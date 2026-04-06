@@ -1,0 +1,268 @@
+pipeline {
+  agent none
+  parameters {
+    booleanParam(name: 'build', defaultValue: true, description: 'Build V80 Docker image and compile BNN model')
+    booleanParam(name: 'hw_test', defaultValue: true, description: 'Run hardware test on V80 board (uses artifacts from previous build if build=false)')
+  }
+  options {
+    timeout(time: 72, unit: 'HOURS')
+  }
+  stages {
+    stage('Build Docker Image') {
+      when {
+        expression { return params['build'] }
+      }
+      agent {
+        label 'finn-build'
+      }
+      environment {
+        FINN_DOCKER_PREBUILT = '0'
+      }
+      steps {
+        catchError(stageResult: 'FAILURE') {
+          script {
+            sh 'docker container prune -f'
+            sh 'docker image prune -f'
+            sh './run-docker.sh echo "V80 Docker image ready"'
+            env.DOCKER_BUILD = 'SUCCESS'
+          }
+        }
+      }
+    }
+    stage('BNN V80 Build') {
+      when {
+        expression { return params['build'] && env.DOCKER_BUILD == 'SUCCESS' }
+      }
+      agent {
+        label 'finn-build'
+      }
+      environment {
+        TEST_NAME = 'bnn_build_v80'
+        FINN_HOST_BUILD_DIR = "${env.FINN_HOST_BUILD_DIR}/${env.TEST_NAME}"
+      }
+      steps {
+        catchError(stageResult: 'FAILURE') {
+          script {
+            sh "mkdir -p ${env.TEST_NAME}"
+            cleanPreviousBuildFiles(env.FINN_HOST_BUILD_DIR)
+
+            runDockerPytestWithMarker('bnn_v80', env.TEST_NAME, '')
+            findCopyZip('V80', env.FINN_HOST_BUILD_DIR, env.TEST_NAME)
+
+            stash name: env.TEST_NAME, includes: "${env.TEST_NAME}.xml,${env.TEST_NAME}.html"
+            env.BNN_BUILD_V80 = 'SUCCESS'
+          }
+        }
+      }
+    }
+    stage('V80 Hardware Test') {
+      options { skipDefaultCheckout() }
+      when {
+        beforeAgent true
+        expression {
+          return params['hw_test'] && isNodeOnline('finn-v80') && (env.BNN_BUILD_V80 == 'SUCCESS' || !params['build'])
+        }
+      }
+      agent {
+        label 'finn-v80'
+      }
+      environment {
+        BOARD = 'V80'
+        TEST_NAME = 'bnn_hw_v80'
+      }
+      steps {
+        catchError(stageResult: 'FAILURE') {
+          script {
+            sh 'v80-smi list'
+
+            sh "mkdir -p ${env.TEST_NAME}"
+            dir(env.TEST_NAME) {
+              cleanPreviousBuildFiles('V80')
+              sh "cp ${env.ARTIFACT_DIR}/bnn_build_v80/V80.zip ."
+              sh 'unzip -o V80.zip'
+
+              dir('V80') {
+                def bdf = detectV80Bdf()
+
+                def testDirs = sh(
+                  script: "ls -d */ 2>/dev/null | grep -v __pycache__ | grep -v .pytest_cache | sed 's|/||'",
+                  returnStdout: true
+                ).trim()
+
+                if (!testDirs) {
+                  error 'No V80 test directories found in deployment package'
+                }
+
+                for (td in testDirs.split('\n')) {
+                  def testDir = td.trim()
+                  if (!testDir) continue
+
+                  echo "Running V80 HW test: ${testDir}"
+                  dir(testDir) {
+                    if (bdf && fileExists('acceleratorconfig.json')) {
+                      sh "sed -i 's/Change me!/${bdf}/g' acceleratorconfig.json"
+                    }
+
+                    buildAndRunV80Driver(testDir)
+                  }
+                }
+              }
+            }
+            env.V80_HW_TEST = 'SUCCESS'
+          }
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: "${env.TEST_NAME}/**/output.npy", allowEmptyArchive: true
+          archiveArtifacts artifacts: "${env.TEST_NAME}/**/nw_metrics.txt", allowEmptyArchive: true
+        }
+      }
+    }
+    stage('Check Stage Results') {
+      agent {
+        label 'finn-build'
+      }
+      steps {
+        script {
+          sh 'mkdir -p reports'
+          cleanPreviousBuildFiles('reports')
+          dir('reports') {
+            unstashSuccessfulStage(env.BNN_BUILD_V80, 'bnn_build_v80')
+          }
+
+          archiveArtifacts artifacts: 'reports/*.xml', allowEmptyArchive: true
+          archiveArtifacts artifacts: 'reports/*.html', allowEmptyArchive: true
+          junit testResults: 'reports/*.xml', allowEmptyResults: true
+        }
+      }
+    }
+  }
+}
+
+// --- Helper functions ---
+
+void cleanPreviousBuildFiles(String buildDir) {
+  if (!buildDir.empty) {
+    sh "rm -rf ${buildDir}"
+  }
+}
+
+void runDockerPytestWithMarker(String marker, String testResultsFilename, String additionalOptions) {
+  sh """./run-docker.sh python -m pytest -m ${marker} --forked --junitxml=${testResultsFilename}.xml --html=${testResultsFilename}.html --self-contained-html ${additionalOptions}"""
+}
+
+void findCopyZip(String board, String findDir, String copyDir) {
+  sh "mkdir -p ${copyDir}"
+  try {
+    sh "cp -r ${findDir}/hw_deployment_*/${board} ${copyDir}/"
+    dir(copyDir) {
+      sh "zip -r ${board}.zip ${board}/"
+      sh "mkdir -p ${env.ARTIFACT_DIR}/${copyDir}/"
+      sh "cp ${board}.zip ${env.ARTIFACT_DIR}/${copyDir}/"
+    }
+  } catch (err) {
+    error "No ${board} hw_deployment_* build artifacts found in ${findDir}"
+  }
+}
+
+String detectV80Bdf() {
+  def bdf = sh(
+    script: "v80-smi list 2>/dev/null | grep -oP '\\d{4}:[0-9a-f]{2}:[0-9a-f]{2}' | head -1",
+    returnStdout: true
+  ).trim()
+  if (bdf) {
+    echo "Detected V80 BDF: ${bdf}"
+  } else {
+    echo 'WARNING: Could not auto-detect V80 BDF from v80-smi'
+  }
+  return bdf
+}
+
+void buildAndRunV80Driver(String testDir) {
+  if (!fileExists('CMakeLists.txt')) {
+    echo "No CMakeLists.txt in ${testDir} — skipping driver compilation"
+    return
+  }
+
+  sh '''
+    export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+    mkdir -p build
+    cd build
+    cmake .. -DCMAKE_BUILD_TYPE=Release 2>&1
+    make -j$(nproc) 2>&1
+  '''
+
+  def driverBin = sh(
+    script: "find build -maxdepth 1 -type f -executable | head -1",
+    returnStdout: true
+  ).trim()
+
+  if (!driverBin) {
+    error "C++ driver compilation produced no executable in ${testDir}/build/"
+  }
+
+  echo "Running V80 execute test with driver: ${driverBin}"
+  sh """
+    export LD_LIBRARY_PATH=/usr/local/lib:\${LD_LIBRARY_PATH:-}
+    ./${driverBin} --exec_mode=execute \\
+      --bitfile=finn-accel.vbin \\
+      --inputfile=input.npy \\
+      --outputfile=output.npy
+  """
+
+  if (fileExists('output.npy') && fileExists('output_reference.npy')) {
+    def hasNumpy = sh(script: 'python3 -c "import numpy" 2>/dev/null', returnStatus: true) == 0
+    if (hasNumpy) {
+      sh '''
+        python3 -c "
+import numpy as np, sys
+out = np.load('output.npy')
+ref = np.load('output_reference.npy')
+if np.allclose(out, ref):
+    print('V80 output matches reference — PASS')
+else:
+    print('V80 output MISMATCH — FAIL')
+    print(f'  Max abs diff: {np.max(np.abs(out - ref))}')
+    sys.exit(1)
+"
+      '''
+    } else {
+      echo 'WARNING: numpy not installed on V80 agent — skipping output comparison'
+      echo 'Install with: sudo apt-get install python3-numpy (or pip3 install numpy)'
+    }
+  }
+}
+
+def isNodeOnline(String labelName) {
+  def label = Jenkins.instance.getLabel(labelName)
+  def agentOnline = false
+
+  if (label) {
+    def nodes = Jenkins.instance.getNodes()
+    nodes.each { node ->
+      if (node.getAssignedLabels().contains(label)) {
+        def computer = node.toComputer()
+        if (computer && computer.isOnline()) {
+          agentOnline = true
+        } else {
+          echo "Agent ${node.displayName} is offline"
+        }
+      }
+    }
+  } else {
+    echo "Node with label ${labelName} not found"
+  }
+
+  return agentOnline
+}
+
+void unstashSuccessfulStage(String stageEnvVariableSet, String stashName) {
+  if (stageEnvVariableSet) {
+    try {
+      unstash stashName
+    } catch (err) {
+      echo "No stash '${stashName}' to unstash"
+    }
+  }
+}
