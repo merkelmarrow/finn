@@ -172,6 +172,14 @@ if [ "$FINN_DOCKER_NO_CACHE" = "1" ]; then
   FINN_DOCKER_BUILD_EXTRA+="--no-cache "
 fi
 
+# If V80PP_DEB_PACKAGE is an absolute path, copy into build context
+V80PP_COPIED=""
+if [ -n "$V80PP_DEB_PACKAGE" ] && [ "${V80PP_DEB_PACKAGE:0:1}" = "/" ]; then
+  cp "$V80PP_DEB_PACKAGE" "$SCRIPTPATH/$(basename "$V80PP_DEB_PACKAGE")"
+  V80PP_DEB_PACKAGE="$(basename "$V80PP_DEB_PACKAGE")"
+  V80PP_COPIED=1
+fi
+
 # Build the FINN Docker image
 if [ "$FINN_DOCKER_PREBUILT" = "0" ] && [ -z "$FINN_SINGULARITY" ]; then
   # Need to ensure this is done within the finn/ root folder:
@@ -195,6 +203,11 @@ fi
 # Remove local xrt.deb file from repo
 if [ ! -z "$LOCAL_XRT" ];then
   rm $XRT_DEB_VERSION.deb
+fi
+
+# Remove local v80++ .deb copy from repo
+if [ ! -z "$V80PP_COPIED" ]; then
+  rm "$SCRIPTPATH/$V80PP_DEB_PACKAGE"
 fi
 
 # Launch container with current directory mounted
