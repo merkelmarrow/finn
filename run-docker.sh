@@ -264,6 +264,12 @@ if [ ! -z "$FINN_XILINX_PATH" ];then
   fi
 fi
 
+# Optional: override the Vivado used by v80++ link (Slash/V80 targets)
+# when it differs from the FINN_XILINX_PATH version used for HLS synthesis.
+if [ ! -z "$FINN_VIVADO_LINK_PATH" ];then
+  DOCKER_EXEC+="-e FINN_VIVADO_LINK_PATH=$FINN_VIVADO_LINK_PATH "
+fi
+
 # This part is used for internal ci for finn-examples
 # if using build verification for finn-examples ci, set up the necessary Docker variables
 if [ "$VERIFICATION_EN" = 1 ]; then

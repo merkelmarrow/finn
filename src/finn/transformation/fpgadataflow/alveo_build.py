@@ -434,12 +434,17 @@ class SlashLink(Transformation):
     full path as value.
 
     :parameter build_hardware: If True, SlashLink will build a hardware programming image.
-    Otherwise, it will create an simulation image.
+        Otherwise, it will create a simulation image.
+    :parameter vivado_path: Optional path to a Vivado installation for v80++ linking.
+        When HLS synthesis uses a different Vivado version than v80++ linking requires
+        (e.g. 2024.2 for HLS vs 2025.1 for linking), set this to the linking Vivado.
+        Falls back to the FINN_VIVADO_LINK_PATH environment variable if not provided.
     """
 
-    def __init__(self, build_hardware=True):
+    def __init__(self, build_hardware=True, vivado_path=None):
         super().__init__()
         self.build_hardware = build_hardware
+        self.vivado_path = vivado_path or os.environ.get("FINN_VIVADO_LINK_PATH", None)
 
     def apply(self, model):
         # create a temporary folder for the project and check out SLASH
@@ -533,8 +538,10 @@ class SlashLink(Transformation):
             "hw" if self.build_hardware else "sim",
             "--out",
             str(vbin_path),
-            "--kernels",
-        ] + [str(path) for path in component_xml_paths]
+        ]
+        if self.vivado_path is not None:
+            command += ["--vivado", str(self.vivado_path)]
+        command += ["--kernels"] + [str(path) for path in component_xml_paths]
 
         # Run the linker
         log_path = link_dir / "slash.log"
