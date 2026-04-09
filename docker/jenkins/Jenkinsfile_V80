@@ -21,8 +21,8 @@ pipeline {
       steps {
         catchError(stageResult: 'FAILURE') {
           script {
-            sh 'docker container prune -f'
-            sh 'docker image prune -f'
+            // Prune old docker containers
+            sh 'docker system prune -a -f'
             sh './run-docker.sh echo "V80 Docker image ready"'
             env.DOCKER_BUILD = 'SUCCESS'
           }
