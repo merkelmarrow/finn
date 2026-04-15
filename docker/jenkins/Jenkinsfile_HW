@@ -90,7 +90,6 @@ pipeline {
       }
     }
     stage('Collect build information for HW testing') {
-      options { skipDefaultCheckout() }
       agent {
         label 'finn-build'
       }
