@@ -167,7 +167,7 @@ pipeline {
             ''').trim()
             sh "mkdir -p ${env.FINN_DOCKER_SHARED_DIR}"
             sh "echo '${dockerTag}' > ${env.FINN_DOCKER_SHARED_DIR}/finn-docker-tag.txt"
-            sh "bash -c 'set -o pipefail; docker save \"${dockerTag}\" | gzip > ${env.FINN_DOCKER_SHARED_DIR}/finn-docker-image.tar.gz'"
+            sh "bash -c 'set -o pipefail; if command -v pigz >/dev/null 2>&1; then COMPRESS=\"pigz -p \$(nproc)\"; else COMPRESS=gzip; fi; docker save \"${dockerTag}\" | \$COMPRESS > ${env.FINN_DOCKER_SHARED_DIR}/finn-docker-image.tar.gz'"
           }
         }
       }
