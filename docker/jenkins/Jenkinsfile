@@ -1,3 +1,137 @@
+import groovy.transform.Field
+
+// ---------------------------------------------------------------------------
+// Single source of truth for what runs in the Run Tests parallel block.
+//
+// Editing rule: if you want to add, remove, re-bucket or re-balance a stage,
+// edit one of the tables below. Everything else (stage wiring, stash names,
+// Check Stage Results aggregation) is generated from these tables.
+// ---------------------------------------------------------------------------
+
+// BNN end2end marker per board. Board names mirror test_board_map in
+// tests/end2end/test_end2end_bnn_pynq.py; markers are defined in setup.cfg.
+@Field
+Map<String, String> BNN_BOARD_MARKERS = [
+    'U250'     : 'bnn_u250',
+    'Pynq-Z1'  : 'bnn_pynq',
+    'ZCU104'   : 'bnn_zcu104',
+    'KV260_SOM': 'bnn_kv260',
+]
+
+// BNN end2end sub-stages — one entry per (board, scenario-bucket).
+//
+// Why sub-stage at scenario granularity: on any given board cnv-w2a2 alone
+// accounts for ~35-50 % of the BNN wall-clock (it scales super-linearly with
+// precision because weight/activation bitwidth drives LUT/DSP count and
+// Vivado impl's routing time). Isolating cnv-w2a2 on every board collapses
+// the critical path from "sum of 9 scenarios on U250" to "one cnv-w2a2 on
+// U250" and opens the door to per-scenario bitstream caching later.
+//
+// How to edit: add, remove, or re-bucket an entry. `-k` is a pytest
+// keyword-expression against the parameterized test id, which has the shape
+// `<topology>-<wbits>-<abits>-<board>` (see
+// get_full_parameterized_test_list in tests/end2end/test_end2end_bnn_pynq.py
+// and the xdist_group marking at line 467).
+//
+// Worker counts: pytest -k that selects a single scenario sends all ~13
+// test methods into one xdist_group, so only one worker actually executes;
+// we use n=2 there (1 runs, 1 idle — cheap spare). Bucketed sub-stages that
+// contain multiple scenarios benefit from n=4.
+@Field
+List<List<Object>> BNN_SUB_STAGES = [
+    // board         label              -k expression                       n
+    ['U250',         'cnv-w2a2',        'cnv and w2a2',                     2],
+    ['U250',         'cnv-w2a1',        'cnv and w2a1',                     2],
+    ['U250',         'cnv-w1a2',        'cnv and w1a2',                     2],
+    ['U250',         'cnv-w1a1-tfc',    '(cnv and w1a1) or tfc',            4],
+    ['U250',         'lfc',             'lfc',                              2],
+    ['ZCU104',       'cnv-heavy',       'cnv and w2',                       4],
+    ['ZCU104',       'cnv-light-tfc',   '(cnv and w1) or tfc',              4],
+    ['ZCU104',       'lfc',             'lfc',                              2],
+    ['Pynq-Z1',      'cnv-w2a2',        'cnv and w2a2',                     2],
+    ['Pynq-Z1',      'cnv-rest-tfc',    '(cnv and not w2a2) or tfc',        4],
+    ['Pynq-Z1',      'lfc',             'lfc',                              2],
+    ['KV260_SOM',    'cnv-w2a2',        'cnv and w2a2',                     2],
+    ['KV260_SOM',    'rest',            'not (cnv and w2a2)',               4],
+]
+
+// End2end file shards. test_end2end_mobilenet_v1.py carries ~32 xdist_group
+// marks and dominates the stage wall (~8 h of 20 h on #329); everything else
+// fits into a single lighter shard.
+@Field
+List<String> END2END_MOBILENET = [
+    'tests/end2end/test_end2end_mobilenet_v1.py',
+]
+
+@Field
+List<String> END2END_REST = [
+    'tests/end2end/test_end2end_bnn_pynq.py',
+    'tests/end2end/test_end2end_cybsec_mlp.py',
+    'tests/end2end/test_ext_weights.py',
+    'tests/end2end/test_ooc_synthesis.py',
+]
+
+// fpgadataflow file shards. Starting split is round-robin on alphabetical
+// order of the 47 test files under tests/fpgadataflow/, which bin-packs
+// heavy tests (convinputgenerator, mvau, thresholding) across both shards
+// in expectation. Rebalance after a real run by feeding
+// tests/fpgadataflow/<junit>.xml to scripts/balance_fpgadataflow_shards.py
+// and pasting its output over these two lists. Target: walls within ~15 %.
+@Field
+List<String> FPGADATAFLOW_SHARD_A = [
+    'tests/fpgadataflow/test_code_gen_trafo.py',
+    'tests/fpgadataflow/test_convert_to_hw_1d_conv_layer.py',
+    'tests/fpgadataflow/test_convert_to_hw_conv_layer.py',
+    'tests/fpgadataflow/test_convert_to_hw_layers_fc.py',
+    'tests/fpgadataflow/test_convert_to_hw_pool_batch.py',
+    'tests/fpgadataflow/test_fifosizing.py',
+    'tests/fpgadataflow/test_fpgadataflow_checksum.py',
+    'tests/fpgadataflow/test_fpgadataflow_convinputgenerator.py',
+    'tests/fpgadataflow/test_fpgadataflow_crop.py',
+    'tests/fpgadataflow/test_fpgadataflow_downsampler.py',
+    'tests/fpgadataflow/test_fpgadataflow_dwc.py',
+    'tests/fpgadataflow/test_fpgadataflow_elementwise_binary.py',
+    'tests/fpgadataflow/test_fpgadataflow_fifo.py',
+    'tests/fpgadataflow/test_fpgadataflow_fmpadding.py',
+    'tests/fpgadataflow/test_fpgadataflow_ipstitch.py',
+    'tests/fpgadataflow/test_fpgadataflow_layernorm.py',
+    'tests/fpgadataflow/test_fpgadataflow_mvau.py',
+    'tests/fpgadataflow/test_fpgadataflow_requant.py',
+    'tests/fpgadataflow/test_fpgadataflow_shuffle.py',
+    'tests/fpgadataflow/test_fpgadataflow_split.py',
+    'tests/fpgadataflow/test_fpgadataflow_thresholding_runtime.py',
+    'tests/fpgadataflow/test_fpgadataflow_vvau.py',
+    'tests/fpgadataflow/test_runtime_weights.py',
+    'tests/fpgadataflow/test_split_large_fifos.py',
+]
+
+@Field
+List<String> FPGADATAFLOW_SHARD_B = [
+    'tests/fpgadataflow/test_compilation_trafo.py',
+    'tests/fpgadataflow/test_convert_to_hw_conv_fc_transition.py',
+    'tests/fpgadataflow/test_convert_to_hw_layers_cnv.py',
+    'tests/fpgadataflow/test_convert_to_hw_layers_synthetic.py',
+    'tests/fpgadataflow/test_depthwise_convolution.py',
+    'tests/fpgadataflow/test_fpgadataflow_addstreams.py',
+    'tests/fpgadataflow/test_fpgadataflow_concat.py',
+    'tests/fpgadataflow/test_fpgadataflow_convinputgenerator_rtl_dynamic.py',
+    'tests/fpgadataflow/test_fpgadataflow_deconv.py',
+    'tests/fpgadataflow/test_fpgadataflow_duplicatestreams.py',
+    'tests/fpgadataflow/test_fpgadataflow_elementwise_absdiff.py',
+    'tests/fpgadataflow/test_fpgadataflow_elementwise_binary_rtl.py',
+    'tests/fpgadataflow/test_fpgadataflow_finnloop.py',
+    'tests/fpgadataflow/test_fpgadataflow_globalaccpool.py',
+    'tests/fpgadataflow/test_fpgadataflow_labelselect.py',
+    'tests/fpgadataflow/test_fpgadataflow_lookup.py',
+    'tests/fpgadataflow/test_fpgadataflow_relu_elementwisemax.py',
+    'tests/fpgadataflow/test_fpgadataflow_res_estimate.py',
+    'tests/fpgadataflow/test_fpgadataflow_softmax.py',
+    'tests/fpgadataflow/test_fpgadataflow_thresholding.py',
+    'tests/fpgadataflow/test_fpgadataflow_upsampler.py',
+    'tests/fpgadataflow/test_minimize_bit_width.py',
+    'tests/fpgadataflow/test_set_folding.py',
+]
+
 pipeline {
   agent none
   options {
@@ -39,262 +173,9 @@ pipeline {
       }
     }
     stage('Run Tests') {
-      parallel {
-        stage('Sanity - Build Hardware') {
-          when {
-            expression { return params['sanity'] }
-          }
-          agent {
-            label 'finn-build'
-          }
-          environment {
-            TEST_NAME = "bnn_build_sanity"
-            FINN_HOST_BUILD_DIR = "${env.FINN_HOST_BUILD_DIR}/${env.TEST_NAME}"
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              script {
-                // Creates dir in finn clone to store build files for stashing
-                sh "mkdir -p ${env.TEST_NAME}"
-                cleanPreviousBuildFiles(env.FINN_HOST_BUILD_DIR)
-
-                // Pass in the marker to run with pytest and the XML test results filename
-                runDockerPytestWithMarker("sanity_bnn", "${env.TEST_NAME}", '')
-
-                // Find the board's build files (bitstreams/xclbins) and zip for use on the boards themselves
-                findCopyZip("Pynq-Z1", env.FINN_HOST_BUILD_DIR, env.TEST_NAME)
-                findCopyZip("ZCU104", env.FINN_HOST_BUILD_DIR, env.TEST_NAME)
-                findCopyZip("KV260_SOM", env.FINN_HOST_BUILD_DIR, env.TEST_NAME)
-                findCopyZip("U250", env.FINN_HOST_BUILD_DIR, env.TEST_NAME)
-
-                // Stash the test results file(s)
-                stash name: "${env.TEST_NAME}", includes: "${env.TEST_NAME}.xml,${env.TEST_NAME}.html"
-
-                // Use an env variable to help collect test results later in pipeline
-                env.BNN_BUILD_SANITY = "SUCCESS"
-              }
-            }
-          }
-        }
-        stage('Sanity - Unit Tests') {
-          when {
-            expression { params['sanity'] }
-          }
-          agent {
-            label 'finn-build'
-          }
-          environment {
-            TEST_NAME = "sanity_ut"
-            FINN_HOST_BUILD_DIR = "${env.FINN_HOST_BUILD_DIR}/${env.TEST_NAME}"
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              script {
-                cleanPreviousBuildFiles(env.FINN_HOST_BUILD_DIR)
-
-                // Multiple markers with pytest needs its own script
-                createMultiMarkerScript("util or brevitas_export or streamline or transform or notebooks", "${env.TEST_NAME}", "-n ${env.NUM_PYTEST_WORKERS} --dist worksteal --cov --cov-report=html:coverage_sanity_ut")
-                sh './run-docker.sh ./run-tests.sh'
-
-                // Stash the test results file(s)
-                stash name: env.TEST_NAME, includes: "${env.TEST_NAME}.xml,${env.TEST_NAME}.html"
-
-                // Use an env variable to help collect test results later in pipeline
-                env.SANITY_UT = "SUCCESS"
-
-                // Archive coverage report if successful
-                archiveSuccessfulStage(env.SANITY_UT, "coverage_sanity_ut")
-              }
-            }
-          }
-        }
-        stage('fpgadataflow Tests') {
-          when {
-            expression { params['fpgadataflow'] }
-          }
-          agent {
-            label 'finn-build'
-          }
-          environment {
-            TEST_NAME = "fpgadataflow"
-            FINN_HOST_BUILD_DIR = "${env.FINN_HOST_BUILD_DIR}/${env.TEST_NAME}"
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              script {
-                cleanPreviousBuildFiles(env.FINN_HOST_BUILD_DIR)
-
-                // Pass in the marker to run with pytest and the XML test results filename
-                runDockerPytestWithMarker("fpgadataflow", "${env.TEST_NAME}", "--cov --cov-report=html:coverage_fpgadataflow -n ${env.NUM_PYTEST_WORKERS} --dist worksteal")
-
-                // Stash the test results file(s)
-                stash name: env.TEST_NAME, includes: "${env.TEST_NAME}.xml,${env.TEST_NAME}.html"
-
-                // Use an env variable to help collect test results later in pipeline
-                env.FPGADATAFLOW_RESULT = "SUCCESS"
-
-                // Archive coverage report if successful
-                archiveSuccessfulStage(env.FPGADATAFLOW_RESULT, "coverage_fpgadataflow")
-              }
-            }
-          }
-        }
-        stage('End2end') {
-          when {
-            expression { params['end2end'] }
-          }
-          agent {
-            label 'finn-build'
-          }
-          environment {
-            TEST_NAME = "end2end"
-            FINN_HOST_BUILD_DIR = "${env.FINN_HOST_BUILD_DIR}/${env.TEST_NAME}"
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              script {
-                // Delete any build files from a previous build
-                cleanPreviousBuildFiles(env.FINN_HOST_BUILD_DIR)
-
-                // Pass in the marker to run with pytest and the XML test results filename
-                runDockerPytestWithMarker(env.TEST_NAME, "${env.TEST_NAME}", '')
-
-                // Stash the test results file(s)
-                stash name: env.TEST_NAME, includes: "${env.TEST_NAME}.xml,${env.TEST_NAME}.html"
-
-                // Use an env variable to help collect test results later in pipeline
-                env.END2END_RESULT = "SUCCESS"
-              }
-            }
-          }
-        }
-        stage('BNN end2end - U250') {
-          when {
-            expression { return params['end2end'] }
-          }
-          agent {
-            label 'finn-build'
-          }
-          environment {
-            BOARD = "U250"
-            TEST_NAME = "bnn_build_full"
-            FINN_HOST_BUILD_DIR = "${env.FINN_HOST_BUILD_DIR}/${env.TEST_NAME}_${env.BOARD}"
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              script {
-                // Creates dir in finn clone to store build files for stashing
-                sh "mkdir -p ${env.TEST_NAME}"
-                cleanPreviousBuildFiles(env.FINN_HOST_BUILD_DIR)
-
-                // Pass in the marker to run with pytest and the XML test results filename
-                runDockerPytestWithMarker("bnn_u250", "${env.TEST_NAME}_${env.BOARD}", '')
-                findCopyZip(env.BOARD, env.FINN_HOST_BUILD_DIR, env.TEST_NAME)
-
-                // Stash the test results file(s)
-                stash name: "${env.TEST_NAME}_${env.BOARD}", includes: "${env.TEST_NAME}_${env.BOARD}.xml,${env.TEST_NAME}_${env.BOARD}.html"
-
-                // Use an env variable to help collect test results later in pipeline
-                env.BNN_BUILD_U250 = "SUCCESS"
-              }
-            }
-          }
-        }
-        stage('BNN end2end - Pynq-Z1') {
-          when {
-            expression { return params['end2end'] }
-          }
-          agent {
-            label 'finn-build'
-          }
-          environment {
-            BOARD = "Pynq-Z1"
-            TEST_NAME = "bnn_build_full"
-            FINN_HOST_BUILD_DIR = "${env.FINN_HOST_BUILD_DIR}/${env.TEST_NAME}_${env.BOARD}"
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              script {
-                // Creates dir in finn clone to store build files for stashing
-                sh "mkdir -p ${env.TEST_NAME}"
-                cleanPreviousBuildFiles(env.FINN_HOST_BUILD_DIR)
-
-                // Pass in the marker to run with pytest and the XML test results filename
-                runDockerPytestWithMarker("bnn_pynq", "${env.TEST_NAME}_${env.BOARD}", '')
-                findCopyZip(env.BOARD, env.FINN_HOST_BUILD_DIR, env.TEST_NAME)
-
-                // Stash the test results file(s)
-                stash name: "${env.TEST_NAME}_PynqZ1", includes: "${env.TEST_NAME}_${env.BOARD}.xml,${env.TEST_NAME}_${env.BOARD}.html"
-
-                // Use an env variable to help collect test results later in pipeline
-                env.BNN_BUILD_PYNQZ1 = "SUCCESS"
-              }
-            }
-          }
-        }
-        stage('BNN end2end - ZCU104') {
-          when {
-            expression { return params['end2end'] }
-          }
-          agent {
-            label 'finn-build'
-          }
-          environment {
-            BOARD = "ZCU104"
-            TEST_NAME = "bnn_build_full"
-            FINN_HOST_BUILD_DIR = "${env.FINN_HOST_BUILD_DIR}/${env.TEST_NAME}_${env.BOARD}"
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              script {
-                // Creates dir in finn clone to store build files for stashing
-                sh "mkdir -p ${env.TEST_NAME}"
-                cleanPreviousBuildFiles(env.FINN_HOST_BUILD_DIR)
-
-                // Pass in the marker to run with pytest and the XML test results filename
-                runDockerPytestWithMarker("bnn_zcu104", "${env.TEST_NAME}_${env.BOARD}", '')
-                findCopyZip(env.BOARD, env.FINN_HOST_BUILD_DIR, env.TEST_NAME)
-
-                // Stash the test results file(s)
-                stash name: "${env.TEST_NAME}_${env.BOARD}", includes: "${env.TEST_NAME}_${env.BOARD}.xml,${env.TEST_NAME}_${env.BOARD}.html"
-
-                // Use an env variable to help collect test results later in pipeline
-                env.BNN_BUILD_ZCU104 = "SUCCESS"
-              }
-            }
-          }
-        }
-        stage('BNN end2end - KV260_SOM') {
-          when {
-            expression { return params['end2end'] }
-          }
-          agent {
-            label 'finn-build'
-          }
-          environment {
-            BOARD = "KV260_SOM"
-            TEST_NAME = "bnn_build_full"
-            FINN_HOST_BUILD_DIR = "${env.FINN_HOST_BUILD_DIR}/${env.TEST_NAME}_${env.BOARD}"
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              script {
-                // Creates dir in finn clone to store build files for stashing
-                sh "mkdir -p ${env.TEST_NAME}"
-                cleanPreviousBuildFiles(env.FINN_HOST_BUILD_DIR)
-
-                // Pass in the marker to run with pytest and the XML test results filename
-                runDockerPytestWithMarker("bnn_kv260", "${env.TEST_NAME}_${env.BOARD}", '')
-                findCopyZip(env.BOARD, env.FINN_HOST_BUILD_DIR, env.TEST_NAME)
-
-                // Stash the test results file(s)
-                stash name: "${env.TEST_NAME}_${env.BOARD}", includes: "${env.TEST_NAME}_${env.BOARD}.xml,${env.TEST_NAME}_${env.BOARD}.html"
-
-                // Use an env variable to help collect test results later in pipeline
-                env.BNN_BUILD_KV260_SOM = "SUCCESS"
-              }
-            }
-          }
+      steps {
+        script {
+          parallel buildParallelStageMap()
         }
       }
     }
@@ -307,15 +188,7 @@ pipeline {
           sh 'mkdir -p reports'
           cleanPreviousBuildFiles('reports')
           dir('reports') {
-            // Only unstash for stages that ran
-            unstashSuccessfulStage(env.SANITY_UT, "sanity_ut")
-            unstashSuccessfulStage(env.FPGADATAFLOW_RESULT, "fpgadataflow")
-            unstashSuccessfulStage(env.BNN_BUILD_SANITY, "bnn_build_sanity")
-            unstashSuccessfulStage(env.END2END_RESULT, "end2end")
-            unstashSuccessfulStage(env.BNN_BUILD_U250, "bnn_build_full_U250")
-            unstashSuccessfulStage(env.BNN_BUILD_PYNQZ1, "bnn_build_full_PynqZ1")
-            unstashSuccessfulStage(env.BNN_BUILD_ZCU104, "bnn_build_full_ZCU104")
-            unstashSuccessfulStage(env.BNN_BUILD_KV260_SOM, "bnn_build_full_KV260_SOM")
+            expectedStashes().each { name -> unstashIf(name) }
           }
 
           // Combine individual HTML files to one single report
@@ -333,6 +206,190 @@ pipeline {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Parallel stage assembly
+// ---------------------------------------------------------------------------
+
+// Build the map of parallel branches that the 'Run Tests' stage executes.
+// Each branch spawns its own node('finn-build') allocation so that Jenkins
+// schedules them across the executor pool. Gating on params mirrors the
+// `when { ... }` blocks of the previous declarative version.
+Map<String, Closure> buildParallelStageMap() {
+  def branches = [:]
+  if (params.sanity) {
+    // Sanity - Build Hardware rebuilds exactly the 4 scenarios (lfc-w1a1 on
+    // Pynq-Z1, cnv-w1a2 on ZCU104, tfc-w2a2 on KV260, cnv-w2a2 on U250) that
+    // the BNN end2end stages also build when end2end=true, so it is
+    // redundant in the full-matrix case. Skip it then. See
+    // knowledge/analyses/finn_ci_12h_15exec_parallelisation.md §3.3.
+    if (!params.end2end) {
+      branches['Sanity - Build Hardware'] = { sanityBuildHardwareStage() }
+    }
+    branches['Sanity - Unit Tests'] = { sanityUnitTestsStage() }
+  }
+  if (params.fpgadataflow) {
+    branches['fpgadataflow - shard A'] = { fpgadataflowShardStage('a', FPGADATAFLOW_SHARD_A) }
+    branches['fpgadataflow - shard B'] = { fpgadataflowShardStage('b', FPGADATAFLOW_SHARD_B) }
+  }
+  if (params.end2end) {
+    // mobilenet_v1 dominates end2end wall-clock and benefits from the full
+    // worker pool; the lighter shard (bnn_pynq non-sanity + cybsec + ooc +
+    // ext_weights) runs comfortably on fewer workers.
+    branches['End2end - mobilenet'] = {
+      end2endShardStage('mobilenet', END2END_MOBILENET, (env.NUM_PYTEST_WORKERS ?: '8').toInteger())
+    }
+    branches['End2end - rest'] = { end2endShardStage('rest', END2END_REST, 4) }
+    BNN_SUB_STAGES.each { entry ->
+      String board = entry[0]
+      String label = entry[1]
+      String kExpr = entry[2]
+      int nWorkers = entry[3] as int
+      branches["BNN ${board} - ${label}"] = { bnnSubStage(board, label, kExpr, nWorkers) }
+    }
+  }
+  return branches
+}
+
+// ---------------------------------------------------------------------------
+// Stage bodies (one per parallel branch)
+// ---------------------------------------------------------------------------
+
+void sanityBuildHardwareStage() {
+  node('finn-build') {
+    stage('Sanity - Build Hardware') {
+      checkout scm
+      def testName = 'bnn_build_sanity'
+      def buildDir = "${env.FINN_HOST_BUILD_DIR}/${testName}"
+      catchError(stageResult: 'FAILURE') {
+        withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
+          sh "mkdir -p ${testName}"
+          cleanPreviousBuildFiles(buildDir)
+          runDockerPytestWithMarker('sanity_bnn', testName, '')
+          // Ship every board's hw_deployment artefacts to ARTIFACT_DIR so
+          // downstream board-HW jobs can pick them up.
+          ['Pynq-Z1', 'ZCU104', 'KV260_SOM', 'U250'].each { b ->
+            findCopyZip(b, buildDir, testName)
+          }
+          stash name: testName, includes: "${testName}.xml,${testName}.html"
+          markStageRan(testName)
+        }
+      }
+    }
+  }
+}
+
+void sanityUnitTestsStage() {
+  node('finn-build') {
+    stage('Sanity - Unit Tests') {
+      checkout scm
+      def testName = 'sanity_ut'
+      def buildDir = "${env.FINN_HOST_BUILD_DIR}/${testName}"
+      catchError(stageResult: 'FAILURE') {
+        withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
+          cleanPreviousBuildFiles(buildDir)
+          runDockerPytestWithMarker(
+              'util or brevitas_export or streamline or transform or notebooks',
+              testName,
+              "-n ${env.NUM_PYTEST_WORKERS} --dist worksteal --cov --cov-report=html:coverage_${testName}"
+          )
+          stash name: testName, includes: "${testName}.xml,${testName}.html"
+          markStageRan(testName)
+          archiveIfStageRan(testName, "coverage_${testName}")
+        }
+      }
+    }
+  }
+}
+
+void fpgadataflowShardStage(String shardId, List<String> paths) {
+  node('finn-build') {
+    stage("fpgadataflow - shard ${shardId}") {
+      checkout scm
+      def testName = "fpgadataflow_${shardId}"
+      def buildDir = "${env.FINN_HOST_BUILD_DIR}/${testName}"
+      def nWorkers = (env.NUM_PYTEST_WORKERS ?: '8').toInteger()
+      catchError(stageResult: 'FAILURE') {
+        withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
+          cleanPreviousBuildFiles(buildDir)
+          runDockerPytestShard(
+              'fpgadataflow',
+              testName,
+              paths,
+              nWorkers,
+              "--cov --cov-report=html:coverage_${testName}"
+          )
+          stash name: testName, includes: "${testName}.xml,${testName}.html"
+          markStageRan(testName)
+          archiveIfStageRan(testName, "coverage_${testName}")
+        }
+      }
+    }
+  }
+}
+
+void end2endShardStage(String shardId, List<String> paths, int nWorkers) {
+  node('finn-build') {
+    stage("End2end - ${shardId}") {
+      checkout scm
+      def testName = "end2end_${shardId}"
+      def buildDir = "${env.FINN_HOST_BUILD_DIR}/${testName}"
+      catchError(stageResult: 'FAILURE') {
+        withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
+          cleanPreviousBuildFiles(buildDir)
+          // Every end2end scenario already carries an xdist_group marker, so
+          // scenarios fan out across workers without cross-talk.
+          runDockerPytestShard('end2end', testName, paths, nWorkers, '')
+          stash name: testName, includes: "${testName}.xml,${testName}.html"
+          markStageRan(testName)
+        }
+      }
+    }
+  }
+}
+
+// Run a single BNN end2end sub-stage: marker selects the board, -k narrows
+// to the scenario bucket defined in BNN_SUB_STAGES. Only the sub-stage that
+// actually builds cnv-w2a2 zips hw_deployment artefacts for the board-HW
+// job — that scenario is what gets validated on the physical board.
+void bnnSubStage(String board, String label, String kExpr, int nWorkers) {
+  node('finn-build') {
+    stage("BNN ${board} - ${label}") {
+      checkout scm
+      def marker = BNN_BOARD_MARKERS[board]
+      def stashName = bnnStashName(board, label)
+      def buildDir = "${env.FINN_HOST_BUILD_DIR}/${stashName}"
+      catchError(stageResult: 'FAILURE') {
+        withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
+          sh "mkdir -p ${stashName}"
+          cleanPreviousBuildFiles(buildDir)
+          runDockerPytestWithMarker(
+              marker,
+              stashName,
+              "-k '${kExpr}' -n ${nWorkers} --dist worksteal"
+          )
+          if (label == 'cnv-w2a2') {
+            findCopyZip(board, buildDir, stashName)
+          }
+          stash name: stashName, includes: "${stashName}.xml,${stashName}.html"
+          markStageRan(stashName)
+        }
+      }
+    }
+  }
+}
+
+// Canonical stash / pytest-junit / env-var suffix for a BNN sub-stage.
+// Board and label dashes are collapsed to underscores so the string is safe
+// as both a filesystem path and an env-var suffix (e.g. Pynq-Z1 + cnv-w2a2
+// → bnn_Pynq_Z1_cnv_w2a2).
+String bnnStashName(String board, String label) {
+  return "bnn_${board}_${label}".replaceAll('-', '_')
+}
+
+// ---------------------------------------------------------------------------
+// Shell / pytest helpers (behaviour preserved from pre-refactor version)
+// ---------------------------------------------------------------------------
+
 void cleanPreviousBuildFiles(String buildDir) {
   // Delete any build files from a previous build
   // Previous build folders affect findCopyZip() and can cause the stage to fail
@@ -341,19 +398,44 @@ void cleanPreviousBuildFiles(String buildDir) {
   }
 }
 
-void createMultiMarkerScript(String markers, String testResultsFilename, String additionalOptions) {
-  // Passing multiple markers when running ./run-docker.sh does not work with bash.
-  // Therefore, create a script to maintain the single quotes that surround the markers
-  sh """echo "#!/bin/bash
-python -m pytest -m \'${markers}\' --forked --junitxml=${testResultsFilename}.xml --html=${testResultsFilename}.html --self-contained-html ${additionalOptions}" >> run-tests.sh
-    """
-
-  // Give permissions to script
+// All pytest invocations go through a shell script file (run-tests.sh)
+// rather than being passed inline to run-docker.sh. run-docker.sh joins its
+// arguments into a single string and re-tokenises them, which breaks any
+// argument that contains shell metacharacters — for example pytest's
+// `-k '(cnv and w2a2) or tfc'` or `-m 'util or brevitas_export'`. Writing
+// the command into a script and feeding that script to run-docker.sh lets
+// the in-container bash parse it with full quoting semantics intact.
+//
+// --forked was dropped in favour of pytest-xdist's native per-worker
+// process isolation. pytest-forked is deprecated upstream; xdist with
+// --dist worksteal already runs each test in a dedicated worker process.
+void runPytestScript(String pytestBody) {
+  writeFile file: 'run-tests.sh', text: "#!/bin/bash\nset -eo pipefail\n${pytestBody}\n"
   sh 'chmod 777 run-tests.sh'
+  sh './run-docker.sh ./run-tests.sh'
 }
 
 void runDockerPytestWithMarker(String marker, String testResultsFilename, String additionalOptions) {
-  sh """./run-docker.sh python -m pytest -m ${marker} --forked --junitxml=${testResultsFilename}.xml --html=${testResultsFilename}.html --self-contained-html ${additionalOptions}"""
+  runPytestScript(
+      "python -m pytest -m '${marker}'" +
+      " --junitxml=${testResultsFilename}.xml" +
+      " --html=${testResultsFilename}.html --self-contained-html" +
+      " ${additionalOptions}"
+  )
+}
+
+// Run pytest filtered by marker and restricted to an explicit list of file
+// paths (used for End2end and fpgadataflow sharding). Always uses
+// pytest-xdist with worksteal for even scheduling.
+void runDockerPytestShard(String marker, String testResultsFilename, List<String> paths, int nWorkers, String additionalOptions) {
+  def pathArgs = paths.join(' ')
+  runPytestScript(
+      "python -m pytest -m '${marker}' ${pathArgs}" +
+      " -n ${nWorkers} --dist worksteal" +
+      " --junitxml=${testResultsFilename}.xml" +
+      " --html=${testResultsFilename}.html --self-contained-html" +
+      " ${additionalOptions}"
+  )
 }
 
 void findCopyZip(String board, String findDir, String copyDir) {
@@ -370,14 +452,55 @@ void findCopyZip(String board, String findDir, String copyDir) {
   }
 }
 
-void unstashSuccessfulStage(String stageEnvVariableSet, String stashName) {
-  if (stageEnvVariableSet) {
+// Record that a parallel branch reached its stash call successfully. The
+// flag is a plain env var (env["STAGE_RAN_${stashName}"]) so Check Stage
+// Results can decide per-stash whether to unstash without hand-maintaining
+// a per-stage env var name.
+void markStageRan(String stashName) {
+  env["STAGE_RAN_${stashName}"] = 'SUCCESS'
+}
+
+// Unstash <stashName> iff the owning stage reached its stash call
+// successfully (i.e. markStageRan was invoked). No-op otherwise — the
+// stage already failed the build via catchError, and we simply skip
+// aggregating an absent stash.
+void unstashIf(String stashName) {
+  if (env["STAGE_RAN_${stashName}"]) {
     unstash stashName
   }
 }
 
-void archiveSuccessfulStage(String stageEnvVariableSet, String folder) {
-  if (stageEnvVariableSet) {
+// Archive a coverage (or similar) folder iff the owning stage succeeded.
+void archiveIfStageRan(String stashName, String folder) {
+  if (env["STAGE_RAN_${stashName}"]) {
     archiveArtifacts artifacts: "${folder}/**/*"
   }
+}
+
+// ---------------------------------------------------------------------------
+// Check Stage Results — driven by the same tables the parallel block uses
+// ---------------------------------------------------------------------------
+
+// List of every stash we expect the current run to produce, in the order
+// they should appear in the aggregated report. Derived directly from the
+// params + the shard / sub-stage tables, so adding a sub-stage anywhere
+// (or flipping a param) updates the aggregation automatically.
+List<String> expectedStashes() {
+  def stashes = []
+  if (params.sanity) {
+    stashes << 'sanity_ut'
+    if (!params.end2end) {
+      stashes << 'bnn_build_sanity'
+    }
+  }
+  if (params.fpgadataflow) {
+    stashes += ['fpgadataflow_a', 'fpgadataflow_b']
+  }
+  if (params.end2end) {
+    stashes += ['end2end_mobilenet', 'end2end_rest']
+    BNN_SUB_STAGES.each { entry ->
+      stashes << bnnStashName(entry[0], entry[1])
+    }
+  }
+  return stashes
 }
