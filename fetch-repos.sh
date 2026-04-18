@@ -35,7 +35,11 @@
 # (transient github.com hiccup, DNS blip, rate-limit) and we exit 0 anyway,
 # the failure surfaces hours later as "ModuleNotFoundError: qonnx" with 100+
 # pytest collection errors that look unrelated to the original problem.
-set -euo pipefail
+#
+# NOTE: deliberately omit `-u` (nounset). Several optional environment
+# variables (FINN_SKIP_BOARD_FILES, etc.) are intended to be unset by
+# default, and tripping `unbound variable` on them is a regression.
+set -eo pipefail
 
 QONNX_COMMIT="f5c9819bd00f01f41e70639b8461c8e4b39432f7"
 FINN_EXP_COMMIT="0724be21111a21f0d81a072fccc1c446e053f851"
