@@ -28,6 +28,15 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+# Fail-fast: a partially-populated deps/ tree is worse than no deps/ tree at
+# all. The container entrypoint (docker/finn_entrypoint.sh) does
+# `pip install -e ${FINN_ROOT}/deps/qonnx` etc., and pytest later imports
+# qonnx/brevitas at collection time. If a `git clone` here silently fails
+# (transient github.com hiccup, DNS blip, rate-limit) and we exit 0 anyway,
+# the failure surfaces hours later as "ModuleNotFoundError: qonnx" with 100+
+# pytest collection errors that look unrelated to the original problem.
+set -euo pipefail
+
 QONNX_COMMIT="f5c9819bd00f01f41e70639b8461c8e4b39432f7"
 FINN_EXP_COMMIT="0724be21111a21f0d81a072fccc1c446e053f851"
 BREVITAS_COMMIT="aad4d5a293db6f2ec622a92a5d3278e47072453e"
@@ -70,34 +79,65 @@ SCRIPT=$(readlink -f "$0")
 # absolute path this script is in, thus /home/user/bin
 SCRIPTPATH=$(dirname "$SCRIPT")
 
+# Run a command up to N times, with exponential back-off, before giving up.
+# Use for any command that may fail transiently due to network conditions
+# (github.com 5xx, DNS blips, rate-limit). Always returns the exit status of
+# the last attempt, so callers under `set -e` will still abort on permanent
+# failure.
+retry() {
+    local n=0
+    local max=5
+    local delay=4
+    until "$@"; do
+        n=$((n+1))
+        if (( n >= max )); then
+            echo "fetch-repos: command failed after $n attempts: $*" >&2
+            return 1
+        fi
+        echo "fetch-repos: attempt $n/$max failed for: $* (retrying in ${delay}s)" >&2
+        sleep "$delay"
+        delay=$((delay*2))
+    done
+}
+
 fetch_repo() {
     # URL for git repo to be cloned
-    REPO_URL=$1
+    local REPO_URL=$1
     # commit hash for repo
-    REPO_COMMIT=$2
+    local REPO_COMMIT=$2
     # directory to clone to under deps/
-    REPO_DIR=$3
+    local REPO_DIR=$3
     # absolute path for the repo local copy
-    CLONE_TO=$SCRIPTPATH/deps/$REPO_DIR
+    local CLONE_TO=$SCRIPTPATH/deps/$REPO_DIR
 
-    # clone repo if dir not found
+    # If a previous run left a partial clone (e.g. interrupted git clone),
+    # the directory exists but is not a valid git repo. Detect and discard
+    # so the retry below gets a clean slate instead of silently exiting.
+    if [ -d "$CLONE_TO" ] && ! git -C "$CLONE_TO" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "fetch-repos: discarding partial clone at $CLONE_TO" >&2
+        rm -rf "$CLONE_TO"
+    fi
+
     if [ ! -d "$CLONE_TO" ]; then
-        git clone $REPO_URL $CLONE_TO
+        retry git clone "$REPO_URL" "$CLONE_TO"
     fi
-    # verify and try to pull repo if not at correct commit
-    CURRENT_COMMIT=$(git -C $CLONE_TO rev-parse HEAD)
-    if [ $CURRENT_COMMIT != $REPO_COMMIT ]; then
-        git -C $CLONE_TO pull
-        # checkout the expected commit
-        git -C $CLONE_TO checkout $REPO_COMMIT
+
+    local CURRENT_COMMIT
+    CURRENT_COMMIT=$(git -C "$CLONE_TO" rev-parse HEAD)
+    if [ "$CURRENT_COMMIT" != "$REPO_COMMIT" ]; then
+        # `fetch` rather than `pull` because the working copy is typically a
+        # detached HEAD on $REPO_COMMIT (see explicit checkout below); pull
+        # requires a tracking branch and silently no-ops in detached HEAD.
+        retry git -C "$CLONE_TO" fetch --tags --force
+        git -C "$CLONE_TO" checkout "$REPO_COMMIT"
     fi
-    # verify one last time
-    CURRENT_COMMIT=$(git -C $CLONE_TO rev-parse HEAD)
-    if [ $CURRENT_COMMIT == $REPO_COMMIT ]; then
-        echo "Successfully checked out $REPO_DIR at commit $CURRENT_COMMIT"
-    else
-        echo "Could not check out $REPO_DIR. Check your internet connection and try again."
+
+    CURRENT_COMMIT=$(git -C "$CLONE_TO" rev-parse HEAD)
+    if [ "$CURRENT_COMMIT" != "$REPO_COMMIT" ]; then
+        echo "fetch-repos: ERROR — $REPO_DIR is at $CURRENT_COMMIT, expected $REPO_COMMIT" >&2
+        return 1
     fi
+    echo "Successfully checked out $REPO_DIR at commit $CURRENT_COMMIT"
 }
 
 fetch_board_files() {
@@ -105,8 +145,8 @@ fetch_board_files() {
     mkdir -p "$SCRIPTPATH/deps/board_files"
     OLD_PWD=$(pwd)
     cd "$SCRIPTPATH/deps/board_files"
-    wget -q https://github.com/cathalmccabe/pynq-z1_board_files/raw/master/pynq-z1.zip
-    wget -q https://dpoauwgwqsy2x.cloudfront.net/Download/pynq-z2.zip
+    retry wget -q https://github.com/cathalmccabe/pynq-z1_board_files/raw/master/pynq-z1.zip
+    retry wget -q https://dpoauwgwqsy2x.cloudfront.net/Download/pynq-z2.zip
     unzip -q pynq-z1.zip
     unzip -q pynq-z2.zip
     cp -r $SCRIPTPATH/deps/$AVNET_BDF_DIR/* $SCRIPTPATH/deps/board_files/

@@ -242,6 +242,18 @@ DOCKER_EXEC+="-e LD_PRELOAD=/lib/x86_64-linux-gnu/libudev.so.1 "
 # Workaround for running multiple Vivado instances simultaneously, see:
 # https://adaptivesupport.amd.com/s/article/63253?language=en_US
 DOCKER_EXEC+="-e XILINX_LOCAL_USER_DATA=no "
+# Optional host-side cache for downloaded artefacts (torch.hub pretrained
+# weights, huggingface, pip wheels). Avoids re-downloading large files from
+# github.com release CDNs on every concurrent CI run — GitHub has been
+# observed to return HTTP 504 under heavy parallel load, which fails tests
+# like end2end_mobilenet that pull a ~50 MB checkpoint at runtime. The
+# mount target matches HOME/.cache inside the container (HOME is set to
+# /tmp/home_dir by docker/finn_entrypoint.sh). Set FINN_DOCKER_CACHE_DIR
+# to "" to disable.
+: ${FINN_DOCKER_CACHE_DIR=""}
+if [ -n "$FINN_DOCKER_CACHE_DIR" ] && [ -d "$FINN_DOCKER_CACHE_DIR" ]; then
+  DOCKER_EXEC+="-v $FINN_DOCKER_CACHE_DIR:/tmp/home_dir/.cache "
+fi
 if [ "$FINN_DOCKER_RUN_AS_ROOT" = "0" ] && [ -z "$FINN_SINGULARITY" ];then
   DOCKER_EXEC+="-v $FINN_SSH_KEY_DIR:$HOME/.ssh "
   DOCKER_EXEC+="--user $DOCKER_UID:$DOCKER_GID "

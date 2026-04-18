@@ -28,10 +28,14 @@ Map<String, String> BNN_BOARD_MARKERS = [
 // U250" and opens the door to per-scenario bitstream caching later.
 //
 // How to edit: add, remove, or re-bucket an entry. `-k` is a pytest
-// keyword-expression against the parameterized test id, which has the shape
-// `<topology>-<wbits>-<abits>-<board>` (see
+// keyword-expression that pytest matches as substrings against the
+// parameterized test id. Test ids are produced by
 // get_full_parameterized_test_list in tests/end2end/test_end2end_bnn_pynq.py
-// and the xdist_group marking at line 467).
+// with the format `<marker>_w<wbits>_a<abits>_<topology>_<board>`, e.g.
+// `bnn_u250_w2_a2_cnv_U250`. There is no literal `w2a2` substring in the
+// id (it is `w2_a2`), so an expression like `cnv and w2a2` matches zero
+// tests and the stage exits with code 5. Always express bit-width as the
+// pair `wN and aM` (or negated as `not (wN and aM)`).
 //
 // Worker counts: pytest -k that selects a single scenario sends all ~13
 // test methods into one xdist_group, so only one worker actually executes;
@@ -39,20 +43,20 @@ Map<String, String> BNN_BOARD_MARKERS = [
 // contain multiple scenarios benefit from n=4.
 @Field
 List<List<Object>> BNN_SUB_STAGES = [
-    // board         label              -k expression                       n
-    ['U250',         'cnv-w2a2',        'cnv and w2a2',                     2],
-    ['U250',         'cnv-w2a1',        'cnv and w2a1',                     2],
-    ['U250',         'cnv-w1a2',        'cnv and w1a2',                     2],
-    ['U250',         'cnv-w1a1-tfc',    '(cnv and w1a1) or tfc',            4],
-    ['U250',         'lfc',             'lfc',                              2],
-    ['ZCU104',       'cnv-heavy',       'cnv and w2',                       4],
-    ['ZCU104',       'cnv-light-tfc',   '(cnv and w1) or tfc',              4],
-    ['ZCU104',       'lfc',             'lfc',                              2],
-    ['Pynq-Z1',      'cnv-w2a2',        'cnv and w2a2',                     2],
-    ['Pynq-Z1',      'cnv-rest-tfc',    '(cnv and not w2a2) or tfc',        4],
-    ['Pynq-Z1',      'lfc',             'lfc',                              2],
-    ['KV260_SOM',    'cnv-w2a2',        'cnv and w2a2',                     2],
-    ['KV260_SOM',    'rest',            'not (cnv and w2a2)',               4],
+    // board         label              -k expression                                n
+    ['U250',         'cnv-w2a2',        'cnv and w2 and a2',                         2],
+    ['U250',         'cnv-w2a1',        'cnv and w2 and a1',                         2],
+    ['U250',         'cnv-w1a2',        'cnv and w1 and a2',                         2],
+    ['U250',         'cnv-w1a1-tfc',    '(cnv and w1 and a1) or tfc',                4],
+    ['U250',         'lfc',             'lfc',                                       2],
+    ['ZCU104',       'cnv-heavy',       'cnv and w2',                                4],
+    ['ZCU104',       'cnv-light-tfc',   '(cnv and w1) or tfc',                       4],
+    ['ZCU104',       'lfc',             'lfc',                                       2],
+    ['Pynq-Z1',      'cnv-w2a2',        'cnv and w2 and a2',                         2],
+    ['Pynq-Z1',      'cnv-rest-tfc',    '(cnv and not (w2 and a2)) or tfc',          4],
+    ['Pynq-Z1',      'lfc',             'lfc',                                       2],
+    ['KV260_SOM',    'cnv-w2a2',        'cnv and w2 and a2',                         2],
+    ['KV260_SOM',    'rest',            'not (cnv and w2 and a2)',                   4],
 ]
 
 // End2end file shards. test_end2end_mobilenet_v1.py carries ~32 xdist_group
