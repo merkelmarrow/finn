@@ -41,11 +41,16 @@ Map<String, String> BNN_BOARD_MARKERS = [
 // test methods into one xdist_group, so only one worker actually executes;
 // we use n=2 there (1 runs, 1 idle — cheap spare). Bucketed sub-stages that
 // contain multiple scenarios benefit from n=4.
+// Note: any cnv configuration with wbits > abits (e.g. w2a1) is a phantom
+// shard. test_end2end_bnn_pynq.py::TestEnd2End::test_export skips on
+// `wbits > abits` and the entire dependency chain cascades to skip via
+// load_test_checkpoint_or_skip, so the stage burns an executor for ~3 min
+// just to do nothing. Re-add such an entry only after the upstream skip
+// in tests/end2end/test_end2end_bnn_pynq.py is lifted.
 @Field
 List<List<Object>> BNN_SUB_STAGES = [
     // board         label              -k expression                                n
     ['U250',         'cnv-w2a2',        'cnv and w2 and a2',                         2],
-    ['U250',         'cnv-w2a1',        'cnv and w2 and a1',                         2],
     ['U250',         'cnv-w1a2',        'cnv and w1 and a2',                         2],
     ['U250',         'cnv-w1a1-tfc',    '(cnv and w1 and a1) or tfc',                4],
     ['U250',         'lfc',             'lfc',                                       2],
@@ -475,6 +480,21 @@ void findCopyZip(String board, String findDir, String copyDir) {
 // flag is a plain env var (env["STAGE_RAN_${stashName}"]) so Check Stage
 // Results can decide per-stash whether to unstash without hand-maintaining
 // a per-stage env var name.
+//
+// Sandbox note: dynamically-keyed access on `env` (which is EnvActionImpl,
+// not a plain Map) compiles to the static helpers
+// org.codehaus.groovy.runtime.DefaultGroovyMethods.putAt(Object,String,Object)
+// and getAt(Object,String). These are NOT in the script-security default
+// allowlist, so Jenkins rejected build #11 cnv-w2a1 with "Scripts not
+// permitted to use staticMethod ... DefaultGroovyMethods putAt ...". Both
+// signatures are now persisted in the ansible-managed
+// jenkins_script_security.yml allowlist for this controller; do not switch
+// to env.setProperty(name,val) / env.getProperty(name) without first adding
+// "method org.jenkinsci.plugins.workflow.cps.EnvActionImpl setProperty
+// java.lang.String java.lang.Object" and "... getProperty java.lang.String"
+// to that allowlist — those instance methods on EnvActionImpl are NOT
+// @Whitelisted by the pipeline plugin (verified via Script Console,
+// 2026-04-19).
 void markStageRan(String stashName) {
   env["STAGE_RAN_${stashName}"] = 'SUCCESS'
 }
