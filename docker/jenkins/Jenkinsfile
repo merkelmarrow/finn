@@ -194,21 +194,52 @@ pipeline {
       }
       steps {
         script {
+          // Ordering note (do NOT reorder without re-reading
+          // knowledge/platform/jenkins_ci.md §Known CI Issues #13):
+          //   1. unstash everything we expect to have been produced
+          //   2. publish junit FIRST — it parses XMLs directly from the
+          //      workspace, does NOT touch the agent->controller tar
+          //      pipeline, so it always succeeds if any XML was unstashed
+          //   3. merge HTMLs (defensive — failure here only loses the
+          //      combined report; per-stage HTMLs still archive)
+          //   4. archiveArtifacts (defensive — the agent->controller tar
+          //      transfer occasionally flakes on stash counts > ~10; see
+          //      build #12, "Failed to extract /scratch/.../transfer of 13
+          //      files" downgraded the stage to FAILURE *after* every
+          //      individual stage had already produced its XML/HTML)
           sh 'mkdir -p reports'
           cleanPreviousBuildFiles('reports')
           dir('reports') {
             expectedStashes().each { name -> unstashIf(name) }
           }
 
-          // Combine individual HTML files to one single report
-          sh './run-docker.sh pytest_html_merger -i reports/ -o reports/test_report_final.html'
+          // Plot what XML files were created during the test run.
+          // Run BEFORE archiveArtifacts so a flaky tar transfer in archive
+          // can never lose us the test result tree (junit reads files
+          // directly from the agent workspace).
+          junit allowEmptyResults: true, testResults: 'reports/*.xml'
 
-          // Archive the XML & HTML test results
-          archiveArtifacts artifacts: "reports/*.xml"
-          archiveArtifacts artifacts: "reports/*.html"
+          // Combine individual HTML files into one final report. Wrapped
+          // in catchError because pytest_html_merger occasionally chokes
+          // on partial inputs; per-stage HTMLs are still archived below.
+          catchError(buildResult: null, stageResult: 'UNSTABLE',
+                     message: 'pytest_html_merger failed; per-stage HTMLs still archived below') {
+            sh './run-docker.sh pytest_html_merger -i reports/ -o reports/test_report_final.html'
+          }
 
-          // Plot what XML files were created during the test run
-          junit 'reports/*.xml'
+          // Archive the XML & HTML test results. Wrapped in catchError
+          // because the agent->controller tar transfer ("transfer of N
+          // files") occasionally fails on large stash counts — without
+          // this, build #12 lost the entire stage to a transfer hiccup
+          // even though every per-stage XML/HTML had already been written.
+          catchError(buildResult: null, stageResult: 'UNSTABLE',
+                     message: 'archiveArtifacts (xml) transfer failed; reports still on agent workspace') {
+            archiveArtifacts artifacts: 'reports/*.xml', allowEmptyArchive: true
+          }
+          catchError(buildResult: null, stageResult: 'UNSTABLE',
+                     message: 'archiveArtifacts (html) transfer failed; reports still on agent workspace') {
+            archiveArtifacts artifacts: 'reports/*.html', allowEmptyArchive: true
+          }
         }
       }
     }
@@ -263,24 +294,51 @@ Map<String, Closure> buildParallelStageMap() {
 // Stage bodies (one per parallel branch)
 // ---------------------------------------------------------------------------
 
+// Stage-body pattern (read this before editing any of the 5 stages below):
+//
+//   withEnv([...]) {
+//     cleanPreviousBuildFiles(buildDir)   // safe to call before pytest
+//     try {
+//       catchError(stageResult: 'FAILURE') {
+//         runDockerPytest...(...)         // throws on pytest exit != 0
+//         // post-success-only artefact extraction (skipped on throw)
+//       }
+//     } finally {
+//       safeStashReport(stashName)        // ALWAYS runs (pass/fail/abort)
+//       archiveIfStageRan(...)            // optional, defensive
+//     }
+//   }
+//
+// catchError wraps ONLY the steps that may throw "expected" failures
+// (pytest exit-1, findCopyZip missing artefacts). safeStashReport MUST
+// live in a `finally` block so it runs regardless of whether pytest
+// passed or failed — otherwise `Check Stage Results` cannot aggregate
+// JUnit XMLs for failed stages and the build's test counts drop the
+// failing stages entirely. See knowledge/platform/jenkins_ci.md
+// §Known CI Issues #12 for the full diagnosis (build #12 lost the XMLs
+// for sanity_ut, fpgadataflow_a/b, end2end_mobilenet/rest this way).
+
 void sanityBuildHardwareStage() {
   node('finn-build') {
     stage('Sanity - Build Hardware') {
       checkout scm
       def testName = 'bnn_build_sanity'
       def buildDir = "${env.FINN_HOST_BUILD_DIR}/${testName}"
-      catchError(stageResult: 'FAILURE') {
-        withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
-          sh "mkdir -p ${testName}"
-          cleanPreviousBuildFiles(buildDir)
-          runDockerPytestWithMarker('sanity_bnn', testName, '')
-          // Ship every board's hw_deployment artefacts to ARTIFACT_DIR so
-          // downstream board-HW jobs can pick them up.
-          ['Pynq-Z1', 'ZCU104', 'KV260_SOM', 'U250'].each { b ->
-            findCopyZip(b, buildDir, testName)
+      withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
+        sh "mkdir -p ${testName}"
+        cleanPreviousBuildFiles(buildDir)
+        try {
+          catchError(stageResult: 'FAILURE') {
+            runDockerPytestWithMarker('sanity_bnn', testName, '')
+            // Ship every board's hw_deployment artefacts to ARTIFACT_DIR so
+            // downstream board-HW jobs can pick them up. Skipped if pytest
+            // failed (catchError swallows the throw and exits the closure).
+            ['Pynq-Z1', 'ZCU104', 'KV260_SOM', 'U250'].each { b ->
+              findCopyZip(b, buildDir, testName)
+            }
           }
-          stash name: testName, includes: "${testName}.xml,${testName}.html"
-          markStageRan(testName)
+        } finally {
+          safeStashReport(testName)
         }
       }
     }
@@ -293,16 +351,18 @@ void sanityUnitTestsStage() {
       checkout scm
       def testName = 'sanity_ut'
       def buildDir = "${env.FINN_HOST_BUILD_DIR}/${testName}"
-      catchError(stageResult: 'FAILURE') {
-        withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
-          cleanPreviousBuildFiles(buildDir)
-          runDockerPytestWithMarker(
-              'util or brevitas_export or streamline or transform or notebooks',
-              testName,
-              "-n ${env.NUM_PYTEST_WORKERS} --dist worksteal --cov --cov-report=html:coverage_${testName}"
-          )
-          stash name: testName, includes: "${testName}.xml,${testName}.html"
-          markStageRan(testName)
+      withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
+        cleanPreviousBuildFiles(buildDir)
+        try {
+          catchError(stageResult: 'FAILURE') {
+            runDockerPytestWithMarker(
+                'util or brevitas_export or streamline or transform or notebooks',
+                testName,
+                "-n ${env.NUM_PYTEST_WORKERS} --dist worksteal --cov --cov-report=html:coverage_${testName}"
+            )
+          }
+        } finally {
+          safeStashReport(testName)
           archiveIfStageRan(testName, "coverage_${testName}")
         }
       }
@@ -317,18 +377,20 @@ void fpgadataflowShardStage(String shardId, List<String> paths) {
       def testName = "fpgadataflow_${shardId}"
       def buildDir = "${env.FINN_HOST_BUILD_DIR}/${testName}"
       def nWorkers = (env.NUM_PYTEST_WORKERS ?: '8').toInteger()
-      catchError(stageResult: 'FAILURE') {
-        withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
-          cleanPreviousBuildFiles(buildDir)
-          runDockerPytestShard(
-              'fpgadataflow',
-              testName,
-              paths,
-              nWorkers,
-              "--cov --cov-report=html:coverage_${testName}"
-          )
-          stash name: testName, includes: "${testName}.xml,${testName}.html"
-          markStageRan(testName)
+      withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
+        cleanPreviousBuildFiles(buildDir)
+        try {
+          catchError(stageResult: 'FAILURE') {
+            runDockerPytestShard(
+                'fpgadataflow',
+                testName,
+                paths,
+                nWorkers,
+                "--cov --cov-report=html:coverage_${testName}"
+            )
+          }
+        } finally {
+          safeStashReport(testName)
           archiveIfStageRan(testName, "coverage_${testName}")
         }
       }
@@ -342,14 +404,16 @@ void end2endShardStage(String shardId, List<String> paths, int nWorkers) {
       checkout scm
       def testName = "end2end_${shardId}"
       def buildDir = "${env.FINN_HOST_BUILD_DIR}/${testName}"
-      catchError(stageResult: 'FAILURE') {
-        withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
-          cleanPreviousBuildFiles(buildDir)
-          // Every end2end scenario already carries an xdist_group marker, so
-          // scenarios fan out across workers without cross-talk.
-          runDockerPytestShard('end2end', testName, paths, nWorkers, '')
-          stash name: testName, includes: "${testName}.xml,${testName}.html"
-          markStageRan(testName)
+      withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
+        cleanPreviousBuildFiles(buildDir)
+        try {
+          catchError(stageResult: 'FAILURE') {
+            // Every end2end scenario already carries an xdist_group marker, so
+            // scenarios fan out across workers without cross-talk.
+            runDockerPytestShard('end2end', testName, paths, nWorkers, '')
+          }
+        } finally {
+          safeStashReport(testName)
         }
       }
     }
@@ -367,29 +431,34 @@ void bnnSubStage(String board, String label, String kExpr, int nWorkers) {
       def marker = BNN_BOARD_MARKERS[board]
       def stashName = bnnStashName(board, label)
       def buildDir = "${env.FINN_HOST_BUILD_DIR}/${stashName}"
-      catchError(stageResult: 'FAILURE') {
-        withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
-          sh "mkdir -p ${stashName}"
-          cleanPreviousBuildFiles(buildDir)
-          // BNN end2end tests have a strict sequential dependency chain: each
-          // test_* loads the previous step's checkpoint via
-          // load_test_checkpoint_or_skip. xdist `--dist worksteal` lets idle
-          // workers steal from busy ones across xdist_group boundaries, which
-          // executes tests out of declaration order and silently breaks the
-          // chain (every downstream test then skips). `--dist loadgroup`
-          // pins entire xdist_group cohorts to a single worker AND processes
-          // them sequentially in collection order. See build #10:
-          // bnn_KV260_SOM_cnv_w2a2 ran test_cppsim before test_export.
-          runDockerPytestWithMarker(
-              marker,
-              stashName,
-              "-k '${kExpr}' -n ${nWorkers} --dist loadgroup"
-          )
-          if (label == 'cnv-w2a2') {
-            findCopyZip(board, buildDir, stashName)
+      withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
+        sh "mkdir -p ${stashName}"
+        cleanPreviousBuildFiles(buildDir)
+        try {
+          catchError(stageResult: 'FAILURE') {
+            // BNN end2end tests have a strict sequential dependency chain: each
+            // test_* loads the previous step's checkpoint via
+            // load_test_checkpoint_or_skip. xdist `--dist worksteal` lets idle
+            // workers steal from busy ones across xdist_group boundaries, which
+            // executes tests out of declaration order and silently breaks the
+            // chain (every downstream test then skips). `--dist loadgroup`
+            // pins entire xdist_group cohorts to a single worker AND processes
+            // them sequentially in collection order. See build #10:
+            // bnn_KV260_SOM_cnv_w2a2 ran test_cppsim before test_export.
+            runDockerPytestWithMarker(
+                marker,
+                stashName,
+                "-k '${kExpr}' -n ${nWorkers} --dist loadgroup"
+            )
+            // hw_deployment artefacts only get shipped on full success;
+            // catchError above swallows pytest throws so this is skipped
+            // when tests fail (incomplete artefacts aren't useful anyway).
+            if (label == 'cnv-w2a2') {
+              findCopyZip(board, buildDir, stashName)
+            }
           }
-          stash name: stashName, includes: "${stashName}.xml,${stashName}.html"
-          markStageRan(stashName)
+        } finally {
+          safeStashReport(stashName)
         }
       }
     }
@@ -476,10 +545,25 @@ void findCopyZip(String board, String findDir, String copyDir) {
   }
 }
 
-// Record that a parallel branch reached its stash call successfully. The
-// flag is a plain env var (env["STAGE_RAN_${stashName}"]) so Check Stage
-// Results can decide per-stash whether to unstash without hand-maintaining
-// a per-stage env var name.
+// Stash the per-stage XML+HTML report iff pytest produced an XML, and
+// flip the STAGE_RAN_<name> env var so Check Stage Results knows to
+// unstash it. Designed to live in a `finally` block so it ALWAYS runs,
+// regardless of whether pytest passed, failed, or aborted — pytest
+// emits its junitxml on every exit code (pass, fail, collection error,
+// keyboard interrupt) so an XML existing on disk is the right "we have
+// something to aggregate" signal. The contract is intentionally:
+//   "STAGE_RAN_<name> means we stashed an XML"
+// NOT:
+//   "STAGE_RAN_<name> means pytest passed".
+// Pass/fail status comes from the JUnit XMLs themselves and from the
+// stage's own catchError(stageResult: 'FAILURE') marking — which is
+// completely orthogonal to whether we managed to ship the report.
+//
+// Wrapped in catchError(buildResult: null, stageResult: null) so a
+// stash hiccup (NFS blip, full disk on the controller) cannot turn a
+// pure test-result-archive operation into a build-status-affecting
+// failure. The stage's pass/fail is already determined by the catchError
+// around the pytest invocation itself.
 //
 // Sandbox note: dynamically-keyed access on `env` (which is EnvActionImpl,
 // not a plain Map) compiles to the static helpers
@@ -494,25 +578,35 @@ void findCopyZip(String board, String findDir, String copyDir) {
 // java.lang.String java.lang.Object" and "... getProperty java.lang.String"
 // to that allowlist — those instance methods on EnvActionImpl are NOT
 // @Whitelisted by the pipeline plugin (verified via Script Console,
-// 2026-04-19).
-void markStageRan(String stashName) {
-  env["STAGE_RAN_${stashName}"] = 'SUCCESS'
+// 2026-04-19). Full diagnosis: knowledge/platform/jenkins_ci.md §Known
+// CI Issues #11.
+void safeStashReport(String stashName) {
+  catchError(buildResult: null, stageResult: null,
+             message: "safeStashReport(${stashName}) failed; non-fatal, junit aggregation may be partial") {
+    if (fileExists("${stashName}.xml")) {
+      stash name: stashName, includes: "${stashName}.xml,${stashName}.html"
+      env["STAGE_RAN_${stashName}"] = 'SUCCESS'
+    }
+  }
 }
 
-// Unstash <stashName> iff the owning stage reached its stash call
-// successfully (i.e. markStageRan was invoked). No-op otherwise — the
-// stage already failed the build via catchError, and we simply skip
-// aggregating an absent stash.
+// Unstash <stashName> iff the owning stage produced an XML and stashed
+// it (i.e. safeStashReport flipped the env flag). No-op otherwise.
 void unstashIf(String stashName) {
   if (env["STAGE_RAN_${stashName}"]) {
     unstash stashName
   }
 }
 
-// Archive a coverage (or similar) folder iff the owning stage succeeded.
+// Archive a coverage (or similar) folder iff the owning stage produced
+// a stash. Wrapped in catchError so a missing/empty coverage dir doesn't
+// fail the stage on top of whatever already happened.
 void archiveIfStageRan(String stashName, String folder) {
   if (env["STAGE_RAN_${stashName}"]) {
-    archiveArtifacts artifacts: "${folder}/**/*"
+    catchError(buildResult: null, stageResult: null,
+               message: "archiveArtifacts(${folder}) failed; non-fatal") {
+      archiveArtifacts artifacts: "${folder}/**/*", allowEmptyArchive: true
+    }
   }
 }
 
