@@ -152,15 +152,16 @@ void publishSharedDockerImage(String sharedDir) {
   ).trim()
   sh "mkdir -p ${sharedDir}"
   sh "echo '${tag}' > ${sharedDir}/finn-docker-tag.txt"
-  // pigz uses all cores; fall back to gzip when the agent lacks it.
-  sh """
-    set -o pipefail
-    if command -v pigz >/dev/null 2>&1; then
-      docker save '${tag}' | pigz -p \$(nproc) > '${sharedDir}/finn-docker-image.tar.gz'
-    else
-      docker save '${tag}' | gzip > '${sharedDir}/finn-docker-image.tar.gz'
-    fi
-  """
+  // Shebang at col 0 so Jenkins durable-task runs this with bash, not /bin/sh
+  // (dash on Ubuntu lacks `set -o pipefail`); pigz uses all cores, gzip is fallback.
+  sh """#!/bin/bash
+set -o pipefail
+if command -v pigz >/dev/null 2>&1; then
+  docker save '${tag}' | pigz -p \$(nproc) > '${sharedDir}/finn-docker-image.tar.gz'
+else
+  docker save '${tag}' | gzip > '${sharedDir}/finn-docker-image.tar.gz'
+fi
+"""
 }
 
 Map<String, Closure> buildParallelStageMap() {
