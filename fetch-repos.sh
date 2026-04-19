@@ -28,17 +28,10 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# Fail-fast: a partially-populated deps/ tree is worse than no deps/ tree at
-# all. The container entrypoint (docker/finn_entrypoint.sh) does
-# `pip install -e ${FINN_ROOT}/deps/qonnx` etc., and pytest later imports
-# qonnx/brevitas at collection time. If a `git clone` here silently fails
-# (transient github.com hiccup, DNS blip, rate-limit) and we exit 0 anyway,
-# the failure surfaces hours later as "ModuleNotFoundError: qonnx" with 100+
-# pytest collection errors that look unrelated to the original problem.
-#
-# NOTE: deliberately omit `-u` (nounset). Several optional environment
-# variables (FINN_SKIP_BOARD_FILES, etc.) are intended to be unset by
-# default, and tripping `unbound variable` on them is a regression.
+# Fail-fast on transient clone errors so a partial deps/ tree doesn't surface
+# hours later as ModuleNotFoundError during pytest collection.
+# `-u` is deliberately omitted: optional vars like FINN_SKIP_BOARD_FILES are
+# expected to be unset by default.
 set -eo pipefail
 
 QONNX_COMMIT="f5c9819bd00f01f41e70639b8461c8e4b39432f7"
@@ -83,11 +76,7 @@ SCRIPT=$(readlink -f "$0")
 # absolute path this script is in, thus /home/user/bin
 SCRIPTPATH=$(dirname "$SCRIPT")
 
-# Run a command up to N times, with exponential back-off, before giving up.
-# Use for any command that may fail transiently due to network conditions
-# (github.com 5xx, DNS blips, rate-limit). Always returns the exit status of
-# the last attempt, so callers under `set -e` will still abort on permanent
-# failure.
+# Retry a command with exponential back-off (github.com 5xx, DNS blips, rate-limit).
 retry() {
     local n=0
     local max=5
@@ -105,18 +94,12 @@ retry() {
 }
 
 fetch_repo() {
-    # URL for git repo to be cloned
     local REPO_URL=$1
-    # commit hash for repo
     local REPO_COMMIT=$2
-    # directory to clone to under deps/
     local REPO_DIR=$3
-    # absolute path for the repo local copy
     local CLONE_TO=$SCRIPTPATH/deps/$REPO_DIR
 
-    # If a previous run left a partial clone (e.g. interrupted git clone),
-    # the directory exists but is not a valid git repo. Detect and discard
-    # so the retry below gets a clean slate instead of silently exiting.
+    # Discard a partial clone left by a previous interrupted run.
     if [ -d "$CLONE_TO" ] && ! git -C "$CLONE_TO" rev-parse --git-dir >/dev/null 2>&1; then
         echo "fetch-repos: discarding partial clone at $CLONE_TO" >&2
         rm -rf "$CLONE_TO"
@@ -129,9 +112,7 @@ fetch_repo() {
     local CURRENT_COMMIT
     CURRENT_COMMIT=$(git -C "$CLONE_TO" rev-parse HEAD)
     if [ "$CURRENT_COMMIT" != "$REPO_COMMIT" ]; then
-        # `fetch` rather than `pull` because the working copy is typically a
-        # detached HEAD on $REPO_COMMIT (see explicit checkout below); pull
-        # requires a tracking branch and silently no-ops in detached HEAD.
+        # fetch+checkout rather than pull: working copy is detached HEAD.
         retry git -C "$CLONE_TO" fetch --tags --force
         git -C "$CLONE_TO" checkout "$REPO_COMMIT"
     fi

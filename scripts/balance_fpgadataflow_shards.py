@@ -1,48 +1,32 @@
 #!/usr/bin/env python3
-"""Balance the two fpgadataflow shard lists used by the FINN Jenkins pipeline.
+"""Recompute the explicit fpgadataflow shard A allowlist used by the FINN
+Jenkins pipeline.
 
-Reads a pytest junit XML file produced by the fpgadataflow stage, aggregates
-per-file test durations, and greedy-bin-packs files into two roughly equal
-shards by total wall-clock time. Emits Groovy list literals that can be
-pasted directly over FPGADATAFLOW_SHARD_A and FPGADATAFLOW_SHARD_B at the
-top of docker/jenkins/Jenkinsfile.
+Shard B is a catch-all in the Jenkinsfile (everything under tests/fpgadataflow/
+that is NOT in shard A), so we only need to decide which test files belong on
+shard A — typically the slowest half by total wall-clock — to keep both shards
+roughly balanced.
+
+Reads pytest junit XMLs from previous fpgadataflow runs, aggregates per-file
+durations, greedy-bin-packs into two halves by total wall, and prints the
+larger half as a Groovy list literal that can be pasted over
+FPGADATAFLOW_SHARD_A at the top of docker/jenkins/Jenkinsfile.
 
 Usage
 -----
     ./scripts/balance_fpgadataflow_shards.py reports/fpgadataflow_a.xml \\
                                              reports/fpgadataflow_b.xml
 
-One or more junit XMLs may be passed (handy for combining shard-A and
-shard-B runs from the same build); durations are summed per file across
-all inputs.
-
-Rebalance cadence
------------------
-Re-run after any build where the observed wall-clock of one shard exceeds
-the other by more than ~15 %. The helper is idempotent; if both shards are
-already well balanced the output is identical (modulo ordering) to the
-current Jenkinsfile lists.
+Re-run after any build where one shard's wall exceeds the other by >15 %.
 """
 from __future__ import annotations
 
 import argparse
 import sys
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
 from pathlib import Path
 
 TESTS_ROOT = "tests/fpgadataflow/"
-
-
-@dataclass
-class Shard:
-    name: str
-    total: float = 0.0
-    files: list[str] = field(default_factory=list)
-
-    def add(self, path: str, duration: float) -> None:
-        self.files.append(path)
-        self.total += duration
 
 
 def aggregate_durations(xml_paths: list[Path]) -> dict[str, float]:
@@ -53,14 +37,12 @@ def aggregate_durations(xml_paths: list[Path]) -> dict[str, float]:
         for tc in tree.iter("testcase"):
             classname = tc.attrib.get("classname", "")
             file_attr = tc.attrib.get("file")
-            # Prefer the explicit 'file' attribute when present; fall back to
-            # inferring from classname (pytest usually emits dotted module
-            # paths like "tests.fpgadataflow.test_fpgadataflow_mvau").
+            # Prefer 'file' attr when present; fall back to dotted classname.
             if file_attr:
                 rel = file_attr
             elif classname:
                 parts = classname.split(".")
-                module_parts = []
+                module_parts: list[str] = []
                 for part in parts:
                     module_parts.append(part)
                     if part.startswith("test_"):
@@ -78,23 +60,29 @@ def aggregate_durations(xml_paths: list[Path]) -> dict[str, float]:
     return durations
 
 
-def pack(durations: dict[str, float]) -> tuple[Shard, Shard]:
-    """Greedy largest-first bin-pack into two shards."""
-    shard_a = Shard("FPGADATAFLOW_SHARD_A")
-    shard_b = Shard("FPGADATAFLOW_SHARD_B")
+def pack_shard_a(durations: dict[str, float]) -> tuple[list[str], float, float]:
+    """Greedy largest-first bin-pack into two halves; return the heavier half
+    plus its wall and the lighter half's wall."""
+    a_files: list[str] = []
+    b_files: list[str] = []
+    a_total = 0.0
+    b_total = 0.0
     for path, duration in sorted(
         durations.items(), key=lambda kv: (-kv[1], kv[0])
     ):
-        target = shard_a if shard_a.total <= shard_b.total else shard_b
-        target.add(path, duration)
-    shard_a.files.sort()
-    shard_b.files.sort()
-    return shard_a, shard_b
+        if a_total <= b_total:
+            a_files.append(path)
+            a_total += duration
+        else:
+            b_files.append(path)
+            b_total += duration
+    a_files.sort()
+    return a_files, a_total, b_total
 
 
-def emit_groovy(shard: Shard) -> str:
-    lines = [f"@Field", f"List<String> {shard.name} = ["]
-    for path in shard.files:
+def emit_groovy(files: list[str]) -> str:
+    lines = ["@Field", "List<String> FPGADATAFLOW_SHARD_A = ["]
+    for path in files:
         lines.append(f"    '{path}',")
     lines.append("]")
     return "\n".join(lines)
@@ -118,23 +106,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    shard_a, shard_b = pack(durations)
+    shard_a_files, a_total, b_total = pack_shard_a(durations)
+    skew = (
+        0.0
+        if max(a_total, b_total) == 0
+        else abs(a_total - b_total) / max(a_total, b_total) * 100
+    )
 
     print(f"# Aggregated from {len(args.junit_xml)} junit file(s),")
     print(f"# {len(durations)} fpgadataflow test file(s).")
-    print(f"# Shard A wall: {shard_a.total:.1f}s across {len(shard_a.files)} files")
-    print(f"# Shard B wall: {shard_b.total:.1f}s across {len(shard_b.files)} files")
-    skew = (
-        0.0
-        if max(shard_a.total, shard_b.total) == 0
-        else abs(shard_a.total - shard_b.total)
-        / max(shard_a.total, shard_b.total)
-        * 100
-    )
+    print(f"# Shard A (explicit allowlist below): {a_total:.1f}s across {len(shard_a_files)} files")
+    print(f"# Shard B (catch-all, implicit):      {b_total:.1f}s across {len(durations) - len(shard_a_files)} files")
     print(f"# Skew: {skew:.1f}% (rebalance if >15 %)\n")
-    print(emit_groovy(shard_a))
-    print()
-    print(emit_groovy(shard_b))
+    print(emit_groovy(shard_a_files))
     return 0
 
 

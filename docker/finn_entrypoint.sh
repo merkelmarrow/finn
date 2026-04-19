@@ -28,11 +28,8 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
-# Fail-fast: if any pip install or env source step below fails (e.g. because
-# fetch-repos.sh on the host left a partial deps/ tree), abort the container
-# instead of silently exec'ing the user command. Without this, a missing
-# qonnx editable install surfaces hours later as opaque "ModuleNotFoundError"
-# pytest collection errors that look unrelated to the entrypoint.
+# Fail-fast on missing deps so a partial host-side fetch-repos.sh doesn't
+# surface hours later as opaque ModuleNotFoundError during pytest collection.
 set -e
 
 export HOME=/tmp/home_dir
@@ -61,11 +58,8 @@ recho () {
   echo -e "${RED}ERROR: $1${NC}"
 }
 
-# qonnx (using workaround for https://github.com/pypa/pip/issues/7953)
-# to be fixed in future Ubuntu versions (https://bugs.launchpad.net/ubuntu/+source/setuptools/+bug/1994016)
-# Trap restores pyproject.toml even if pip install aborts under `set -e`,
-# so the on-host workspace is not left in a half-renamed state for the next
-# container invocation.
+# qonnx pyproject.toml workaround for https://github.com/pypa/pip/issues/7953.
+# Trap ensures we restore the file even if pip install aborts under `set -e`.
 mv ${FINN_ROOT}/deps/qonnx/pyproject.toml ${FINN_ROOT}/deps/qonnx/pyproject.tmp
 trap 'mv ${FINN_ROOT}/deps/qonnx/pyproject.tmp ${FINN_ROOT}/deps/qonnx/pyproject.toml 2>/dev/null || true' EXIT
 pip install --user -e ${FINN_ROOT}/deps/qonnx
@@ -124,9 +118,7 @@ else
     gecho "Found existing finn_xsi at ${FINN_ROOT}/finn_xsi/xsi.so"
   else
     gecho "Building finn_xsi using finn.xsi.setup..."
-    # Wrap in if/else so a non-zero exit is treated as a recoverable warning
-    # under `set -e` rather than aborting the entrypoint — matches the
-    # original "log and continue" semantics from the pre-set -e version.
+    # if/else preserves "log and continue" semantics under `set -e`.
     if python -m finn.xsi.setup --quiet; then
       gecho "finn_xsi built successfully"
     else

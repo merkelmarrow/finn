@@ -172,10 +172,8 @@ if [ "$FINN_DOCKER_NO_CACHE" = "1" ]; then
 fi
 
 # If the image isn't available locally, try loading from shared storage.
-# This is independent of FINN_DOCKER_PREBUILT: loading is an image
-# acquisition step, not a build step. With PREBUILT=1 it provides the
-# image so the build below is skipped; with PREBUILT=0 it warms the
-# layer cache so the build below runs faster.
+# Independent of FINN_DOCKER_PREBUILT — with PREBUILT=1 this provides the
+# image, with PREBUILT=0 it warms the layer cache.
 if [ ! -z "$FINN_DOCKER_SHARED_DIR" ] && \
    ! docker image inspect "$FINN_DOCKER_TAG" > /dev/null 2>&1; then
   SHARED_IMG="$FINN_DOCKER_SHARED_DIR/finn-docker-image.tar.gz"
@@ -183,7 +181,7 @@ if [ ! -z "$FINN_DOCKER_SHARED_DIR" ] && \
   if [ -f "$SHARED_IMG" ] && [ -f "$SHARED_TAG_FILE" ]; then
     gecho "Loading Docker image from shared storage ($FINN_DOCKER_SHARED_DIR)..."
     SHARED_TAG=$(cat "$SHARED_TAG_FILE")
-    # Lock is local (/tmp) to serialize loads on the same host. Do not move to NFS.
+    # /tmp lock serialises loads on the same host (do not move to NFS).
     if flock /tmp/finn-docker-load.lock bash -c "set -o pipefail; gunzip -c '$SHARED_IMG' | docker load"; then
       if [ "$SHARED_TAG" != "$FINN_DOCKER_TAG" ]; then
         gecho "Tagging $SHARED_TAG as $FINN_DOCKER_TAG"
@@ -242,19 +240,10 @@ DOCKER_EXEC+="-e LD_PRELOAD=/lib/x86_64-linux-gnu/libudev.so.1 "
 # Workaround for running multiple Vivado instances simultaneously, see:
 # https://adaptivesupport.amd.com/s/article/63253?language=en_US
 DOCKER_EXEC+="-e XILINX_LOCAL_USER_DATA=no "
-# Optional host-side cache for downloaded artefacts (torch.hub pretrained
-# weights, huggingface). Avoids re-downloading large files from github.com
-# release CDNs on every concurrent CI run — GitHub has been observed to
-# return HTTP 504 under heavy parallel load, which fails tests like
-# end2end_mobilenet that pull a ~50 MB checkpoint at runtime.
-#
-# The mount target is /finn_cache (NOT $HOME/.cache) because Docker
-# auto-creates parent directories of bind mounts as root:root. Mounting
-# inside $HOME would make $HOME root-owned, which then breaks
-# `pip install --user` (which writes to $HOME/.local) inside the
-# container's non-root user. The entrypoint sets TORCH_HOME / HF_HOME
-# to point at this cache.
-# Set FINN_DOCKER_CACHE_DIR to "" to disable.
+# Optional host-side cache for torch.hub / huggingface weights to avoid
+# re-downloading on every parallel CI run (github CDN returns 504 under load).
+# Mount target is /finn_cache, NOT under $HOME, because Docker creates bind
+# parents as root and that would break pip install --user.
 : ${FINN_DOCKER_CACHE_DIR=""}
 if [ -n "$FINN_DOCKER_CACHE_DIR" ] && [ -d "$FINN_DOCKER_CACHE_DIR" ]; then
   DOCKER_EXEC+="-v $FINN_DOCKER_CACHE_DIR:/finn_cache "
