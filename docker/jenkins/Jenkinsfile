@@ -366,10 +366,19 @@ void bnnSubStage(String board, String label, String kExpr, int nWorkers) {
         withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
           sh "mkdir -p ${stashName}"
           cleanPreviousBuildFiles(buildDir)
+          // BNN end2end tests have a strict sequential dependency chain: each
+          // test_* loads the previous step's checkpoint via
+          // load_test_checkpoint_or_skip. xdist `--dist worksteal` lets idle
+          // workers steal from busy ones across xdist_group boundaries, which
+          // executes tests out of declaration order and silently breaks the
+          // chain (every downstream test then skips). `--dist loadgroup`
+          // pins entire xdist_group cohorts to a single worker AND processes
+          // them sequentially in collection order. See build #10:
+          // bnn_KV260_SOM_cnv_w2a2 ran test_cppsim before test_export.
           runDockerPytestWithMarker(
               marker,
               stashName,
-              "-k '${kExpr}' -n ${nWorkers} --dist worksteal"
+              "-k '${kExpr}' -n ${nWorkers} --dist loadgroup"
           )
           if (label == 'cnv-w2a2') {
             findCopyZip(board, buildDir, stashName)
@@ -429,13 +438,19 @@ void runDockerPytestWithMarker(String marker, String testResultsFilename, String
 }
 
 // Run pytest filtered by marker and restricted to an explicit list of file
-// paths (used for End2end and fpgadataflow sharding). Always uses
-// pytest-xdist with worksteal for even scheduling.
+// paths (used for End2end and fpgadataflow sharding). Uses pytest-xdist
+// with `--dist loadgroup` so that tests carrying the same xdist_group mark
+// are pinned to the same worker AND run in collection order. The end2end
+// suites depend on per-scenario checkpoints written by earlier tests in
+// the same group; `--dist worksteal` allowed idle workers to steal across
+// groups and executed tests out of order, silently skipping the chain
+// (build #10, bnn_KV260_SOM_cnv_w2a2: test_cppsim ran before test_export).
+// fpgadataflow tests are independent so loadgroup degenerates to load there.
 void runDockerPytestShard(String marker, String testResultsFilename, List<String> paths, int nWorkers, String additionalOptions) {
   def pathArgs = paths.join(' ')
   runPytestScript(
       "python -m pytest -m '${marker}' ${pathArgs}" +
-      " -n ${nWorkers} --dist worksteal" +
+      " -n ${nWorkers} --dist loadgroup" +
       " --junitxml=${testResultsFilename}.xml" +
       " --html=${testResultsFilename}.html --self-contained-html" +
       " ${additionalOptions}"
