@@ -1,63 +1,62 @@
-# FINN Jenkins CI — stage lookup
+# FINN Jenkins CI — maintainer guide
 
-This file is the **human-readable index** of what each parallel stage in
-[`Jenkinsfile`](./Jenkinsfile) runs. If you want to know which stage exercises
-a given test, marker, or board, start here.
+Every parallel stage is defined by **one row** of `PARALLEL_SHARDS` at the
+top of [`Jenkinsfile`](./Jenkinsfile). Actual test selection and shard
+splitting are done by the standard `-m <marker>` expression plus the tiny
+`--num-shards` / `--shard-id` plugin in [`tests/conftest.py`](../../tests/conftest.py).
+No state, no allowlists, no rebalancing script.
 
-## Quick answers
+## How do I …
 
-| Question                                                 | Where to look                                                                                |
-| -------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| Which stage runs test `tests/foo/test_bar.py::baz`?       | `./scripts/list_ci_stages.py` and grep, or `--collect 'Stage Name'`                          |
-| Why is this stage so slow?                               | Row `workers:` column below; tune in `BNN_SUB_STAGES` / `END2END_SHARDS` in `Jenkinsfile`    |
-| How do I move a fpgadataflow test between shards?         | Add/remove `pytestmark = [pytest.mark.fpgadataflow_slow]` in the test file; no Jenkinsfile edit |
-| How do I add a new BNN sub-stage?                        | Mark the target tests, register the marker in `setup.cfg`, add a row to `BNN_SUB_STAGES`    |
-| What does this stage actually execute?                   | Jenkins console log prints `runPytest[<stash>]: python -m pytest …` before every invocation |
+### … add a new test?
 
-## Stage → pytest / agent / stash table
+Decorate it with the existing marker (`@pytest.mark.fpgadataflow`,
+`@pytest.mark.end2end`, `@pytest.mark.bnn_u250`, …). That is the entire CI
+change. The next CI run deterministically hashes the new test's `nodeid`
+into one of the shards for that marker.
 
-All stages run on a `finn-build` agent. The `Build Docker Image` and
-`Check Stage Results` stages are sequential; everything else runs in the
-`Run Tests` parallel block, gated by the `sanity`/`fpgadataflow`/`end2end`
-job parameters.
+### … add a new BNN parameter value (e.g. a new `(wbits, abits)` combo)?
 
-| Stage                       | Param         | Marker expression                                                         | Stash                      | Extra artefacts                              |
-| --------------------------- | ------------- | ------------------------------------------------------------------------- | -------------------------- | -------------------------------------------- |
-| Build Docker Image          | (always)      | —                                                                         | —                          | `finn-docker-image.tar.gz` (shared dir)      |
-| Sanity - Build Hardware     | sanity\*      | `sanity_bnn`                                                              | `bnn_build_sanity`         | `{U250,Pynq-Z1,ZCU104,KV260_SOM}.zip`        |
-| Sanity - Unit Tests         | sanity        | `util or brevitas_export or streamline or transform or notebooks`         | `sanity_ut`                | `coverage_sanity_ut/`                        |
-| fpgadataflow - shard A      | fpgadataflow  | `fpgadataflow and fpgadataflow_slow`                                      | `fpgadataflow_a`           | `coverage_fpgadataflow_a/`                   |
-| fpgadataflow - shard B      | fpgadataflow  | `fpgadataflow and not fpgadataflow_slow`                                  | `fpgadataflow_b`           | `coverage_fpgadataflow_b/`                   |
-| BNN \<Board\> - \<label\>   | end2end       | `bnn_<board> and <scenario markers>` (see `BNN_SUB_STAGES`)               | `bnn_<Board>_<label>`      | `<Board>.zip` when label == `cnv-w2a2`       |
-| End2end - mobilenet         | end2end       | `end2end` on `tests/end2end/test_end2end_mobilenet_v1.py`                 | `end2end_mobilenet`        | —                                            |
-| End2end - rest              | end2end       | `end2end` on the remaining four `tests/end2end/*.py` files                | `end2end_rest`             | —                                            |
-| Check Stage Results         | (always)      | — (`junit` + `pytest_html_merger`)                                        | —                          | `reports/*.xml`, `reports/*.html`            |
+Edit the lists in `tests/end2end/test_end2end_bnn_pynq.py::pytest_generate_tests`.
+Nothing else. The new parameter lands in some shard of the board's marker
+automatically.
 
-\* Sanity-Build-Hardware is **skipped when `end2end` is also set** — the BNN
-sub-stages already rebuild the same four sanity scenarios.
+### … add a new BNN board?
 
-## Adding/removing tests from the heavy fpgadataflow shard
+1. Add the marker (`bnn_<board>`) to `setup.cfg` under `[tool:pytest]` `markers`.
+2. Update `test_board_map` / `pytest_generate_tests` in the BNN test file.
+3. Add one row to `PARALLEL_SHARDS` — `marker: 'bnn_<board>'`, a shard count
+   and worker count, and `zipBoards: ['<Board>']` if it produces bitstreams
+   for hardware validation.
 
-The heavy shard is defined by the `fpgadataflow_slow` marker. To rebalance:
+### … handle a test that got much slower?
 
-```
-./scripts/balance_fpgadataflow_shards.py reports/fpgadataflow_*.xml
-```
+Nothing, usually — `worksteal`/`loadgroup` within a shard absorbs most
+variance. If a whole marker's wall-clock grows out of budget, bump its
+`shards:` count in `PARALLEL_SHARDS` (more Jenkins agents run it in
+parallel, same total work).
 
-prints `ADD` / `REMOVE` recommendations for the module-level `pytestmark =
-[pytest.mark.fpgadataflow_slow]` in each test file. Apply those edits in the
-test files; no Jenkinsfile change is needed.
+### … find which stage runs a given test?
 
-## Adding a new BNN scenario
+Run `pytest --collect-only -m '<marker>' <path/to/test.py>` locally. The
+marker is what CI selects on. The Jenkins console log also echoes
+`runPytest[<stash>]: python -m pytest …` at the start of every stage.
 
-1. Pick or add a scenario marker (e.g. `bnn_cnv_w4a4`) in
-   `tests/end2end/test_end2end_bnn_pynq.py::pytest_generate_tests`.
-2. Register it under `[tool:pytest]` `markers` in `setup.cfg`.
-3. Add a row to `BNN_SUB_STAGES` with `marker: 'bnn_<board> and bnn_cnv_w4a4'`
-   and add its stash to `expectedStashes()` automatically via the loop there.
+### … verify a marker still has CI coverage?
 
-## See also
+Any marker used in `PARALLEL_SHARDS` that collects **zero** tests will fail
+the stage loudly — the plugin raises `UsageError`. A silent-skip is
+impossible by construction.
 
-- `scripts/list_ci_stages.py` — source-of-truth Python extractor
-- `knowledge/platform/jenkins_ci.md` — agent / credential / bug history
-- `knowledge/analyses/finn_ci_12h_15exec_parallelisation.md` — wall-clock budget
+## Stage → param mapping
+
+Stages are gated by the job parameters `sanity`, `fpgadataflow`, `end2end`.
+The `Sanity - Build Hardware` row is suppressed when `end2end=true` because
+the BNN rows rebuild the same scenarios.
+
+## Artefacts
+
+- `reports/*.xml`, `reports/*.html` (merged via `pytest_html_merger`)
+- `coverage_<stash>/` per row with `coverage: true`
+- `<Board>.zip` per row with `zipBoards: [...]` — only emitted by the shard
+  that happens to have run the tests producing `hw_deployment_*` output.

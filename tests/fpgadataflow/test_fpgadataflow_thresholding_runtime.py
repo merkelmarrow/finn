@@ -47,8 +47,6 @@ from finn.transformation.fpgadataflow.prepare_ip import PrepareIP
 from finn.transformation.fpgadataflow.prepare_rtlsim import PrepareRTLSim
 from finn.transformation.fpgadataflow.specialize_layers import SpecializeLayers
 
-pytestmark = [pytest.mark.fpgadataflow_slow]  # heavy shard; see docker/jenkins/README.md
-
 finnxsi = xsi if xsi.is_available() else None
 
 test_fpga_part = "xczu3eg-sbva484-1-e"

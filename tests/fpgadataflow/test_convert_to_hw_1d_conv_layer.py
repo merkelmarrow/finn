@@ -54,8 +54,6 @@ from finn.transformation.fpgadataflow.specialize_layers import SpecializeLayers
 from finn.util.fpgadataflow import is_fpgadataflow_node
 
 
-pytestmark = [pytest.mark.fpgadataflow_slow]  # heavy shard; see docker/jenkins/README.md
-
 # conv_config:
 # [pad_h_begin, pad_w_begin, pad_h_end, pad_w_end]
 # [kernel_size_h, kernel_size_w]

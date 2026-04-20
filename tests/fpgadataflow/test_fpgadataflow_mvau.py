@@ -70,8 +70,6 @@ from finn.transformation.general import ApplyConfig
 from finn.transformation.streamline.round_thresholds import RoundAndClipThresholds
 from finn.util.basic import is_versal
 
-pytestmark = [pytest.mark.fpgadataflow_slow]  # heavy shard; see docker/jenkins/README.md
-
 finnxsi = xsi if xsi.is_available() else None
 
 

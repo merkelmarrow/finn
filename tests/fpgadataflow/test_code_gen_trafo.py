@@ -38,8 +38,6 @@ from qonnx.util.basic import gen_finn_dt_tensor, get_by_name, qonnx_make_model
 from finn.transformation.fpgadataflow.prepare_cppsim import PrepareCppSim
 
 
-pytestmark = [pytest.mark.fpgadataflow_slow]  # heavy shard; see docker/jenkins/README.md
-
 @pytest.mark.fpgadataflow
 @pytest.mark.vivado
 def test_code_gen_trafo():
