@@ -76,18 +76,23 @@ pipeline {
   }
 }
 
-// Return a job parameter via the sandbox-safe property-access path. Avoids
-// `params[key]` which lowers to DefaultGroovyMethods.getAt(Object,String)
-// (not whitelisted — same class that bit env[k]=v in iter-1).
+// Return a job parameter via java.util.Map.get — `params` is a
+// Collections$UnmodifiableMap, so standard Map access is sandbox-safe.
+// (Earlier iter-5 draft used `params.getProperty(name)` under the mistaken
+// assumption that `params[name]` was a sandbox hazard like `env[k]=v` from
+// iter-1. `env` is EnvActionImpl, not a Map; `params` IS a Map, so
+// DefaultGroovyMethods.getAt(Map,Object) applies and is whitelisted.
+// `params.getProperty(name)` fails with MissingMethodException because
+// UnmodifiableMap has no such method — verified on #16.)
 boolean paramBool(String name) {
-  def v = params.getProperty(name)
+  def v = params.get(name)
   if (v == null) { return false }
   if (v instanceof Boolean) { return v }
   return v.toString().toBoolean()
 }
 
 String paramString(String name) {
-  def v = params.getProperty(name)
+  def v = params.get(name)
   return v == null ? '' : v.toString()
 }
 
