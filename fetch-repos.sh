@@ -28,10 +28,9 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# Fail-fast on transient clone errors so a partial deps/ tree doesn't surface
-# hours later as ModuleNotFoundError during pytest collection.
-# `-u` is deliberately omitted: optional vars like FINN_SKIP_BOARD_FILES are
-# expected to be unset by default.
+# Fail-fast so a partial deps/ tree is caught here, not hours later as
+# ModuleNotFoundError during pytest collection. `-u` is deliberately omitted:
+# optional FINN_SKIP_* flags are expected to be unset.
 set -eo pipefail
 
 QONNX_COMMIT="f5c9819bd00f01f41e70639b8461c8e4b39432f7"
@@ -76,7 +75,7 @@ SCRIPT=$(readlink -f "$0")
 # absolute path this script is in, thus /home/user/bin
 SCRIPTPATH=$(dirname "$SCRIPT")
 
-# Retry a command with exponential back-off (github.com 5xx, DNS blips, rate-limit).
+# Retry a command with exponential back-off (github 5xx, DNS blips, rate-limit).
 retry() {
     local n=0
     local max=5
@@ -99,7 +98,7 @@ fetch_repo() {
     local REPO_DIR=$3
     local CLONE_TO=$SCRIPTPATH/deps/$REPO_DIR
 
-    # Discard a partial clone left by a previous interrupted run.
+    # Drop a partial clone left by a previous interrupted run.
     if [ -d "$CLONE_TO" ] && ! git -C "$CLONE_TO" rev-parse --git-dir >/dev/null 2>&1; then
         echo "fetch-repos: discarding partial clone at $CLONE_TO" >&2
         rm -rf "$CLONE_TO"
@@ -112,7 +111,7 @@ fetch_repo() {
     local CURRENT_COMMIT
     CURRENT_COMMIT=$(git -C "$CLONE_TO" rev-parse HEAD)
     if [ "$CURRENT_COMMIT" != "$REPO_COMMIT" ]; then
-        # fetch+checkout rather than pull: working copy is detached HEAD.
+        # fetch+checkout instead of pull: working copy is a detached HEAD.
         retry git -C "$CLONE_TO" fetch --tags --force
         git -C "$CLONE_TO" checkout "$REPO_COMMIT"
     fi

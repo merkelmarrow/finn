@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
-"""Recompute the explicit fpgadataflow shard A allowlist used by the FINN
-Jenkins pipeline.
+"""Recompute the FPGADATAFLOW_SHARD_A allowlist in docker/jenkins/Jenkinsfile.
 
-Shard B is a catch-all in the Jenkinsfile (everything under tests/fpgadataflow/
-that is NOT in shard A), so we only need to decide which test files belong on
-shard A — typically the slowest half by total wall-clock — to keep both shards
-roughly balanced.
+Reads pytest junit XMLs, aggregates per-file durations, greedy-bin-packs into
+two halves, and prints the heavier half as a Groovy list literal. Shard B is
+the Jenkinsfile catch-all, so only shard A needs to be enumerated.
 
-Reads pytest junit XMLs from previous fpgadataflow runs, aggregates per-file
-durations, greedy-bin-packs into two halves by total wall, and prints the
-larger half as a Groovy list literal that can be pasted over
-FPGADATAFLOW_SHARD_A at the top of docker/jenkins/Jenkinsfile.
-
-Usage
------
-    ./scripts/balance_fpgadataflow_shards.py reports/fpgadataflow_a.xml \\
-                                             reports/fpgadataflow_b.xml
-
-Re-run after any build where one shard's wall exceeds the other by >15 %.
+Usage: ./scripts/balance_fpgadataflow_shards.py reports/fpgadataflow_*.xml
 """
 from __future__ import annotations
 

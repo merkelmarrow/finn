@@ -1,11 +1,7 @@
 import groovy.transform.Field
 
-// =============================================================================
-// Tables — edit these to add/remove/re-bucket what runs in the parallel block.
-// =============================================================================
+// Edit these tables to add/remove/re-bucket what runs in the parallel block.
 
-// BNN end2end pytest markers; keys mirror test_board_map in
-// tests/end2end/test_end2end_bnn_pynq.py and the markers in setup.cfg.
 @Field
 Map<String, String> BNN_BOARD_MARKERS = [
     'U250'     : 'bnn_u250',
@@ -14,17 +10,10 @@ Map<String, String> BNN_BOARD_MARKERS = [
     'KV260_SOM': 'bnn_kv260',
 ]
 
-// BNN end2end sub-stages — one Jenkins executor per row.
-//
-// cnv-w2a2 dominates each board's wall-clock (~35-50 %) because impl runtime
-// scales super-linearly with bitwidth, so it is isolated on every board.
-// Other scenarios are bucketed to keep the executor count down.
-//
-// Schema per row: board (key in BNN_BOARD_MARKERS), label (sub-stage suffix),
-// keyword (pytest -k expression), workers (xdist -n value).
-//
-// Note: cnv configurations with wbits > abits (e.g. w2a1) are skipped by
-// test_end2end_bnn_pynq.py::test_export, so do not list them here.
+// One parallel sub-stage per row. cnv-w2a2 dominates each board's wall because
+// impl runtime scales super-linearly with bitwidth, so it is isolated on every
+// board. wbits > abits configs (e.g. w2a1) are skipped by test_export upstream
+// and must not be listed here.
 @Field
 List<Map> BNN_SUB_STAGES = [
     [board: 'U250',      label: 'cnv-w2a2',      keyword: 'cnv and w2 and a2',                workers: 2],
@@ -41,25 +30,24 @@ List<Map> BNN_SUB_STAGES = [
     [board: 'KV260_SOM', label: 'rest',          keyword: 'not (cnv and w2 and a2)',          workers: 4],
 ]
 
-// End2end shards. Mobilenet carries ~32 xdist_group marks and dominates the
-// stage wall; everything else fits comfortably into a lighter shard.
+// Mobilenet carries ~32 xdist_group marks and dominates the stage wall.
 @Field
-List<String> END2END_MOBILENET = [
-    'tests/end2end/test_end2end_mobilenet_v1.py',
+List<Map> END2END_SHARDS = [
+    [label: 'mobilenet', workers: 8, files: [
+        'tests/end2end/test_end2end_mobilenet_v1.py',
+    ]],
+    [label: 'rest', workers: 4, files: [
+        'tests/end2end/test_end2end_bnn_pynq.py',
+        'tests/end2end/test_end2end_cybsec_mlp.py',
+        'tests/end2end/test_ext_weights.py',
+        'tests/end2end/test_ooc_synthesis.py',
+    ]],
 ]
 
-@Field
-List<String> END2END_REST = [
-    'tests/end2end/test_end2end_bnn_pynq.py',
-    'tests/end2end/test_end2end_cybsec_mlp.py',
-    'tests/end2end/test_ext_weights.py',
-    'tests/end2end/test_ooc_synthesis.py',
-]
-
-// fpgadataflow shard A: explicit list of test files (heavy tests distributed
-// by scripts/balance_fpgadataflow_shards.py). Shard B implicitly contains
-// every other file under tests/fpgadataflow/, so adding a new test file
-// requires no Jenkinsfile edit.
+// fpgadataflow shard A: explicit heavy-file allowlist. Shard B is the
+// catch-all (tests/fpgadataflow/ minus this list), so a new test file lands
+// on shard B with no Jenkinsfile edit. Regenerate with
+// scripts/balance_fpgadataflow_shards.py if shards drift > 15 %.
 @Field
 List<String> FPGADATAFLOW_SHARD_A = [
     'tests/fpgadataflow/test_code_gen_trafo.py',
@@ -88,19 +76,6 @@ List<String> FPGADATAFLOW_SHARD_A = [
     'tests/fpgadataflow/test_split_large_fifos.py',
 ]
 
-// =============================================================================
-// Constants
-// =============================================================================
-
-// Must match the tag computed by run-docker.sh; XRT_DEB_VERSION default
-// is mirrored there so a missing env var doesn't silently mismatch.
-@Field
-final String DEFAULT_XRT_DEB_VERSION = 'xrt_202220.2.14.354_22.04-amd64-xrt'
-
-// =============================================================================
-// Pipeline
-// =============================================================================
-
 pipeline {
   agent none
   options {
@@ -114,8 +89,6 @@ pipeline {
   stages {
     stage('Build Docker Image') {
       agent { label 'finn-build' }
-      // Override any DSL-level FINN_DOCKER_PREBUILT=1 — this stage must
-      // build so subsequent test stages have an image to load.
       environment { FINN_DOCKER_PREBUILT = '0' }
       steps {
         script { buildAndPublishDockerImage() }
@@ -131,10 +104,6 @@ pipeline {
   }
 }
 
-// =============================================================================
-// Stage builders
-// =============================================================================
-
 void buildAndPublishDockerImage() {
   sh 'docker system prune -a -f'
   sh "./run-docker.sh echo 'Docker image build complete'"
@@ -143,17 +112,16 @@ void buildAndPublishDockerImage() {
   }
 }
 
-// Push the freshly-built image to FINN_DOCKER_SHARED_DIR so other agents
-// `docker load` it via run-docker.sh instead of rebuilding. The tag must
-// match what run-docker.sh computes from `git describe` + XRT_DEB_VERSION.
+// Publish the built image to FINN_DOCKER_SHARED_DIR so other agents
+// `docker load` it instead of rebuilding. Tag must match run-docker.sh.
 void publishSharedDockerImage(String sharedDir) {
   def tag = sh(returnStdout: true, script:
-      "echo \"xilinx/finn:\$(git describe --always --tags --dirty).\${XRT_DEB_VERSION:-${DEFAULT_XRT_DEB_VERSION}}\""
+      'echo "xilinx/finn:$(git describe --always --tags --dirty).${XRT_DEB_VERSION:-xrt_202220.2.14.354_22.04-amd64-xrt}"'
   ).trim()
   sh "mkdir -p ${sharedDir}"
   sh "echo '${tag}' > ${sharedDir}/finn-docker-tag.txt"
-  // Shebang at col 0 so Jenkins durable-task runs this with bash, not /bin/sh
-  // (dash on Ubuntu lacks `set -o pipefail`); pigz uses all cores, gzip is fallback.
+  // #!/bin/bash required: Jenkins durable-task defaults to /bin/sh (dash),
+  // which lacks `set -o pipefail`.
   sh """#!/bin/bash
 set -o pipefail
 if command -v pigz >/dev/null 2>&1; then
@@ -167,20 +135,21 @@ fi
 Map<String, Closure> buildParallelStageMap() {
   def branches = [:]
   if (params.sanity) {
-    // Sanity-Build-Hardware rebuilds the same 4 scenarios that the BNN
-    // sub-stages already build when end2end=true; skip it then.
+    // Sanity-Build-Hardware rebuilds the same 4 scenarios the BNN sub-stages
+    // already cover when end2end=true; skip it then to avoid redundant work.
     if (!params.end2end) {
       branches['Sanity - Build Hardware'] = { sanityBuildHardwareStage() }
     }
     branches['Sanity - Unit Tests'] = { sanityUnitTestsStage() }
   }
   if (params.fpgadataflow) {
-    branches['fpgadataflow - shard A'] = { fpgadataflowShardAStage() }
-    branches['fpgadataflow - shard B'] = { fpgadataflowShardBStage() }
+    branches['fpgadataflow - shard A'] = { fpgadataflowShardStage('a', FPGADATAFLOW_SHARD_A, null) }
+    branches['fpgadataflow - shard B'] = { fpgadataflowShardStage('b', ['tests/fpgadataflow/'], FPGADATAFLOW_SHARD_A) }
   }
   if (params.end2end) {
-    branches['End2end - mobilenet'] = { end2endShardStage('mobilenet', END2END_MOBILENET, defaultWorkers()) }
-    branches['End2end - rest']      = { end2endShardStage('rest',      END2END_REST,      4) }
+    END2END_SHARDS.each { entry ->
+      branches["End2end - ${entry.label}"] = { end2endShardStage(entry) }
+    }
     BNN_SUB_STAGES.each { entry ->
       branches["BNN ${entry.board} - ${entry.label}"] = { bnnSubStage(entry) }
     }
@@ -188,16 +157,13 @@ Map<String, Closure> buildParallelStageMap() {
   return branches
 }
 
-// =============================================================================
-// Stage bodies — every parallel branch routes through testStage(), which
-// guarantees the report stash runs in `finally` so failed stages still
-// publish their JUnit XML. Do not move the stash out of the `finally`.
-// =============================================================================
+// Every parallel branch routes through testStage() so the report stash runs
+// in `finally`; failed stages still publish their JUnit XML.
 
 void sanityBuildHardwareStage() {
   testStage('Sanity - Build Hardware', 'bnn_build_sanity') { stashName, buildDir ->
     runPytest(marker: 'sanity_bnn', stash: stashName)
-    ['Pynq-Z1', 'ZCU104', 'KV260_SOM', 'U250'].each { board ->
+    BNN_BOARD_MARKERS.keySet().each { board ->
       findCopyZip(board, buildDir, stashName)
     }
   }
@@ -215,80 +181,48 @@ void sanityUnitTestsStage() {
   }
 }
 
-void fpgadataflowShardAStage() {
-  testStage('fpgadataflow - shard A', 'fpgadataflow_a') { stashName, buildDir ->
+void fpgadataflowShardStage(String shardId, List<String> files, List<String> ignore) {
+  String stashName = "fpgadataflow_${shardId}"
+  testStage("fpgadataflow - shard ${shardId.toUpperCase()}", stashName) { name, buildDir ->
     runPytest(
         marker: 'fpgadataflow',
-        stash: stashName,
-        files: FPGADATAFLOW_SHARD_A,
+        stash: name,
+        files: files,
+        ignore: ignore,
         workers: defaultWorkers(),
-        extraArgs: "--cov --cov-report=html:coverage_${stashName}",
+        extraArgs: "--cov --cov-report=html:coverage_${name}",
     )
-    archiveStageFolder("coverage_${stashName}")
+    archiveStageFolder("coverage_${name}")
   }
 }
 
-void fpgadataflowShardBStage() {
-  // Shard B = "everything under tests/fpgadataflow/ that is not in shard A",
-  // so a newly-added test file lands here automatically.
-  testStage('fpgadataflow - shard B', 'fpgadataflow_b') { stashName, buildDir ->
-    runPytest(
-        marker: 'fpgadataflow',
-        stash: stashName,
-        files: ['tests/fpgadataflow/'],
-        ignore: FPGADATAFLOW_SHARD_A,
-        workers: defaultWorkers(),
-        extraArgs: "--cov --cov-report=html:coverage_${stashName}",
-    )
-    archiveStageFolder("coverage_${stashName}")
+// --dist loadgroup is REQUIRED for end2end/BNN correctness — worksteal breaks
+// the xdist_group / load_test_checkpoint_or_skip dependency chain and silently
+// skips downstream tests.
+void end2endShardStage(Map entry) {
+  testStage("End2end - ${entry.label}", "end2end_${entry.label}") { stashName, buildDir ->
+    runPytest(marker: 'end2end', stash: stashName, files: entry.files,
+              workers: entry.workers as int, distMode: 'loadgroup')
   }
 }
 
-void end2endShardStage(String shardId, List<String> files, int workers) {
-  testStage("End2end - ${shardId}", "end2end_${shardId}") { stashName, buildDir ->
-    runPytest(marker: 'end2end', stash: stashName, files: files,
-              workers: workers, distMode: 'loadgroup')
-  }
-}
-
-// `--dist loadgroup` is REQUIRED for BNN end2end correctness — workers
-// stealing across xdist_group boundaries (worksteal default) breaks the
-// load_test_checkpoint_or_skip dependency chain and silently skips
-// downstream tests. Build #10 KV260 cnv-w2a2 hit this; do not change.
 void bnnSubStage(Map entry) {
-  String marker = BNN_BOARD_MARKERS[entry.board]
-  String name   = bnnStashName(entry.board, entry.label)
-  testStage("BNN ${entry.board} - ${entry.label}", name) { stashName, buildDir ->
+  String stashName = bnnStashName(entry)
+  testStage("BNN ${entry.board} - ${entry.label}", stashName) { name, buildDir ->
     runPytest(
-        marker: marker,
-        stash: stashName,
+        marker: BNN_BOARD_MARKERS[entry.board],
+        stash: name,
         keyword: entry.keyword,
         workers: entry.workers as int,
         distMode: 'loadgroup',
     )
-    // Only the cnv-w2a2 sub-stage produces the artefacts the board-HW
-    // job consumes (that is what gets validated on the physical board).
+    // Only cnv-w2a2 artefacts feed the board-HW validation job.
     if (entry.label == 'cnv-w2a2') {
-      findCopyZip(entry.board, buildDir, stashName)
+      findCopyZip(entry.board, buildDir, name)
     }
   }
 }
 
-// Stash names double as filesystem paths and env-var suffixes, so dashes are
-// normalised to underscores: e.g. Pynq-Z1 + cnv-w2a2 -> bnn_Pynq_Z1_cnv_w2a2.
-String bnnStashName(String board, String label) {
-  return "bnn_${board}_${label}".replaceAll('-', '_')
-}
-
-// =============================================================================
-// Test-stage scaffolding
-// =============================================================================
-
-// Run `body(stashName, buildDir)` inside a finn-build node, with the standard
-// per-stage build-dir + report-stash plumbing. The body runs inside
-// catchError(stageResult: 'FAILURE') so an expected pytest failure marks
-// the stage FAILURE without aborting the pipeline; the stash itself runs in
-// `finally` so failed stages still publish their JUnit XMLs.
 void testStage(String stageName, String stashName, Closure body) {
   node('finn-build') {
     stage(stageName) {
@@ -302,6 +236,7 @@ void testStage(String stageName, String stashName, Closure body) {
             body.call(stashName, buildDir)
           }
         } finally {
+          // MUST stay in `finally` so failed stages still publish their XML.
           safeStashReport(stashName)
         }
       }
@@ -309,10 +244,9 @@ void testStage(String stageName, String stashName, Closure body) {
   }
 }
 
-// Stash <stash>.xml + <stash>.html iff pytest produced an XML. Defensive
-// catchError ensures a stash hiccup (NFS blip, controller disk full) cannot
-// affect build status — the stage's own catchError around pytest already
-// determines pass/fail.
+// Stash <stash>.xml + <stash>.html iff pytest produced them. The defensive
+// catchError ensures a stash hiccup cannot affect build status — pytest's
+// own catchError already determines pass/fail.
 void safeStashReport(String stashName) {
   catchError(buildResult: null, stageResult: null,
              message: "safeStashReport(${stashName}) failed; aggregation may be partial") {
@@ -322,15 +256,13 @@ void safeStashReport(String stashName) {
   }
 }
 
-// unstash throws if the stash never happened (stage skipped or failed pre-stash);
-// swallow that one specific case so aggregation continues. We use try/catch
-// rather than a tracking @Field collection because the latter would require
-// thread-safe sandbox-approved JDK collection types for parallel branches.
+// Swallows "stash does not exist" when a stage was skipped or failed before
+// publishing, so aggregation still sees every stash that did publish.
 void unstashIfPresent(String stashName) {
   try {
     unstash stashName
   } catch (Exception ignored) {
-    echo "No stash named '${stashName}' (stage was skipped or failed before publishing reports)"
+    echo "No stash '${stashName}' (stage skipped or failed before publishing)"
   }
 }
 
@@ -341,14 +273,9 @@ void archiveStageFolder(String folder) {
   }
 }
 
-// =============================================================================
-// Aggregation
-// =============================================================================
-
 // Order is load-bearing: junit FIRST (workspace-local, never flakes), then
-// defensive merge + archive (agent->controller tar transfer can flake on
-// glob counts > ~10). Reversing this loses the test result tree on transfer
-// flake even when every per-stage XML is on disk.
+// the defensive merge + archive (agent->controller tar transfer can flake on
+// glob counts > ~10). Reversing this loses the test tree on transfer flake.
 void aggregateReports() {
   sh 'mkdir -p reports'
   cleanPreviousBuildFiles('reports')
@@ -357,15 +284,15 @@ void aggregateReports() {
   }
   junit allowEmptyResults: true, testResults: 'reports/*.xml'
   catchError(buildResult: null, stageResult: 'UNSTABLE',
-             message: 'pytest_html_merger failed; per-stage HTMLs still archived below') {
+             message: 'pytest_html_merger failed; per-stage HTMLs still archived') {
     sh './run-docker.sh pytest_html_merger -i reports/ -o reports/test_report_final.html'
   }
   catchError(buildResult: null, stageResult: 'UNSTABLE',
-             message: 'archiveArtifacts (xml) transfer failed') {
+             message: 'archiveArtifacts (xml) failed') {
     archiveArtifacts artifacts: 'reports/*.xml', allowEmptyArchive: true
   }
   catchError(buildResult: null, stageResult: 'UNSTABLE',
-             message: 'archiveArtifacts (html) transfer failed') {
+             message: 'archiveArtifacts (html) failed') {
     archiveArtifacts artifacts: 'reports/*.html', allowEmptyArchive: true
   }
 }
@@ -384,15 +311,16 @@ List<String> expectedStashes() {
     stashes += ['fpgadataflow_a', 'fpgadataflow_b']
   }
   if (params.end2end) {
-    stashes += ['end2end_mobilenet', 'end2end_rest']
-    BNN_SUB_STAGES.each { entry -> stashes << bnnStashName(entry.board, entry.label) }
+    END2END_SHARDS.each { entry -> stashes << "end2end_${entry.label}" }
+    BNN_SUB_STAGES.each { entry -> stashes << bnnStashName(entry) }
   }
   return stashes
 }
 
-// =============================================================================
-// Shell helpers
-// =============================================================================
+// Stash names double as filesystem paths, so dashes become underscores.
+String bnnStashName(Map entry) {
+  return "bnn_${entry.board}_${entry.label}".replaceAll('-', '_')
+}
 
 void cleanPreviousBuildFiles(String buildDir) {
   if (buildDir && !buildDir.empty) {
@@ -404,23 +332,13 @@ int defaultWorkers() {
   return (env.NUM_PYTEST_WORKERS ?: '8').toInteger()
 }
 
-// Single pytest entry point. Builds the command line from named arguments
-// and feeds it to run-docker.sh via a temporary script; run-docker.sh
-// re-tokenises its argv, so quoted shell metacharacters (e.g. -k '... or ...')
-// don't survive a direct `./run-docker.sh python -m pytest -k '...'` call.
-//
-// Args (Map):
-//   marker    : pytest -m expression                  (required)
-//   stash     : test-results filename stem            (required)
-//   keyword   : pytest -k expression                  (optional)
-//   files     : list of test paths or directories     (optional)
-//   ignore    : list of paths to --ignore             (optional)
-//   workers   : xdist -n value                        (optional; if omitted, no -n)
-//   distMode  : --dist value, defaults to 'worksteal' when workers > 0
-//   extraArgs : free-form extra pytest args           (optional)
-//
-// pytest-forked dropped — pytest-xdist already provides per-worker process
-// isolation, and pytest-forked is deprecated upstream.
+// Single pytest entry point. Feeds the command line via a temporary script
+// because run-docker.sh re-tokenises argv and a direct invocation would split
+// quoted shell metacharacters in -m / -k expressions. Args (Map):
+//   marker/stash      : required pytest -m and results filename stem
+//   keyword/files/ignore : optional -k, explicit test paths, --ignore paths
+//   workers/distMode  : optional xdist -n and --dist value
+//   extraArgs         : free-form extra pytest args
 void runPytest(Map opts) {
   def parts = ["python -m pytest -m '${opts.marker}'"]
   if (opts.files)   { parts << opts.files.join(' ') }

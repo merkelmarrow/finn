@@ -28,8 +28,8 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
-# Fail-fast on missing deps so a partial host-side fetch-repos.sh doesn't
-# surface hours later as opaque ModuleNotFoundError during pytest collection.
+# Fail-fast so a partial deps/ tree is caught here, not hours later as
+# ModuleNotFoundError during pytest collection.
 set -e
 
 export HOME=/tmp/home_dir
@@ -58,8 +58,8 @@ recho () {
   echo -e "${RED}ERROR: $1${NC}"
 }
 
-# qonnx pyproject.toml workaround for https://github.com/pypa/pip/issues/7953.
-# Trap ensures we restore the file even if pip install aborts under `set -e`.
+# qonnx pyproject.toml workaround for https://github.com/pypa/pip/issues/7953;
+# trap restores the file if pip install aborts under `set -e`.
 mv ${FINN_ROOT}/deps/qonnx/pyproject.toml ${FINN_ROOT}/deps/qonnx/pyproject.tmp
 trap 'mv ${FINN_ROOT}/deps/qonnx/pyproject.tmp ${FINN_ROOT}/deps/qonnx/pyproject.toml 2>/dev/null || true' EXIT
 pip install --user -e ${FINN_ROOT}/deps/qonnx
@@ -118,7 +118,7 @@ else
     gecho "Found existing finn_xsi at ${FINN_ROOT}/finn_xsi/xsi.so"
   else
     gecho "Building finn_xsi using finn.xsi.setup..."
-    # if/else preserves "log and continue" semantics under `set -e`.
+    # if/else keeps "log and continue" semantics under `set -e`.
     if python -m finn.xsi.setup --quiet; then
       gecho "finn_xsi built successfully"
     else

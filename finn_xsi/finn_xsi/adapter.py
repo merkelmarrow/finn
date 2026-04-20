@@ -45,16 +45,12 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
         }
         verilog_header_incl_str = " ".join(["--include " + x for x in verilog_headers])
 
-        # Ensure SystemVerilog/Verilog packages (e.g. mvu_pkg.sv, swg_pkg.sv)
-        # are elaborated before modules that import them at parse time, e.g.
-        # `module add_multi import mvu_pkg::*;` in finn-rtllib/mvu/add_multi.sv.
-        # A plain sorted(..., key=(pattern not in s, s)) is NOT safe: the `s`
-        # tie-breaker alphabetically re-orders the non-package bucket and
-        # breaks caller-supplied dependency order (alphabetic sort pushes
-        # add_multi.sv ahead of mvu_pkg.sv and xelab then fails with
-        # "[VRFC 10-2989] 'mvu_pkg' is not declared"). Partitioning via list
-        # comprehension is stable, so caller order is preserved within each
-        # bucket.
+        # Elaborate *_pkg.{sv,v} before modules that import them (e.g.
+        # `module add_multi import mvu_pkg::*;`). A stable partition preserves
+        # caller-supplied dependency order within each bucket; sorted() with
+        # an (is_pkg, name) key does not, because the name tie-breaker
+        # reorders the non-package bucket and can push importers ahead of
+        # their packages.
         def _is_pkg_src(p):
             base = os.path.basename(p)
             return base.endswith("_pkg.sv") or base.endswith("_pkg.v")
@@ -126,10 +122,8 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
     if locate_glbl() is not None:
         cmd_xelab.insert(1, "work.glbl")
 
-    # check=True so an xelab compile failure surfaces as a
-    # subprocess.CalledProcessError with the real message (e.g.
-    # "[VRFC 10-2989] '<pkg>' is not declared") rather than being masked
-    # by the downstream "xsimk.so missing" FileNotFoundError.
+    # check=True surfaces xelab compile errors as CalledProcessError instead
+    # of masking them as a downstream "xsimk.so missing" FileNotFoundError.
     launch_process_helper(cmd_xelab, cwd=sim_out_dir, check=True)
     out_so_relative_path = "xsim.dir/%s/xsimk.so" % top_module_name
     out_so_full_path = sim_out_dir + "/" + out_so_relative_path
