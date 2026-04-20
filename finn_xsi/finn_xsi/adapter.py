@@ -45,12 +45,23 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
         }
         verilog_header_incl_str = " ".join(["--include " + x for x in verilog_headers])
 
-        # sort src list so that packages are loaded first
-        # these packages must be compiled before modules that depend on them
-        pkg_patterns = ["swg_pkg", "mvu_pkg"]
-        srcs_list = sorted(
-            source_list, key=lambda s: (not any(pkg in s for pkg in pkg_patterns), s)
-        )
+        # Ensure SystemVerilog/Verilog packages (e.g. mvu_pkg.sv, swg_pkg.sv)
+        # are elaborated before modules that import them at parse time, e.g.
+        # `module add_multi import mvu_pkg::*;` in finn-rtllib/mvu/add_multi.sv.
+        # A plain sorted(..., key=(pattern not in s, s)) is NOT safe: the `s`
+        # tie-breaker alphabetically re-orders the non-package bucket and
+        # breaks caller-supplied dependency order (alphabetic sort pushes
+        # add_multi.sv ahead of mvu_pkg.sv and xelab then fails with
+        # "[VRFC 10-2989] 'mvu_pkg' is not declared"). Partitioning via list
+        # comprehension is stable, so caller order is preserved within each
+        # bucket.
+        def _is_pkg_src(p):
+            base = os.path.basename(p)
+            return base.endswith("_pkg.sv") or base.endswith("_pkg.v")
+
+        pkg_srcs = [s for s in source_list if _is_pkg_src(s)]
+        other_srcs = [s for s in source_list if not _is_pkg_src(s)]
+        srcs_list = pkg_srcs + other_srcs
         for src_line in srcs_list:
             if src_line.endswith(".v"):
                 f.write(f"verilog work {verilog_header_incl_str} {src_line}\n")
@@ -115,7 +126,11 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
     if locate_glbl() is not None:
         cmd_xelab.insert(1, "work.glbl")
 
-    launch_process_helper(cmd_xelab, cwd=sim_out_dir)
+    # check=True so an xelab compile failure surfaces as a
+    # subprocess.CalledProcessError with the real message (e.g.
+    # "[VRFC 10-2989] '<pkg>' is not declared") rather than being masked
+    # by the downstream "xsimk.so missing" FileNotFoundError.
+    launch_process_helper(cmd_xelab, cwd=sim_out_dir, check=True)
     out_so_relative_path = "xsim.dir/%s/xsimk.so" % top_module_name
     out_so_full_path = sim_out_dir + "/" + out_so_relative_path
 

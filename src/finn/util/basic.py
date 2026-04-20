@@ -207,22 +207,34 @@ class CppBuilder:
         process_compile.communicate()
 
 
-def launch_process_helper(args, proc_env=None, cwd=None):
+def launch_process_helper(args, proc_env=None, cwd=None, check=False):
     """Helper function to launch a process in a way that facilitates logging
     stdout/stderr with Python loggers.
-    Returns (cmd_out, cmd_err)."""
+    Returns (cmd_out, cmd_err).
+
+    If ``check`` is True, raises :class:`subprocess.CalledProcessError` when
+    the process exits non-zero. The default (``check=False``) preserves
+    historical behaviour where the caller is responsible for detecting
+    failure (e.g. via a subsequent artefact-existence check). Prefer
+    ``check=True`` for new call sites and any toolchain invocation whose
+    failure would otherwise surface as a confusing downstream error (for
+    example, ``xelab`` compile errors being masked as
+    ``FileNotFoundError: xsimk.so``)."""
     if proc_env is None:
         proc_env = os.environ.copy()
     with subprocess.Popen(
         args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=proc_env, cwd=cwd
     ) as proc:
         (cmd_out, cmd_err) = proc.communicate()
+        returncode = proc.returncode
     if cmd_out is not None:
         cmd_out = cmd_out.decode("utf-8")
         sys.stdout.write(cmd_out)
     if cmd_err is not None:
         cmd_err = cmd_err.decode("utf-8")
         sys.stderr.write(cmd_err)
+    if check and returncode != 0:
+        raise subprocess.CalledProcessError(returncode, args, cmd_out, cmd_err)
     return (cmd_out, cmd_err)
 
 
