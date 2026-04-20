@@ -43,6 +43,8 @@ from finn.transformation.fpgadataflow.prepare_rtlsim import PrepareRTLSim
 from finn.transformation.fpgadataflow.set_exec_mode import SetExecMode
 from finn.transformation.fpgadataflow.specialize_layers import SpecializeLayers
 
+pytestmark = [pytest.mark.fpgadataflow_slow]  # heavy shard; see docker/jenkins/README.md
+
 build_dir = os.environ["FINN_BUILD_DIR"]
 test_fpga_part = "xc7z020clg400-1"
 target_clk_ns = 10

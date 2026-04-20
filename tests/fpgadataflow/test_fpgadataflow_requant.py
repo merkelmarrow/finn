@@ -58,6 +58,8 @@ from finn.transformation.qonnx.quant_act_to_multithreshold import (
 )
 from finn.util.basic import make_build_dir, pynq_part_map
 
+pytestmark = [pytest.mark.fpgadataflow_slow]  # heavy shard; see docker/jenkins/README.md
+
 test_pynq_board = "ZCU104"
 test_fpga_part = pynq_part_map[test_pynq_board]
 target_clk_ns = 10

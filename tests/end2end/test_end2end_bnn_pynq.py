@@ -403,6 +403,10 @@ def pytest_generate_tests(metafunc):
     # This allows a user to select multiple markers
     all_markers_used = metafunc.config.getoption("-m").split(" ")
 
+    # Exact-match set — prevents sub-stage markers like `bnn_cnv_w2a2` from
+    # falling into the `"bnn_" in marker` branch below and polluting scenarios.
+    bnn_board_markers = {"bnn_u250", "bnn_pynq", "bnn_zcu104", "bnn_kv260"}
+
     for marker in all_markers_used:
         if "sanity_bnn" in marker:
             # Define a set of sanity tests that target each of
@@ -444,7 +448,7 @@ def pytest_generate_tests(metafunc):
                 )
             )
 
-        if "bnn_" in marker:
+        if marker in bnn_board_markers:
             # Target the full set of parameters for a single board
             # Extract the board name from the marker used, as it is in the form of 'bnn_<board>'
             bnn_board = next(
@@ -462,9 +466,19 @@ def pytest_generate_tests(metafunc):
             items = scenario[1].items()
             argnames = [x[0] for x in items]
             argvalues_scenario = [x[1] for x in items]
+            # Sub-stage scenario marker — lets the Jenkinsfile shard by
+            # `bnn_cnv_w2a2` / `bnn_tfc` etc. instead of a pytest -k expression.
+            sc = scenario[1]
+            if sc["topology"] == "cnv":
+                scenario_mark = getattr(
+                    pytest.mark, "bnn_cnv_w%da%d" % (sc["wbits"], sc["abits"])
+                )
+            else:
+                scenario_mark = getattr(pytest.mark, "bnn_%s" % sc["topology"])
             argvalues.append(
                 pytest.param(
-                    *argvalues_scenario, marks=pytest.mark.xdist_group(name="bnn_pynq_%d" % i)
+                    *argvalues_scenario,
+                    marks=[pytest.mark.xdist_group(name="bnn_pynq_%d" % i), scenario_mark],
                 )
             )
         metafunc.parametrize(argnames, argvalues, ids=idlist, scope="class")

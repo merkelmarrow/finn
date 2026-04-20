@@ -44,6 +44,8 @@ from finn.transformation.fpgadataflow.prepare_ip import PrepareIP
 from finn.transformation.fpgadataflow.specialize_layers import SpecializeLayers
 from finn.util.create import hls_random_mlp_maker
 
+pytestmark = [pytest.mark.fpgadataflow_slow]  # heavy shard; see docker/jenkins/README.md
+
 test_fpga_part = "xczu3eg-sbva484-1-e"
 target_clk_ns = 5
 

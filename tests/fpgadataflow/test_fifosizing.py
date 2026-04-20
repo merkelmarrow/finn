@@ -50,6 +50,8 @@ from finn.util.basic import make_build_dir
 from finn.util.test import get_trained_network_and_ishape
 
 
+pytestmark = [pytest.mark.fpgadataflow_slow]  # heavy shard; see docker/jenkins/README.md
+
 def fetch_test_model(topology, wbits=2, abits=2):
     tmp_output_dir = make_build_dir("build_fifosizing_%s_" % topology)
     (model, ishape) = get_trained_network_and_ishape(topology, wbits, abits)

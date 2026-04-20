@@ -59,6 +59,8 @@ from finn.transformation.fpgadataflow.set_exec_mode import SetExecMode
 from finn.transformation.fpgadataflow.set_fifo_depths import InsertAndSetFIFODepths
 from finn.transformation.fpgadataflow.specialize_layers import SpecializeLayers
 
+pytestmark = [pytest.mark.fpgadataflow_slow]  # heavy shard; see docker/jenkins/README.md
+
 # Mapping of ElementwiseBinaryOperation specializations to numpy reference
 # implementation functions
 NUMPY_REFERENCES = {

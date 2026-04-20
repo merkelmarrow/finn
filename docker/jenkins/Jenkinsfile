@@ -1,33 +1,31 @@
+// Parallel-stage tables. See docker/jenkins/README.md for a full index and
+// scripts/list_ci_stages.py to expand each row to its concrete pytest command.
+
 import groovy.transform.Field
 
-// Edit these tables to add/remove/re-bucket what runs in the parallel block.
-
 @Field
-Map<String, String> BNN_BOARD_MARKERS = [
-    'U250'     : 'bnn_u250',
-    'Pynq-Z1'  : 'bnn_pynq',
-    'ZCU104'   : 'bnn_zcu104',
-    'KV260_SOM': 'bnn_kv260',
-]
+List<String> BNN_BOARDS = ['U250', 'Pynq-Z1', 'ZCU104', 'KV260_SOM']
 
-// One parallel sub-stage per row. cnv-w2a2 dominates each board's wall because
-// impl runtime scales super-linearly with bitwidth, so it is isolated on every
-// board. wbits > abits configs (e.g. w2a1) are skipped by test_export upstream
-// and must not be listed here.
+// One parallel sub-stage per row. `marker` is the pytest -m expression and is
+// the ONLY filter; board + sub-scenario markers live on the tests themselves
+// (see tests/end2end/test_end2end_bnn_pynq.py and setup.cfg `markers`).
+// cnv-w2a2 dominates each board's wall (impl runtime scales super-linearly
+// with bitwidth) so it is isolated per board. wbits > abits configs are
+// skipped by test_export upstream and do not need their own marker.
 @Field
 List<Map> BNN_SUB_STAGES = [
-    [board: 'U250',      label: 'cnv-w2a2',      keyword: 'cnv and w2 and a2',                workers: 2],
-    [board: 'U250',      label: 'cnv-w1a2',      keyword: 'cnv and w1 and a2',                workers: 2],
-    [board: 'U250',      label: 'cnv-w1a1-tfc',  keyword: '(cnv and w1 and a1) or tfc',       workers: 4],
-    [board: 'U250',      label: 'lfc',           keyword: 'lfc',                              workers: 2],
-    [board: 'ZCU104',    label: 'cnv-heavy',     keyword: 'cnv and w2',                       workers: 4],
-    [board: 'ZCU104',    label: 'cnv-light-tfc', keyword: '(cnv and w1) or tfc',              workers: 4],
-    [board: 'ZCU104',    label: 'lfc',           keyword: 'lfc',                              workers: 2],
-    [board: 'Pynq-Z1',   label: 'cnv-w2a2',      keyword: 'cnv and w2 and a2',                workers: 2],
-    [board: 'Pynq-Z1',   label: 'cnv-rest-tfc',  keyword: '(cnv and not (w2 and a2)) or tfc', workers: 4],
-    [board: 'Pynq-Z1',   label: 'lfc',           keyword: 'lfc',                              workers: 2],
-    [board: 'KV260_SOM', label: 'cnv-w2a2',      keyword: 'cnv and w2 and a2',                workers: 2],
-    [board: 'KV260_SOM', label: 'rest',          keyword: 'not (cnv and w2 and a2)',          workers: 4],
+    [board: 'U250',      label: 'cnv-w2a2',      marker: 'bnn_u250 and bnn_cnv_w2a2',                         workers: 2],
+    [board: 'U250',      label: 'cnv-w1a2',      marker: 'bnn_u250 and bnn_cnv_w1a2',                         workers: 2],
+    [board: 'U250',      label: 'cnv-w1a1-tfc',  marker: 'bnn_u250 and (bnn_cnv_w1a1 or bnn_tfc)',            workers: 4],
+    [board: 'U250',      label: 'lfc',           marker: 'bnn_u250 and bnn_lfc',                              workers: 2],
+    [board: 'ZCU104',    label: 'cnv-heavy',     marker: 'bnn_zcu104 and bnn_cnv_w2a2',                       workers: 4],
+    [board: 'ZCU104',    label: 'cnv-light-tfc', marker: 'bnn_zcu104 and (bnn_cnv_w1a1 or bnn_cnv_w1a2 or bnn_tfc)', workers: 4],
+    [board: 'ZCU104',    label: 'lfc',           marker: 'bnn_zcu104 and bnn_lfc',                            workers: 2],
+    [board: 'Pynq-Z1',   label: 'cnv-w2a2',      marker: 'bnn_pynq and bnn_cnv_w2a2',                         workers: 2],
+    [board: 'Pynq-Z1',   label: 'cnv-rest-tfc',  marker: 'bnn_pynq and (bnn_cnv_w1a1 or bnn_cnv_w1a2 or bnn_tfc)',   workers: 4],
+    [board: 'Pynq-Z1',   label: 'lfc',           marker: 'bnn_pynq and bnn_lfc',                              workers: 2],
+    [board: 'KV260_SOM', label: 'cnv-w2a2',      marker: 'bnn_kv260 and bnn_cnv_w2a2',                        workers: 2],
+    [board: 'KV260_SOM', label: 'rest',          marker: 'bnn_kv260 and not bnn_cnv_w2a2',                    workers: 4],
 ]
 
 // Mobilenet carries ~32 xdist_group marks and dominates the stage wall.
@@ -42,38 +40,6 @@ List<Map> END2END_SHARDS = [
         'tests/end2end/test_ext_weights.py',
         'tests/end2end/test_ooc_synthesis.py',
     ]],
-]
-
-// fpgadataflow shard A: explicit heavy-file allowlist. Shard B is the
-// catch-all (tests/fpgadataflow/ minus this list), so a new test file lands
-// on shard B with no Jenkinsfile edit. Regenerate with
-// scripts/balance_fpgadataflow_shards.py if shards drift > 15 %.
-@Field
-List<String> FPGADATAFLOW_SHARD_A = [
-    'tests/fpgadataflow/test_code_gen_trafo.py',
-    'tests/fpgadataflow/test_convert_to_hw_1d_conv_layer.py',
-    'tests/fpgadataflow/test_convert_to_hw_conv_layer.py',
-    'tests/fpgadataflow/test_convert_to_hw_layers_fc.py',
-    'tests/fpgadataflow/test_convert_to_hw_pool_batch.py',
-    'tests/fpgadataflow/test_fifosizing.py',
-    'tests/fpgadataflow/test_fpgadataflow_checksum.py',
-    'tests/fpgadataflow/test_fpgadataflow_convinputgenerator.py',
-    'tests/fpgadataflow/test_fpgadataflow_crop.py',
-    'tests/fpgadataflow/test_fpgadataflow_downsampler.py',
-    'tests/fpgadataflow/test_fpgadataflow_dwc.py',
-    'tests/fpgadataflow/test_fpgadataflow_elementwise_binary.py',
-    'tests/fpgadataflow/test_fpgadataflow_fifo.py',
-    'tests/fpgadataflow/test_fpgadataflow_fmpadding.py',
-    'tests/fpgadataflow/test_fpgadataflow_ipstitch.py',
-    'tests/fpgadataflow/test_fpgadataflow_layernorm.py',
-    'tests/fpgadataflow/test_fpgadataflow_mvau.py',
-    'tests/fpgadataflow/test_fpgadataflow_requant.py',
-    'tests/fpgadataflow/test_fpgadataflow_shuffle.py',
-    'tests/fpgadataflow/test_fpgadataflow_split.py',
-    'tests/fpgadataflow/test_fpgadataflow_thresholding_runtime.py',
-    'tests/fpgadataflow/test_fpgadataflow_vvau.py',
-    'tests/fpgadataflow/test_runtime_weights.py',
-    'tests/fpgadataflow/test_split_large_fifos.py',
 ]
 
 pipeline {
@@ -143,8 +109,8 @@ Map<String, Closure> buildParallelStageMap() {
     branches['Sanity - Unit Tests'] = { sanityUnitTestsStage() }
   }
   if (params.fpgadataflow) {
-    branches['fpgadataflow - shard A'] = { fpgadataflowShardStage('a', FPGADATAFLOW_SHARD_A, null) }
-    branches['fpgadataflow - shard B'] = { fpgadataflowShardStage('b', ['tests/fpgadataflow/'], FPGADATAFLOW_SHARD_A) }
+    branches['fpgadataflow - shard A'] = { fpgadataflowShardStage('a', 'fpgadataflow and fpgadataflow_slow') }
+    branches['fpgadataflow - shard B'] = { fpgadataflowShardStage('b', 'fpgadataflow and not fpgadataflow_slow') }
   }
   if (params.end2end) {
     END2END_SHARDS.each { entry ->
@@ -163,9 +129,7 @@ Map<String, Closure> buildParallelStageMap() {
 void sanityBuildHardwareStage() {
   testStage('Sanity - Build Hardware', 'bnn_build_sanity') { stashName, buildDir ->
     runPytest(marker: 'sanity_bnn', stash: stashName)
-    BNN_BOARD_MARKERS.keySet().each { board ->
-      findCopyZip(board, buildDir, stashName)
-    }
+    BNN_BOARDS.each { board -> findCopyZip(board, buildDir, stashName) }
   }
 }
 
@@ -181,14 +145,12 @@ void sanityUnitTestsStage() {
   }
 }
 
-void fpgadataflowShardStage(String shardId, List<String> files, List<String> ignore) {
+void fpgadataflowShardStage(String shardId, String marker) {
   String stashName = "fpgadataflow_${shardId}"
   testStage("fpgadataflow - shard ${shardId.toUpperCase()}", stashName) { name, buildDir ->
     runPytest(
-        marker: 'fpgadataflow',
+        marker: marker,
         stash: name,
-        files: files,
-        ignore: ignore,
         workers: defaultWorkers(),
         extraArgs: "--cov --cov-report=html:coverage_${name}",
     )
@@ -210,9 +172,8 @@ void bnnSubStage(Map entry) {
   String stashName = bnnStashName(entry)
   testStage("BNN ${entry.board} - ${entry.label}", stashName) { name, buildDir ->
     runPytest(
-        marker: BNN_BOARD_MARKERS[entry.board],
+        marker: entry.marker,
         stash: name,
-        keyword: entry.keyword,
         workers: entry.workers as int,
         distMode: 'loadgroup',
     )
@@ -333,23 +294,21 @@ int defaultWorkers() {
 }
 
 // Single pytest entry point. Feeds the command line via a temporary script
-// because run-docker.sh re-tokenises argv and a direct invocation would split
-// quoted shell metacharacters in -m / -k expressions. Args (Map):
-//   marker/stash      : required pytest -m and results filename stem
-//   keyword/files/ignore : optional -k, explicit test paths, --ignore paths
-//   workers/distMode  : optional xdist -n and --dist value
-//   extraArgs         : free-form extra pytest args
+// because run-docker.sh re-tokenises argv and would split quoted metacharacters
+// in `-m` expressions otherwise. Args (Map): marker/stash (required),
+// files/workers/distMode/extraArgs (optional).
 void runPytest(Map opts) {
   def parts = ["python -m pytest -m '${opts.marker}'"]
-  if (opts.files)   { parts << opts.files.join(' ') }
-  if (opts.keyword) { parts << "-k '${opts.keyword}'" }
-  (opts.ignore ?: []).each { parts << "--ignore=${it}" }
+  if (opts.files) { parts << opts.files.join(' ') }
   if (opts.workers) {
     parts << "-n ${opts.workers} --dist ${opts.distMode ?: 'worksteal'}"
   }
   parts << "--junitxml=${opts.stash}.xml --html=${opts.stash}.html --self-contained-html"
   if (opts.extraArgs) { parts << opts.extraArgs }
-  writeFile file: 'run-tests.sh', text: "#!/bin/bash\nset -eo pipefail\n${parts.join(' ')}\n"
+  def cmd = parts.join(' ')
+  // Echo the resolved command so the Jenkins console log shows exactly what ran.
+  echo "runPytest[${opts.stash}]: ${cmd}"
+  writeFile file: 'run-tests.sh', text: "#!/bin/bash\nset -eo pipefail\n${cmd}\n"
   sh 'chmod 777 run-tests.sh'
   sh './run-docker.sh ./run-tests.sh'
 }

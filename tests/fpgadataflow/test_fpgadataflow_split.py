@@ -50,6 +50,8 @@ from finn.transformation.fpgadataflow.set_exec_mode import SetExecMode
 from finn.transformation.fpgadataflow.specialize_layers import SpecializeLayers
 
 
+pytestmark = [pytest.mark.fpgadataflow_slow]  # heavy shard; see docker/jenkins/README.md
+
 def make_split_model(IN_SHAPE, IN_DTYPE, SPLIT, AXIS):
     out_shapes = [IN_SHAPE[:-1] + [s] for s in SPLIT]
     outputs = []

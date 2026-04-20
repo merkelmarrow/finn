@@ -65,6 +65,8 @@ from finn.transformation.fpgadataflow.specialize_layers import SpecializeLayers
 from finn.transformation.general import ApplyConfig
 
 
+pytestmark = [pytest.mark.fpgadataflow_slow]  # heavy shard; see docker/jenkins/README.md
+
 def _infer_sparse_weight_tensor(W_conv, k_h, k_w, channels):
     W_sparse = np.zeros((channels, channels, k_h, k_w), dtype=np.float32)
     for ch in range(channels):

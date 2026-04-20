@@ -60,6 +60,8 @@ from finn.transformation.streamline import Streamline
 from finn.transformation.streamline.round_thresholds import RoundAndClipThresholds
 from finn.util.test import get_test_model_trained
 
+pytestmark = [pytest.mark.fpgadataflow_slow]  # heavy shard; see docker/jenkins/README.md
+
 export_onnx_path = "test_convert_to_hw_layers_fc.onnx"
 
 
