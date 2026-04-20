@@ -171,14 +171,18 @@ Map<String, Closure> buildParallelStageMap() {
 
 void eachActiveShard(Closure body) {
   String filter = paramString('STAGES')
-  PARALLEL_SHARDS.each { row ->
-    if (!paramBool(row.param as String)) { return }
-    if (row.skipWhen && paramBool(row.skipWhen as String)) { return }
-    (0..<(row.shards as int)).each { id ->
+  for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
+    Map row = PARALLEL_SHARDS[rowIdx]
+    if (!paramBool(row.param as String)) { continue }
+    if (row.skipWhen && paramBool(row.skipWhen as String)) { continue }
+    int numShards = row.shards as int
+    // C-style for-loop (not `(0..<n).each`): groovy.lang.IntRange is not
+    // Serializable, and when a range is a live local in the CPS frame that
+    // reaches `parallel(...)`, every branch fails to persist with
+    // NotSerializableException at the first checkpoint.
+    for (int id = 0; id < numShards; id++) {
       String stage = shardStageName(row, id)
-      // Substring filter (not regex: .contains() is sandbox-safe, avoids
-      // Pattern whitelist concerns for ad-hoc debug filters).
-      if (filter && !stage.contains(filter)) { return }
+      if (filter && !stage.contains(filter)) { continue }
       body.call(row, id)
     }
   }
