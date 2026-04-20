@@ -5,12 +5,23 @@
 
 import groovy.transform.Field
 
+// Per-board BNN rows — the single list that adding a new board requires
+// editing. BNN_BOARDS and the per-board rows in PARALLEL_SHARDS are both
+// derived from this so adding a board is a one-row change.
 @Field
-List<String> BNN_BOARDS = ['U250', 'Pynq-Z1', 'ZCU104', 'KV260_SOM']
+List<Map> BNN_BOARD_ROWS = [
+    [stage: 'BNN U250',    marker: 'bnn_u250',    shards: 4, workers: 2, board: 'U250'],
+    [stage: 'BNN Pynq-Z1', marker: 'bnn_pynq',    shards: 3, workers: 2, board: 'Pynq-Z1'],
+    [stage: 'BNN ZCU104',  marker: 'bnn_zcu104',  shards: 3, workers: 4, board: 'ZCU104'],
+    [stage: 'BNN KV260',   marker: 'bnn_kv260',   shards: 2, workers: 2, board: 'KV260_SOM'],
+]
+
+@Field
+List<String> BNN_BOARDS = BNN_BOARD_ROWS.collect { it.board }
 
 @Field
 List<Map> PARALLEL_SHARDS = [
-    // Sanity - Build Hardware rebuilds the same 4 scenarios covered by the
+    // Sanity - Build Hardware rebuilds the same scenarios covered by the
     // bnn_* rows below, so skip it when end2end also runs.
     [param: 'sanity',       stage: 'Sanity - Build Hardware', marker: 'sanity_bnn',
      shards: 1, workers: 1, skipWhen: 'end2end', zipBoards: BNN_BOARDS],
@@ -20,17 +31,18 @@ List<Map> PARALLEL_SHARDS = [
      shards: 2, workers: 8, coverage: true],
     [param: 'end2end',      stage: 'End2end',                 marker: 'end2end',
      shards: 2, workers: 6, distMode: 'loadgroup'],
-    // BNN per-board shard counts track iteration-3 wall-clock; cnv-w2a2 is the
-    // hot path on every board so give heavy boards more shards.
-    [param: 'end2end',      stage: 'BNN U250',                marker: 'bnn_u250',
-     shards: 4, workers: 2, distMode: 'loadgroup', zipBoards: ['U250']],
-    [param: 'end2end',      stage: 'BNN Pynq-Z1',             marker: 'bnn_pynq',
-     shards: 3, workers: 2, distMode: 'loadgroup', zipBoards: ['Pynq-Z1']],
-    [param: 'end2end',      stage: 'BNN ZCU104',              marker: 'bnn_zcu104',
-     shards: 3, workers: 4, distMode: 'loadgroup', zipBoards: ['ZCU104']],
-    [param: 'end2end',      stage: 'BNN KV260',               marker: 'bnn_kv260',
-     shards: 2, workers: 2, distMode: 'loadgroup', zipBoards: ['KV260_SOM']],
-]
+] + BNN_BOARD_ROWS.collect { r ->
+    // Per-board shard counts track iteration-3 wall-clock; cnv-w2a2 is the hot
+    // path on every board so heavy boards (U250) get more shards.
+    [param: 'end2end', stage: r.stage, marker: r.marker,
+     shards: r.shards, workers: r.workers, distMode: 'loadgroup',
+     zipBoards: [r.board]]
+}
+
+// Marker expressions are interpolated into shell. Restrict to identifier
+// characters + spaces so nothing can inject shell metacharacters.
+@Field
+java.util.regex.Pattern MARKER_SAFE_PATTERN = ~/^[A-Za-z0-9_ ]+$/
 
 pipeline {
   agent none
@@ -39,10 +51,16 @@ pipeline {
   }
   parameters {
     booleanParam(name: 'fpgadataflow', defaultValue: false, description: 'Run fpgadataflow tests')
-    booleanParam(name: 'sanity', defaultValue: true, description: 'Run sanity hardware and unit tests')
-    booleanParam(name: 'end2end', defaultValue: false, description: 'Run end2end tests')
+    booleanParam(name: 'sanity',       defaultValue: true,  description: 'Run sanity hardware and unit tests')
+    booleanParam(name: 'end2end',      defaultValue: false, description: 'Run end2end tests')
+    string(name: 'STAGES', defaultValue: '',
+           description: 'Substring filter on stage name (empty = all). Use to run one row for debugging.')
   }
   stages {
+    stage('Validate') {
+      agent { label 'finn-build' }
+      steps { script { validateShards() } }
+    }
     stage('Build Docker Image') {
       agent { label 'finn-build' }
       environment { FINN_DOCKER_PREBUILT = '0' }
@@ -55,6 +73,53 @@ pipeline {
       agent { label 'finn-build' }
       steps { script { aggregateReports() } }
     }
+  }
+}
+
+// Return a job parameter via the sandbox-safe property-access path. Avoids
+// `params[key]` which lowers to DefaultGroovyMethods.getAt(Object,String)
+// (not whitelisted — same class that bit env[k]=v in iter-1).
+boolean paramBool(String name) {
+  def v = params.getProperty(name)
+  if (v == null) { return false }
+  if (v instanceof Boolean) { return v }
+  return v.toString().toBoolean()
+}
+
+String paramString(String name) {
+  def v = params.getProperty(name)
+  return v == null ? '' : v.toString()
+}
+
+// Pre-flight: marker regex + executor budget. Marker violations are hard
+// errors; budget overshoot is UNSTABLE because CI queues correctly anyway.
+void validateShards() {
+  PARALLEL_SHARDS.each { row ->
+    if (!MARKER_SAFE_PATTERN.matcher(row.marker as String).matches()) {
+      error "PARALLEL_SHARDS row '${row.stage}' has unsafe marker '${row.marker}' (only [A-Za-z0-9_ ] allowed)"
+    }
+    if (!(row.shards instanceof Integer) || (row.shards as int) < 1) {
+      error "PARALLEL_SHARDS row '${row.stage}' has invalid shards=${row.shards}"
+    }
+  }
+  // BNN_BOARDS must match the derived set from BNN_BOARD_ROWS (derived is the
+  // source of truth; this asserts nobody hard-wired a stale value elsewhere).
+  def derivedBnn = BNN_BOARD_ROWS.collect { it.board }
+  if (BNN_BOARDS != derivedBnn) {
+    error "BNN_BOARDS (${BNN_BOARDS}) drift from BNN_BOARD_ROWS (${derivedBnn})"
+  }
+  def activeCount = 0
+  eachActiveShard { row, id -> activeCount++ }
+  int available = 0
+  try {
+    def lbl = Jenkins.instance.getLabelAtom('finn-build')
+    if (lbl) { available = lbl.getTotalExecutors() }
+  } catch (Exception e) {
+    echo "validateShards: executor query failed (${e.class.name}: ${e.message}); skipping budget check"
+  }
+  echo "validateShards: ${activeCount} shard(s) active; finn-build executors available: ${available}"
+  if (available > 0 && activeCount > available) {
+    unstable "PARALLEL_SHARDS requests ${activeCount} parallel shards but only ${available} finn-build executors are available; stages will queue and wall-clock will extend"
   }
 }
 
@@ -86,9 +151,9 @@ fi
 """
 }
 
-// Expand PARALLEL_SHARDS into (stage -> closure) pairs honouring param gates
-// and skipWhen cross-param suppression. Stash names are derived so adding a
-// row does not require editing expectedStashes().
+// Expand PARALLEL_SHARDS into (stage -> closure) pairs honouring param gates,
+// skipWhen cross-param suppression, and the STAGES substring filter. Stash
+// names are derived so adding a row does not require editing expectedStashes().
 Map<String, Closure> buildParallelStageMap() {
   def branches = [:]
   eachActiveShard { row, id ->
@@ -100,10 +165,17 @@ Map<String, Closure> buildParallelStageMap() {
 }
 
 void eachActiveShard(Closure body) {
+  String filter = paramString('STAGES')
   PARALLEL_SHARDS.each { row ->
-    if (!params[row.param]) return
-    if (row.skipWhen && params[row.skipWhen]) return
-    (0..<(row.shards as int)).each { id -> body.call(row, id) }
+    if (!paramBool(row.param as String)) { return }
+    if (row.skipWhen && paramBool(row.skipWhen as String)) { return }
+    (0..<(row.shards as int)).each { id ->
+      String stage = shardStageName(row, id)
+      // Substring filter (not regex: .contains() is sandbox-safe, avoids
+      // Pattern whitelist concerns for ad-hoc debug filters).
+      if (filter && !stage.contains(filter)) { return }
+      body.call(row, id)
+    }
   }
 }
 
@@ -137,6 +209,12 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
             if ((row.shards as int) > 1) {
               opts.numShards = row.shards as int
               opts.shardId = shardIdx
+            } else {
+              // Even unsharded rows emit timings via --num-shards=1 so the
+              // observability path is uniform. conftest.py treats --num-shards=1
+              // as a no-op for sharding but still writes <stash>.timings.json.
+              opts.numShards = 1
+              opts.shardId = 0
             }
             if (row.coverage) {
               opts.extraArgs = "--cov --cov-report=html:coverage_${stashName}"
@@ -156,14 +234,16 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
   }
 }
 
-// Stash <stash>.xml + <stash>.html iff pytest produced them. The defensive
-// catchError ensures a stash hiccup cannot affect build status — pytest's
-// own catchError already determines pass/fail.
+// Stash <stash>.xml + <stash>.html + <stash>.timings.json iff pytest produced
+// them. The defensive catchError ensures a stash hiccup cannot affect build
+// status — pytest's own catchError already determines pass/fail.
 void safeStashReport(String stashName) {
   catchError(buildResult: null, stageResult: null,
              message: "safeStashReport(${stashName}) failed; aggregation may be partial") {
     if (fileExists("${stashName}.xml")) {
-      stash name: stashName, includes: "${stashName}.xml,${stashName}.html"
+      stash name: stashName,
+            includes: "${stashName}.xml,${stashName}.html,${stashName}.timings.json",
+            allowEmpty: false
     }
   }
 }
@@ -195,6 +275,8 @@ void aggregateReports() {
     expectedStashes().each { name -> unstashIfPresent(name) }
   }
   junit allowEmptyResults: true, testResults: 'reports/*.xml'
+  echoShardTimings()
+  assertZipBoardsEmitted()
   catchError(buildResult: null, stageResult: 'UNSTABLE',
              message: 'pytest_html_merger failed; per-stage HTMLs still archived') {
     sh './run-docker.sh pytest_html_merger -i reports/ -o reports/test_report_final.html'
@@ -206,6 +288,104 @@ void aggregateReports() {
   catchError(buildResult: null, stageResult: 'UNSTABLE',
              message: 'archiveArtifacts (html) failed') {
     archiveArtifacts artifacts: 'reports/*.html', allowEmptyArchive: true
+  }
+  catchError(buildResult: null, stageResult: 'UNSTABLE',
+             message: 'archiveArtifacts (timings.json) failed') {
+    archiveArtifacts artifacts: 'reports/*.timings.json', allowEmptyArchive: true
+  }
+}
+
+// Per-shard wall-clock summary. Reads reports/*.timings.json (emitted by the
+// conftest plugin) and groups by marker family (stripped trailing _N). Warns
+// when any shard is > 1.5x the median wall-clock for its family.
+void echoShardTimings() {
+  catchError(buildResult: null, stageResult: null,
+             message: 'echoShardTimings failed; non-fatal') {
+    if (!fileExists('reports')) { return }
+    def count = sh(returnStdout: true, script:
+        "find reports -maxdepth 1 -type f -name '*.timings.json' | wc -l").trim()
+    if (count == '0') {
+      echo 'echoShardTimings: no timings.json found; skipping summary'
+      return
+    }
+    sh '''#!/bin/bash
+set -eo pipefail
+python3 - <<'PY'
+import glob, json, os, re, collections
+rows = []
+for p in sorted(glob.glob("reports/*.timings.json")):
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except Exception as e:
+        print("!! could not parse %s: %s" % (p, e))
+        continue
+    stash = d.get("stash") or os.path.basename(p).split(".")[0]
+    groups = d.get("groups") or []
+    top = groups[0] if groups else {"name": "(none)", "seconds": 0.0}
+    rows.append((stash, int(d.get("shard", {}).get("id", 0)),
+                 float(d.get("wall_seconds", 0.0)),
+                 float(top.get("seconds", 0.0)), str(top.get("name", ""))))
+if not rows:
+    print("echoShardTimings: no parseable timings.json files")
+    raise SystemExit(0)
+
+def family(s):
+    return re.sub(r"_\\d+$", "", s)
+
+by_family = collections.defaultdict(list)
+for r in rows:
+    by_family[family(r[0])].append(r)
+
+print()
+print("=== per-shard wall-clock ===")
+print("%-36s %3s %10s %12s  %s" % ("stash", "id", "wall_s", "max_group_s", "max_group"))
+print("-" * 100)
+unstable_found = False
+for fam in sorted(by_family):
+    rs = sorted(by_family[fam], key=lambda r: r[1])
+    walls = sorted(r[2] for r in rs)
+    median = walls[len(walls)//2] if walls else 0.0
+    for (stash, sid, wall, mx_sec, mx_name) in rs:
+        flag = ""
+        if median > 0.0 and wall > 1.5 * median:
+            flag = "  <<< SLOW SHARD (%.1fx median)" % (wall / median)
+            unstable_found = True
+        print("%-36s %3d %10.1f %12.1f  %s%s" % (stash, sid, wall, mx_sec, mx_name, flag))
+    print()
+if unstable_found:
+    print("echoShardTimings: one or more shards are > 1.5x family median; "
+          "consider rebalancing `shards:` in PARALLEL_SHARDS")
+PY
+'''
+  }
+}
+
+// Post-condition: every active row declaring zipBoards must have produced a
+// <board>.zip in ARTIFACT_DIR for each board. Missing zips mean no shard ran
+// the bitstream-emitting scenario — a silent-skip class the pre-shard coverage
+// guard doesn't catch (marker has items, but the specific parametrisation
+// that emits bitstreams isn't in any of them). UNSTABLE, not FAILURE, because
+// the upstream cause (marker typo, test filter) would surface via junit too.
+void assertZipBoardsEmitted() {
+  catchError(buildResult: null, stageResult: null,
+             message: 'assertZipBoardsEmitted failed; non-fatal') {
+    def missing = []
+    eachActiveShard { row, id ->
+      if (!row.zipBoards) { return }
+      if (id != 0) { return }  // check once per row, not once per shard
+      String stash = shardStashName(row, id)
+      (row.zipBoards ?: []).each { board ->
+        String expected = "${env.ARTIFACT_DIR}/${stash}/${board}.zip"
+        if (!fileExists(expected)) {
+          missing << "${row.stage} -> ${board} (expected ${expected})"
+        }
+      }
+    }
+    if (!missing.isEmpty()) {
+      echo "assertZipBoardsEmitted: missing ${missing.size()} expected board zip(s):\n  - " + missing.join('\n  - ')
+      unstable "assertZipBoardsEmitted: ${missing.size()} expected board zip(s) missing (see log above); no shard emitted the bitstream-producing scenario"
+    }
   }
 }
 
@@ -224,10 +404,13 @@ void cleanPreviousBuildFiles(String buildDir) {
 
 // Single pytest entry point. Feeds the command line via a temporary script
 // because run-docker.sh re-tokenises argv and would split quoted metacharacters
-// in `-m` expressions otherwise. Args (Map): marker/stash required; workers,
-// distMode, numShards/shardId, extraArgs optional.
+// in `-m` expressions otherwise. Marker expression is passed via an env var
+// rather than single-quote interpolation so shell metachars in a (malformed)
+// marker value can't escape — validateShards() already rejects those, this is
+// defence in depth. Args (Map): marker/stash required; workers, distMode,
+// numShards/shardId, extraArgs optional.
 void runPytest(Map opts) {
-  def parts = ["python -m pytest -m '${opts.marker}'"]
+  def parts = ["python -m pytest -m \"\$FINN_CI_MARKER\""]
   if (opts.workers) {
     parts << "-n ${opts.workers} --dist ${opts.distMode ?: 'worksteal'}"
   }
@@ -237,20 +420,21 @@ void runPytest(Map opts) {
   parts << "--junitxml=${opts.stash}.xml --html=${opts.stash}.html --self-contained-html"
   if (opts.extraArgs) { parts << opts.extraArgs }
   def cmd = parts.join(' ')
-  // Echo the resolved command so the Jenkins console log shows exactly what ran.
-  echo "runPytest[${opts.stash}]: ${cmd}"
+  echo "runPytest[${opts.stash}]: FINN_CI_MARKER='${opts.marker}'; ${cmd}"
   // pytest exit 5 = "no tests collected". With hash-sharding this happens
   // legitimately when an over-provisioned shard count leaves one shard empty;
   // pre-shard-empty is already caught loudly by the plugin in tests/conftest.py,
   // so exit 5 here is a "reduce shards: in PARALLEL_SHARDS" hint, not a failure.
   writeFile file: 'run-tests.sh', text:
-      "#!/bin/bash\nset -o pipefail\n${cmd}\nec=\$?\n[ \$ec -eq 5 ] && exit 0 || exit \$ec\n"
+      "#!/bin/bash\nset -o pipefail\nexport FINN_CI_MARKER='${opts.marker}'\n${cmd}\nec=\$?\n[ \$ec -eq 5 ] && exit 0 || exit \$ec\n"
   sh 'chmod 777 run-tests.sh'
   sh './run-docker.sh ./run-tests.sh'
 }
 
 // Silent no-op if the board's hw_deployment_* directory is absent: with hash
 // sharding, only the shard that happened to run cnv-w2a2 produces artefacts.
+// The zipBoards postcondition in aggregateReports catches the case where NO
+// shard produced the expected artefact.
 void findCopyZip(String board, String findDir, String copyDir) {
   if (!fileExists("${findDir}")) { return }
   def found = sh(returnStdout: true, script:

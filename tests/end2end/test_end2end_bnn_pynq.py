@@ -367,114 +367,78 @@ def deploy_based_on_board(model, model_title, topology, wbits, abits, board):
         model.set_metadata_prop("cpp_deploy_dir", deployment_dir)
 
 
-# parameters that make up inputs to test case(s)
-def get_full_parameterized_test_list(marker, wbits_list, abits_list, topology_list, board_list):
-    test_cases = [
-        (
-            f"{marker}_w{param1}_a{param2}_{param3}_{param4}",
-            {
-                "wbits": param1,
-                "abits": param2,
-                "topology": param3,
-                "board": param4,
-            },
-        )
-        for param1, param2, param3, param4 in itertools.product(
-            wbits_list,
-            abits_list,
-            topology_list,
-            board_list,
-        )
-    ]
-    return test_cases
+# The (marker, wbits, abits, topology, board) cross-product covered by this
+# file. Each scenario is tagged with the single marker for the shard that
+# should run it; pytest's own `-m <marker>` filter then does the selection.
+# Adding a new board is a one-row addition to `_BNN_MARKER_BY_BOARD` and a
+# matching line in `test_board_map` — the Jenkinsfile PARALLEL_SHARDS row
+# picks it up by marker without any change here.
+#
+# Sanity scenarios are a fixed 4-tuple — one per board — that exercise
+# representative (w,a,topology) combinations. They are kept separate from
+# the full per-board cross-product so `-m sanity_bnn` stays a single build
+# per board rather than the 12 scenarios of `-m bnn_<board>`.
+_SANITY_BNN_CONFIGS = [
+    (1, 1, "lfc", "Pynq-Z1"),
+    (1, 2, "cnv", "KV260_SOM"),
+    (2, 2, "tfc", "ZCU104"),
+    (2, 2, "cnv", "U250"),
+]
+
+_BNN_MARKER_BY_BOARD = {
+    "Pynq-Z1":   "bnn_pynq",
+    "KV260_SOM": "bnn_kv260",
+    "ZCU104":    "bnn_zcu104",
+    "U250":      "bnn_u250",
+}
+
+_BNN_WBITS = [1, 2]
+_BNN_ABITS = [1, 2]
+_BNN_TOPOLOGY = ["lfc", "tfc", "cnv"]
+
+
+def _bnn_scenarios():
+    """Return a list of (id, kwargs, marks) tuples covering every scenario."""
+    scenarios = []
+    for idx, (w, a, top, board) in enumerate(_SANITY_BNN_CONFIGS):
+        scenarios.append((
+            f"sanity_bnn_w{w}_a{a}_{top}_{board}",
+            {"wbits": w, "abits": a, "topology": top, "board": board},
+            [
+                pytest.mark.sanity_bnn,
+                pytest.mark.xdist_group(name=f"sanity_bnn_group_{idx}"),
+            ],
+        ))
+    for board in test_board_map:
+        marker_name = _BNN_MARKER_BY_BOARD[board]
+        marker = getattr(pytest.mark, marker_name)
+        for idx, (w, a, top) in enumerate(
+            itertools.product(_BNN_WBITS, _BNN_ABITS, _BNN_TOPOLOGY)
+        ):
+            scenarios.append((
+                f"bnn_w{w}_a{a}_{top}_{board}",
+                {"wbits": w, "abits": a, "topology": top, "board": board},
+                [
+                    marker,
+                    pytest.mark.xdist_group(name=f"{marker_name}_group_{idx}"),
+                ],
+            ))
+    return scenarios
 
 
 def pytest_generate_tests(metafunc):
-    idlist = []
-    argvalues = []
-    scenarios = []
-
-    # Full set of test parameters
-    wbits = [1, 2]
-    abits = [1, 2]
-    topology = ["lfc", "tfc", "cnv"]
-
-    # Separate the full list of markers used on command line.
-    # This allows a user to select multiple markers
-    all_markers_used = metafunc.config.getoption("-m").split(" ")
-
-    for marker in all_markers_used:
-        if "sanity_bnn" in marker:
-            # Define a set of sanity tests that target each of
-            # the supported boards with fixed parameters
-            scenarios.extend(
-                get_full_parameterized_test_list(
-                    "sanity_bnn",
-                    wbits_list=[1],
-                    abits_list=[1],
-                    topology_list=["lfc"],
-                    board_list=[test_board_map[0]],
-                )
-            )
-            scenarios.extend(
-                get_full_parameterized_test_list(
-                    "sanity_bnn",
-                    wbits_list=[1],
-                    abits_list=[2],
-                    topology_list=["cnv"],
-                    board_list=[test_board_map[1]],
-                )
-            )
-            scenarios.extend(
-                get_full_parameterized_test_list(
-                    "sanity_bnn",
-                    wbits_list=[2],
-                    abits_list=[2],
-                    topology_list=["tfc"],
-                    board_list=[test_board_map[2]],
-                )
-            )
-            scenarios.extend(
-                get_full_parameterized_test_list(
-                    "sanity_bnn",
-                    wbits_list=[2],
-                    abits_list=[2],
-                    topology_list=["cnv"],
-                    board_list=[test_board_map[3]],
-                )
-            )
-
-        if "bnn_" in marker:
-            # Target the full set of parameters for a single board
-            # Extract the board name from the marker used, as it is in the form of 'bnn_<board>'
-            bnn_board = next(
-                (element for element in test_board_map if marker.split("_")[1] in element.lower()),
-                None,
-            )
-            test_cases = get_full_parameterized_test_list(
-                "bnn", wbits, abits, topology, [bnn_board]
-            )
-            scenarios.extend(test_cases)
-
-    if len(scenarios) > 0:
-        for i, scenario in enumerate(scenarios):
-            idlist.append(scenario[0])
-            items = scenario[1].items()
-            argnames = [x[0] for x in items]
-            argvalues_scenario = [x[1] for x in items]
-            argvalues.append(
-                pytest.param(
-                    *argvalues_scenario, marks=pytest.mark.xdist_group(name="bnn_pynq_%d" % i)
-                )
-            )
-        metafunc.parametrize(argnames, argvalues, ids=idlist, scope="class")
+    scenarios = _bnn_scenarios()
+    if not scenarios:
+        return
+    argnames = ["wbits", "abits", "topology", "board"]
+    idlist = [s[0] for s in scenarios]
+    argvalues = [
+        pytest.param(*(s[1][k] for k in argnames), marks=s[2])
+        for s in scenarios
+    ]
+    metafunc.parametrize(argnames, argvalues, ids=idlist, scope="class")
 
 
-@pytest.mark.sanity_bnn
-@pytest.mark.bnn_pynq
-@pytest.mark.bnn_zcu104
-@pytest.mark.bnn_kv260
-@pytest.mark.bnn_u250
 class TestEnd2End:
     def test_export(self, topology, wbits, abits, board):
         if wbits > abits:
