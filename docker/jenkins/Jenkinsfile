@@ -444,7 +444,11 @@ void cleanStaleAgentDirs() {
       "ls -1A '${env.FINN_HOST_BUILD_DIR}' 2>/dev/null || true"
   ).trim()
   if (!listing) { return }
-  def stale = listing.split('\n').findAll { it && !expected.contains(it) }
+  // readLines() returns an ArrayList<String>; split('\n') returns String[]
+  // whose iterator is org.codehaus.groovy.util.ArrayIterator, which is not
+  // serializable and fails the CPS checkpoint on the sh inside .each below
+  // (same class of bug as the IntRange fix in iter-5).
+  def stale = listing.readLines().findAll { it && !expected.contains(it) }
   if (stale.isEmpty()) { return }
   echo "cleanStaleAgentDirs: pruning ${stale.size()} non-whitelisted entry/entries in ${env.FINN_HOST_BUILD_DIR}: ${stale}"
   stale.each { name ->
