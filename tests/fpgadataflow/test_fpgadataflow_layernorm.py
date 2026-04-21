@@ -12,6 +12,7 @@
 
 import pytest
 
+import json
 import numpy as np
 import os
 import warnings
@@ -437,6 +438,16 @@ def test_hls_rtl_dsp_conflict_detection():
     np.save(tmp_output_dir + "/expected_output.npy", y_ref)
     model.save(tmp_output_dir + "/model.onnx")
 
+    # Create specialize_layers config to force the first Mul to use HLS implementation.
+    # This future-proofs the test for when RTL gets int+float->float support.
+    specialize_config = {
+        "Defaults": {},
+        "ElementwiseMul_0": {"preferred_impl_style": "hls"},
+    }
+    specialize_config_file = tmp_output_dir + "/specialize_layers_config.json"
+    with open(specialize_config_file, "w") as f:
+        json.dump(specialize_config, f)
+
     # Build steps - includes conversion to HW layers and specialization
     steps = [
         "step_convert_to_hw",
@@ -465,6 +476,7 @@ def test_hls_rtl_dsp_conflict_detection():
         target_fps=1000,
         synth_clk_period_ns=target_clk_ns,
         board="V80",
+        specialize_layers_config_file=specialize_config_file,
         verify_steps=verif_steps,
         verify_input_npy=tmp_output_dir + "/input.npy",
         verify_expected_output_npy=tmp_output_dir + "/expected_output.npy",
