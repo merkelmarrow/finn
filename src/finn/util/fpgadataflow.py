@@ -28,6 +28,7 @@
 
 import os
 import warnings
+from qonnx.core.datatype import DataType
 from qonnx.custom_op.registry import getCustomOp, is_custom_op
 from qonnx.util.basic import get_by_name
 
@@ -76,11 +77,14 @@ def is_rtl_node(node):
 
 def detect_hls_rtl_dsp_conflict(model, check_subgraphs=True):
     """
-    Detect if model contains both HLS Elementwise ops and RTL ops using DSPFP32.
+    Detect if model contains both floating-point HLS Elementwise ops and RTL ops using DSPFP32.
 
     This combination causes incorrect simulation results in xsim due to DSP
     primitive initialization conflicts. The hardware is correct - only
     simulation is affected.
+
+    Note: Only HLS Elementwise ops using floating-point datatypes are flagged,
+    as integer-only HLS Elementwise ops don't use DSP primitives.
 
     Args:
         model: ModelWrapper to check
@@ -89,10 +93,9 @@ def detect_hls_rtl_dsp_conflict(model, check_subgraphs=True):
     Returns:
         Tuple of (has_conflict, hls_elementwise_ops, rtl_dsp_ops)
         - has_conflict: bool, True if both types of ops are present
-        - hls_elementwise_ops: list of HLS Elementwise node names
+        - hls_elementwise_ops: list of floating-point HLS Elementwise node names
         - rtl_dsp_ops: list of RTL DSP node names (LayerNorm_rtl, Elementwise*_rtl)
     """
-
     # RTL ops that use DSPFP32 primitive (via binopf.sv)
     RTL_DSP_OPS = {
         "LayerNorm_rtl",
@@ -110,9 +113,23 @@ def detect_hls_rtl_dsp_conflict(model, check_subgraphs=True):
         for node in nodes:
             full_name = f"{prefix}{node.name}" if prefix else node.name
 
-            # Check for HLS Elementwise ops
+            # Check for HLS Elementwise ops with floating-point datatypes
             if node.op_type.startswith("Elementwise") and node.domain == HLS_DOMAIN:
-                hls_elementwise_ops.append(full_name)
+                try:
+                    node_inst = getCustomOp(node)
+                    # Check if any of the datatypes are floating-point
+                    lhs_dtype = DataType[node_inst.get_nodeattr("lhs_dtype")]
+                    rhs_dtype = DataType[node_inst.get_nodeattr("rhs_dtype")]
+                    out_dtype = DataType[node_inst.get_nodeattr("out_dtype")]
+                    if (
+                        lhs_dtype.get_canonical_name().startswith("FLOAT")
+                        or rhs_dtype.get_canonical_name().startswith("FLOAT")
+                        or out_dtype.get_canonical_name().startswith("FLOAT")
+                    ):
+                        hls_elementwise_ops.append(full_name)
+                except (KeyError, AttributeError):
+                    # If we can't check datatypes, assume it could be floating-point
+                    hls_elementwise_ops.append(full_name)
 
             # Check for RTL ops using DSPFP32
             if node.op_type in RTL_DSP_OPS:

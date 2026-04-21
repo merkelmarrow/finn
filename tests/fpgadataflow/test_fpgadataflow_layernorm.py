@@ -417,53 +417,18 @@ def test_hls_rtl_dsp_conflict_detection():
     mul_param_shape = [ishape[-1]]
     idt = DataType["INT8"]
 
-    # Create model
+    # Create model and prepare for build
     model = create_mul_layernorm_model(idt, ishape, mul_param_shape)
 
     # Generate reference input/output
     input_data = gen_finn_dt_tensor(idt, ishape)
     input_t = {"inp": input_data}
-
     y_ref = oxe.execute_onnx(model, input_t)["outp"]
 
-    # Apply transformations
+    # Apply minimal transformations - build flow handles the rest
     model = model.transform(InferShapes())
     model = model.transform(InferDataTypes())
-
-    # Extract scale/bias from LayerNorm
     model = model.transform(ExtractNormScaleBias())
-
-    # Convert to HW layers
-    model = model.transform(to_hw.InferLayerNorm())
-    model = model.transform(to_hw.InferElementwiseBinaryOperation())
-
-    # Verify transformation worked
-    input_t = {"inp": input_data}
-    y_hw = oxe.execute_onnx(model, input_t)["outp"]
-    assert np.allclose(y_ref, y_hw, rtol=1e-3, atol=2**-4), "HW transformation changed output"
-
-    # Specialize layers - this will create:
-    # - ElementwiseMul_hls (INT8 input doesn't qualify for RTL, needs FLOAT32)
-    # - LayerNorm_rtl (FLOAT32 input qualifies for RTL)
-    # - ElementwiseMul_rtl and ElementwiseAdd_rtl for scale/bias
-    model = model.transform(SpecializeLayers(test_fpga_part))
-    model = model.transform(GiveUniqueNodeNames())
-
-    # Check that we have the conflict-causing combination
-    hls_elementwise_ops = [
-        n.name
-        for n in model.graph.node
-        if n.op_type.startswith("Elementwise") and n.domain == "finn.custom_op.fpgadataflow.hls"
-    ]
-    rtl_dsp_ops = [
-        n.name
-        for n in model.graph.node
-        if n.op_type
-        in ["LayerNorm_rtl", "ElementwiseAdd_rtl", "ElementwiseSub_rtl", "ElementwiseMul_rtl"]
-    ]
-
-    assert len(hls_elementwise_ops) > 0, "Expected at least one HLS Elementwise op"
-    assert len(rtl_dsp_ops) > 0, "Expected at least one RTL DSP op"
 
     # Setup build directory
     tmp_output_dir = make_build_dir("build_dsp_conflict_test_")
@@ -472,9 +437,11 @@ def test_hls_rtl_dsp_conflict_detection():
     np.save(tmp_output_dir + "/expected_output.npy", y_ref)
     model.save(tmp_output_dir + "/model.onnx")
 
-    # Build steps - convert to HW through IP stitching
+    # Build steps - includes conversion to HW layers and specialization
     steps = [
+        "step_convert_to_hw",
         "step_create_dataflow_partition",
+        "step_specialize_layers",
         "step_target_fps_parallelization",
         "step_apply_folding_config",
         "step_minimize_bit_width",
@@ -534,8 +501,7 @@ def test_hls_rtl_dsp_conflict_detection():
         cppsim_success
     ), f"cppsim verification should have passed - check {verif_dir}"
 
-    # Verify cppsim still passed (not affected by DSP conflict)
-    verif_dir = tmp_output_dir + "/verification_output"
+    # Verify node_by_node_rtlsim passed (not affected by DSP conflict for non-MLO)
     rtlsim_success = os.path.join(verif_dir, "verify_node_by_node_rtlsim_0_SUCCESS.npy")
     assert os.path.isfile(
         rtlsim_success
@@ -546,3 +512,198 @@ def test_hls_rtl_dsp_conflict_detection():
     assert not os.path.isfile(
         stitched_success
     ), "stitched_ip_rtlsim should have been skipped due to DSP conflict"
+
+
+def create_layernorm_threshold_mul_model(ishape):
+    """
+    Create a model: LayerNorm -> MultiThreshold -> Mul (INT param).
+
+    This model has both RTL DSP ops (LayerNorm_rtl) and HLS Elementwise ops,
+    but the HLS Elementwise uses integer datatypes (after quantization via
+    MultiThreshold), so it should NOT trigger the DSP conflict detection.
+    """
+    from qonnx.util.basic import qonnx_make_model
+
+    num_channels = ishape[-1]
+
+    inp = helper.make_tensor_value_info("inp", TensorProto.FLOAT, ishape)
+    outp = helper.make_tensor_value_info("outp", TensorProto.FLOAT, ishape)
+    scale = helper.make_tensor_value_info("scale", TensorProto.FLOAT, [num_channels])
+    bias = helper.make_tensor_value_info("bias", TensorProto.FLOAT, [num_channels])
+    thresh = helper.make_tensor_value_info("thresh", TensorProto.FLOAT, [num_channels, 255])
+    mul_param = helper.make_tensor_value_info("mul_param", TensorProto.FLOAT, [num_channels])
+
+    # LayerNorm (will become LayerNorm_rtl)
+    ln_node = helper.make_node(
+        "LayerNormalization",
+        inputs=["inp", "scale", "bias"],
+        outputs=["ln_out"],
+        name="LayerNorm_0",
+        epsilon=1e-5,
+        axis=-1,
+        stash_type=1,
+    )
+
+    # MultiThreshold to quantize to INT8
+    mt_node = helper.make_node(
+        "MultiThreshold",
+        inputs=["ln_out", "thresh"],
+        outputs=["mt_out"],
+        domain="qonnx.custom_op.general",
+        out_dtype="INT8",
+        out_bias=-128.0,
+        out_scale=1.0,
+        data_layout="NC",
+    )
+
+    # Mul with integer parameter (INT8 * INT8 -> INT16)
+    # After MultiThreshold, input is INT8, param will be INT8
+    mul_node = helper.make_node(
+        "Mul",
+        inputs=["mt_out", "mul_param"],
+        outputs=["outp"],
+        name="Mul_int",
+    )
+
+    # Intermediate value infos
+    ln_out_vi = helper.make_tensor_value_info("ln_out", TensorProto.FLOAT, ishape)
+    mt_out_vi = helper.make_tensor_value_info("mt_out", TensorProto.FLOAT, ishape)
+
+    graph = helper.make_graph(
+        nodes=[ln_node, mt_node, mul_node],
+        name="ln_thresh_mul_graph",
+        inputs=[inp, scale, bias, thresh, mul_param],
+        outputs=[outp],
+        value_info=[ln_out_vi, mt_out_vi],
+    )
+    model = qonnx_make_model(graph, producer_name="ln_thresh_mul_test")
+    model = ModelWrapper(model)
+
+    # Set initializers
+    scale_data = np.ones(num_channels, dtype=np.float32)
+    bias_data = np.zeros(num_channels, dtype=np.float32)
+    # Create thresholds for 256 levels (INT8 range)
+    thresh_data = np.zeros((num_channels, 255), dtype=np.float32)
+    for ch in range(num_channels):
+        thresh_data[ch, :] = np.linspace(-10.0, 10.0, 255)
+    # Integer mul param (small integers)
+    mul_param_data = np.ones(num_channels, dtype=np.float32) * 2.0
+
+    model.set_initializer("scale", scale_data)
+    model.set_initializer("bias", bias_data)
+    model.set_initializer("thresh", thresh_data)
+    model.set_initializer("mul_param", mul_param_data)
+
+    # Set tensor datatypes
+    model.set_tensor_datatype("inp", DataType["FLOAT32"])
+    model.set_tensor_datatype("ln_out", DataType["FLOAT32"])
+    model.set_tensor_datatype("mt_out", DataType["INT8"])
+    model.set_tensor_datatype("mul_param", DataType["INT8"])
+    model.set_tensor_datatype("outp", DataType["INT16"])
+    model.set_tensor_datatype("scale", DataType["FLOAT32"])
+    model.set_tensor_datatype("bias", DataType["FLOAT32"])
+    model.set_tensor_datatype("thresh", DataType["FLOAT32"])
+
+    return model
+
+
+@pytest.mark.slow
+@pytest.mark.vivado
+@pytest.mark.fpgadataflow
+def test_integer_hls_elementwise_no_dsp_conflict():
+    """
+    Test that integer-only HLS Elementwise ops do NOT trigger DSP conflict detection.
+
+    This test creates a model with:
+    - LayerNorm -> LayerNorm_rtl (uses DSPFP32)
+    - MultiThreshold -> quantizes to INT8
+    - Mul (INT8 * INT8) -> ElementwiseMul_hls (integer, no DSP conflict)
+
+    The model has HLS Elementwise ops AND RTL DSP ops, but since the HLS
+    Elementwise uses integer datatypes (not floating-point), NO DSP conflict
+    should be detected and stitched_ip_rtlsim should run successfully.
+    """
+    ishape = [1, 32]
+
+    # Create model and prepare for build
+    model = create_layernorm_threshold_mul_model(ishape)
+
+    # Generate reference input/output
+    input_data = gen_finn_dt_tensor(DataType["FLOAT32"], ishape)
+    input_t = {"inp": input_data}
+    y_ref = oxe.execute_onnx(model, input_t)["outp"]
+
+    # Apply minimal transformations - build flow handles the rest
+    model = model.transform(InferShapes())
+    model = model.transform(InferDataTypes())
+    model = model.transform(ExtractNormScaleBias())
+
+    # Setup build directory
+    tmp_output_dir = make_build_dir("build_int_elementwise_test_")
+
+    np.save(tmp_output_dir + "/input.npy", input_data)
+    np.save(tmp_output_dir + "/expected_output.npy", y_ref)
+    model.save(tmp_output_dir + "/model.onnx")
+
+    # Build steps - includes conversion to HW layers and specialization
+    steps = [
+        "step_convert_to_hw",
+        "step_create_dataflow_partition",
+        "step_specialize_layers",
+        "step_target_fps_parallelization",
+        "step_apply_folding_config",
+        "step_minimize_bit_width",
+        "step_generate_estimate_reports",
+        "step_hw_codegen",
+        "step_hw_ipgen",
+        "step_set_fifo_depths",
+        "step_create_stitched_ip",
+    ]
+
+    # Request verification steps - stitched_ip_rtlsim should NOT be skipped
+    verif_steps = [
+        "folded_hls_cppsim",
+        "stitched_ip_rtlsim",
+    ]
+
+    cfg = build_cfg.DataflowBuildConfig(
+        output_dir=tmp_output_dir,
+        steps=steps,
+        target_fps=1000,
+        synth_clk_period_ns=target_clk_ns,
+        board="V80",
+        verify_steps=verif_steps,
+        verify_input_npy=tmp_output_dir + "/input.npy",
+        verify_expected_output_npy=tmp_output_dir + "/expected_output.npy",
+        generate_outputs=[
+            build_cfg.DataflowOutputType.ESTIMATE_REPORTS,
+            build_cfg.DataflowOutputType.STITCHED_IP,
+        ],
+    )
+
+    # Capture warnings during build
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        build.build_dataflow_cfg(tmp_output_dir + "/model.onnx", cfg)
+
+    # Check that NO DSP conflict warning was issued
+    dsp_conflict_warnings = [
+        w for w in caught_warnings if "HLS+RTL DSP CONFLICT DETECTED" in str(w.message)
+    ]
+    assert len(dsp_conflict_warnings) == 0, (
+        f"No DSP conflict warning should be issued for integer HLS Elementwise. "
+        f"Found warnings: {[str(w.message)[:100] for w in dsp_conflict_warnings]}"
+    )
+
+    # Verify that stitched_ip_rtlsim ran successfully (was NOT skipped)
+    verif_dir = tmp_output_dir + "/verification_output"
+    stitched_success = os.path.join(verif_dir, "verify_stitched_ip_rtlsim_0_SUCCESS.npy")
+    assert os.path.isfile(
+        stitched_success
+    ), f"stitched_ip_rtlsim should have run (not skipped) and passed - check {verif_dir}"
+
+    # Verify no conflict log file was created
+    stitched_conflict_file = os.path.join(verif_dir, "stitched_ip_rtlsim_SKIPPED_DSP_CONFLICT.txt")
+    assert not os.path.isfile(
+        stitched_conflict_file
+    ), f"No DSP conflict log file should exist at {stitched_conflict_file}"
