@@ -425,10 +425,23 @@ List<String> expectedStashes() {
   return stashes
 }
 
+// iter-6 C: clean buildDir on the host AND pre-create it so docker's `-v`
+// mount finds an existing source and doesn't auto-create the bind parent as
+// root:root (which the in-container cse-jenkins user can't then write to,
+// observed as PermissionError on end2end tests in #21). The existence check
+// after rm fails loud if a previous container left root-owned residue that
+// this shard can't clean — the operator needs to nuke it with sudo once.
 void cleanPreviousBuildFiles(String buildDir) {
-  if (buildDir && !buildDir.empty) {
-    sh "rm -rf ${buildDir}"
-  }
+  if (!buildDir || buildDir.empty) { return }
+  sh """
+    rm -rf '${buildDir}' 2>/dev/null || true
+    if [ -d '${buildDir}' ]; then
+      echo "cleanPreviousBuildFiles: '${buildDir}' still exists after rm; likely root-owned residue from a previous container. Ask an admin to 'sudo rm -rf ${buildDir}' on this agent. Contents:"
+      ls -la '${buildDir}' | head -40
+      exit 1
+    fi
+    mkdir -p '${buildDir}'
+  """
 }
 
 // iter-6 A.1: prune directories in FINN_HOST_BUILD_DIR that aren't an
