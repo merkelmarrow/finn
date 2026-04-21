@@ -216,17 +216,14 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
   node('finn-build') {
     stage(stageName) {
       checkout scm
+      // iter-6 A.1: prune legacy siblings under the parent tmp dir before we
+      // remap FINN_HOST_BUILD_DIR to the per-shard path. Must run here so
+      // `env.FINN_HOST_BUILD_DIR` still points at the shared parent.
+      cleanStaleAgentDirs()
       def buildDir = "${env.FINN_HOST_BUILD_DIR}/${stashName}"
       withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
-        // iter-6 A.1 / A.2: admission control at shard start on this agent.
-        // cleanStaleAgentDirs removes dirs in FINN_HOST_BUILD_DIR that no
-        // current shard owns (legacy `bnn_build_full/`, `fpgadataflow/` from
-        // pre-iter-5 pipelines — these accumulated to 170 GB on xircseeng01
-        // and filled /scratch during #18). checkAgentFreeSpace fails the
-        // shard fast if /scratch is below threshold rather than letting
-        // pytest OOM-disk mid-run (which corrupts junit XML and drops the
-        // agent off Jenkins — 5 such cascades in #18).
-        cleanStaleAgentDirs()
+        // iter-6 A.2: fail the shard fast if /scratch is below threshold
+        // rather than letting pytest OOM-disk mid-run (5 such cascades in #18).
         checkAgentFreeSpace(FINN_CI_MIN_FREE_GB)
         sh "mkdir -p ${stashName}"
         cleanPreviousBuildFiles(buildDir)
@@ -463,11 +460,21 @@ void cleanStaleAgentDirs() {
 void checkAgentFreeSpace(int minFreeGB) {
   if (minFreeGB <= 0) { return }
   String target = env.FINN_HOST_BUILD_DIR ?: '/scratch'
-  def raw = sh(returnStdout: true, script:
-      "df -BG '${target}' | awk 'NR==2 {print \$4}' | tr -d 'G'"
-  ).trim()
-  int freeGB = raw.isInteger() ? raw.toInteger() : 0
-  echo "checkAgentFreeSpace[${env.NODE_NAME}]: ${freeGB} GB free on ${target} (threshold ${minFreeGB} GB)"
+  // The shard's own dir doesn't exist yet (mkdir happens later in runShard),
+  // so climb up to the nearest existing ancestor before calling df. Without
+  // this, df emits a single "No such file or directory" line, awk returns
+  // empty, and the parser falls back to 0 -> every shard aborts (#19).
+  def raw = sh(returnStdout: true, script: """
+d='${target}'
+while [ ! -d "\$d" ] && [ "\$d" != '/' ]; do d=\$(dirname "\$d"); done
+df -BG "\$d" | awk 'NR==2 {print \$4}' | tr -d 'G'
+""").trim()
+  int freeGB = raw.isInteger() ? raw.toInteger() : -1
+  echo "checkAgentFreeSpace[${env.NODE_NAME}]: ${freeGB} GB free (probed ${target}; threshold ${minFreeGB} GB)"
+  if (freeGB < 0) {
+    echo "checkAgentFreeSpace[${env.NODE_NAME}]: could not parse df output (${raw.take(80)}); skipping precheck"
+    return
+  }
   if (freeGB < minFreeGB) {
     error "agent ${env.NODE_NAME} has only ${freeGB} GB free on ${target} (< ${minFreeGB} GB threshold); aborting shard to avoid mid-run disk exhaustion. Free space by pruning /scratch or reduce concurrent shards on this agent (see jenkins_ci.md iter-6)."
   }
