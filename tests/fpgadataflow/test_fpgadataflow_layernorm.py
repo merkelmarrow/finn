@@ -534,8 +534,6 @@ def create_layernorm_threshold_mul_model(ishape):
     but the HLS Elementwise uses integer datatypes (after quantization via
     MultiThreshold), so it should NOT trigger the DSP conflict detection.
     """
-    from qonnx.util.basic import qonnx_make_model
-
     num_channels = ishape[-1]
 
     inp = helper.make_tensor_value_info("inp", TensorProto.FLOAT, ishape)
