@@ -29,19 +29,35 @@
 
 Adding a test requires nothing beyond the usual `@pytest.mark.<marker>`:
 the Jenkinsfile runs each marker with `--num-shards N --shard-id I`, and
-the hook below does deterministic hash-based sharding over the collected
-items. No `.test_durations`, no per-file allowlist, no rebalance script.
+the hook below does deterministic round-robin-by-group sharding over the
+collected items. No `.test_durations`, no per-file allowlist, no
+rebalance script.
+
+iter-6 change: switched from hash-by-group to round-robin over
+sorted-group-keys. Hashing permitted collisions where two big groups
+landed on one shard and another shard ran empty; the pathological case
+in #18 was `bnn_u250_3: 54 skipped, 0 passed in 11.9 s` where the shard
+received only chain-break-prone late steps from guard-skipped scenarios.
+Round-robin guarantees balanced group COUNT per shard and deterministic
+placement that is identical across runs of the same test set, so a late
+step's upstream is always in the same shard it was in last run.
+
+Chain integrity rule: items that share an `@pytest.mark.xdist_group(name=X)`
+ALWAYS land in the same shard (they form a `load_test_checkpoint_or_skip`
+sequence and splitting them silently skips downstream steps). Items
+without an explicit xdist_group are grouped by nodeid (one item per
+group), which is fine for leaf unit tests.
 
 If `-m <marker>` ever selects zero tests while sharding is requested, the
 hook raises — catching "silently skipped in CI" at collection time rather
 than allowing the skip to ship.
 
-`@pytest.mark.shard(N)` pins a test to a specific shard, overriding the
-hash. `--dry-run-shards` prints the shard assignment table and exits.
-A `<stash>.timings.json` sidecar is emitted next to the junit XML when
-`--num-shards` is set so the Jenkinsfile can echo per-shard wall-clock.
+`@pytest.mark.shard(N)` pins a test (and its xdist_group siblings) to a
+specific shard, overriding round-robin. `--dry-run-shards` prints the
+shard assignment table and exits. A `<stash>.timings.json` sidecar is
+emitted next to the junit XML when `--num-shards` is set so the
+Jenkinsfile can echo per-shard wall-clock.
 """
-import hashlib
 import json
 import os
 import time
@@ -74,7 +90,7 @@ def _group_key(item):
     # Tests sharing an `xdist_group` form a sequence (downstream steps use
     # `load_test_checkpoint_or_skip` against upstream outputs), so they must
     # land in the SAME shard or the chain silently skips. Return the group
-    # name when set, else the nodeid.
+    # name when set, else the nodeid (each leaf item its own "group of 1").
     for mark in item.iter_markers(name="xdist_group"):
         if mark.args:
             return str(mark.args[0])
@@ -84,13 +100,8 @@ def _group_key(item):
     return item.nodeid
 
 
-def _shard_of(key, num_shards):
-    digest = hashlib.sha256(key.encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "big") % num_shards
-
-
 def _pinned_shard(item, num_shards):
-    # `@pytest.mark.shard(N)` overrides the hash-based assignment. An
+    # `@pytest.mark.shard(N)` overrides round-robin placement. An
     # out-of-range pin is a loud UsageError rather than a silent skip.
     for mark in item.iter_markers(name=SHARD_MARKER_NAME):
         if not mark.args:
@@ -110,22 +121,40 @@ def _pinned_shard(item, num_shards):
     return None
 
 
-def _assign_shard(item, num_shards):
-    pinned = _pinned_shard(item, num_shards)
-    if pinned is not None:
-        return pinned
-    return _shard_of(_group_key(item), num_shards)
+def _assign_groups_to_shards(groups, num_shards):
+    # groups: dict of group_key -> list[items]. Return dict of group_key -> shard.
+    #
+    # Two-phase: first honour any @pytest.mark.shard(N) pins (erroring if a
+    # single xdist_group has conflicting pins across its members); then
+    # round-robin the unpinned groups over shards in SORTED key order. Sorted
+    # order is intentional: the assignment becomes deterministic and
+    # reproducible across runs of the same test set, so a downstream step
+    # always lands in the same shard its upstream did last time.
+    assignment = {}
+    for key, members in groups.items():
+        pins = {_pinned_shard(it, num_shards) for it in members}
+        pins.discard(None)
+        if len(pins) > 1:
+            raise pytest.UsageError(
+                "conflicting @pytest.mark.shard pins within xdist_group %r: %r"
+                % (key, sorted(pins))
+            )
+        if pins:
+            assignment[key] = pins.pop()
+    unpinned = sorted(k for k in groups if k not in assignment)
+    for i, key in enumerate(unpinned):
+        assignment[key] = i % num_shards
+    return assignment
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(config, items):
     # trylast=True ensures pytest's own `-m` deselection has already reduced
-    # `items` before we hash-shard it, so each shard sees only tests matching
+    # `items` before we shard it, so each shard sees only tests matching
     # the marker expression.
     num_shards = config.getoption("--num-shards")
     dry_run = config.getoption("--dry-run-shards")
     if num_shards <= 0:
-        # --dry-run-shards without --num-shards is a no-op.
         return
     shard_id = config.getoption("--shard-id")
     if not 0 <= shard_id < num_shards:
@@ -140,21 +169,38 @@ def pytest_collection_modifyitems(config, items):
             "no tests collected for this marker; CI shard configuration is "
             "out of sync with the test markers"
         )
+
+    groups = {}
+    for item in items:
+        groups.setdefault(_group_key(item), []).append(item)
+    assignment = _assign_groups_to_shards(groups, num_shards)
+
     if dry_run:
-        buckets = [[] for _ in range(num_shards)]
-        for it in items:
-            buckets[_assign_shard(it, num_shards)].append(it.nodeid)
-        print("\n--- dry-run-shards (num_shards=%d, total_items=%d) ---"
-              % (num_shards, len(items)))
-        print("%-8s %-8s %s" % ("shard", "count", "sample_nodeid"))
-        for i, bucket in enumerate(buckets):
-            sample = bucket[0] if bucket else "(empty)"
-            print("%-8d %-8d %s" % (i, len(bucket), sample))
-        # Deselect everything so the session exits cleanly with no tests run.
+        per_shard = {i: {"items": 0, "groups": []} for i in range(num_shards)}
+        for key, members in groups.items():
+            s = assignment[key]
+            per_shard[s]["items"] += len(members)
+            per_shard[s]["groups"].append(key)
+        print("\n--- dry-run-shards (num_shards=%d, groups=%d, items=%d) ---"
+              % (num_shards, len(groups), len(items)))
+        print("%-8s %-8s %-8s %s" % ("shard", "items", "groups", "sample_group"))
+        for i in range(num_shards):
+            gs = sorted(per_shard[i]["groups"])
+            sample = gs[0] if gs else "(empty)"
+            print("%-8d %-8d %-8d %s" % (i, per_shard[i]["items"], len(gs), sample))
         config.hook.pytest_deselected(items=list(items))
         items[:] = []
         return
-    items[:] = [it for it in items if _assign_shard(it, num_shards) == shard_id]
+
+    kept = [it for it in items if assignment[_group_key(it)] == shard_id]
+    my_groups = sorted(k for k, s in assignment.items() if s == shard_id)
+    print("[finn-sharding] shard %d/%d: %d item(s) across %d group(s)"
+          % (shard_id, num_shards, len(kept), len(my_groups)))
+    if my_groups:
+        sample = my_groups[:5]
+        ellipsis = " ..." if len(my_groups) > 5 else ""
+        print("[finn-sharding] groups: %s%s" % (sample, ellipsis))
+    items[:] = kept
 
 
 # ---------------------------------------------------------------------------

@@ -10,11 +10,17 @@ import groovy.transform.Field
 // derived from this so adding a board is a one-row change.
 @Field
 List<Map> BNN_BOARD_ROWS = [
-    [stage: 'BNN U250',    marker: 'bnn_u250',    shards: 4, workers: 2, board: 'U250'],
+    [stage: 'BNN U250',    marker: 'bnn_u250',    shards: 2, workers: 2, board: 'U250'],
     [stage: 'BNN Pynq-Z1', marker: 'bnn_pynq',    shards: 3, workers: 2, board: 'Pynq-Z1'],
-    [stage: 'BNN ZCU104',  marker: 'bnn_zcu104',  shards: 3, workers: 4, board: 'ZCU104'],
+    [stage: 'BNN ZCU104',  marker: 'bnn_zcu104',  shards: 2, workers: 4, board: 'ZCU104'],
     [stage: 'BNN KV260',   marker: 'bnn_kv260',   shards: 2, workers: 2, board: 'KV260_SOM'],
 ]
+
+// Minimum free disk space (GB) required on each finn-build agent for a shard
+// to start. Sized for ~2 concurrent fpgadataflow/bnn build trees on one agent
+// (~60-80 GB each) plus headroom. Set 0 to disable (e.g. for --dry-run).
+@Field
+int FINN_CI_MIN_FREE_GB = 120
 
 @Field
 List<String> BNN_BOARDS = BNN_BOARD_ROWS.collect { it.board }
@@ -29,11 +35,18 @@ List<Map> PARALLEL_SHARDS = [
      shards: 1, workers: 8, coverage: true],
     [param: 'fpgadataflow', stage: 'fpgadataflow',            marker: 'fpgadataflow',
      shards: 2, workers: 8, coverage: true],
+    // iter-6: end2end has 3 xdist_groups (cybsec, ext_weights, mobilenet) and
+    // mobilenet is the critical path (~705 min in #18). shards=3 lets the
+    // round-robin-over-sorted-groups scheduler in conftest.py isolate mobilenet
+    // on its own shard, leaving cybsec + ext_weights to finish quickly.
     [param: 'end2end',      stage: 'End2end',                 marker: 'end2end',
-     shards: 2, workers: 6, distMode: 'loadgroup'],
+     shards: 3, workers: 6, distMode: 'loadgroup'],
 ] + BNN_BOARD_ROWS.collect { r ->
-    // Per-board shard counts track iteration-3 wall-clock; cnv-w2a2 is the hot
-    // path on every board so heavy boards (U250) get more shards.
+    // Per-board shard counts were rebalanced in iter-6 against observed .timings.json
+    // from #18: over-sharded boards (U250 4->2, ZCU104 3->2) wasted wall-clock on
+    // guard-skipped scenarios (wbits > abits) producing chain-break noise without
+    // adding pass throughput. Group-aware sharding (conftest.py) keeps scenario
+    // steps co-located so reducing shard count does not re-introduce chain breaks.
     [param: 'end2end', stage: r.stage, marker: r.marker,
      shards: r.shards, workers: r.workers, distMode: 'loadgroup',
      zipBoards: [r.board]]
@@ -205,6 +218,16 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
       checkout scm
       def buildDir = "${env.FINN_HOST_BUILD_DIR}/${stashName}"
       withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
+        // iter-6 A.1 / A.2: admission control at shard start on this agent.
+        // cleanStaleAgentDirs removes dirs in FINN_HOST_BUILD_DIR that no
+        // current shard owns (legacy `bnn_build_full/`, `fpgadataflow/` from
+        // pre-iter-5 pipelines — these accumulated to 170 GB on xircseeng01
+        // and filled /scratch during #18). checkAgentFreeSpace fails the
+        // shard fast if /scratch is below threshold rather than letting
+        // pytest OOM-disk mid-run (which corrupts junit XML and drops the
+        // agent off Jenkins — 5 such cascades in #18).
+        cleanStaleAgentDirs()
+        checkAgentFreeSpace(FINN_CI_MIN_FREE_GB)
         sh "mkdir -p ${stashName}"
         cleanPreviousBuildFiles(buildDir)
         try {
@@ -408,6 +431,45 @@ List<String> expectedStashes() {
 void cleanPreviousBuildFiles(String buildDir) {
   if (buildDir && !buildDir.empty) {
     sh "rm -rf ${buildDir}"
+  }
+}
+
+// iter-6 A.1: prune directories in FINN_HOST_BUILD_DIR that aren't an
+// expected stash for this build. Safe across concurrent shards because the
+// whitelist is identical in every shard, so no two shards ever disagree on
+// which sibling is stale. In-progress siblings are whitelisted, so this
+// never races with a live build. Only touches immediate children, never
+// recurses into files we don't own.
+void cleanStaleAgentDirs() {
+  if (!env.FINN_HOST_BUILD_DIR) { return }
+  def expected = new HashSet(expectedStashes())
+  def listing = sh(returnStdout: true, script:
+      "ls -1A '${env.FINN_HOST_BUILD_DIR}' 2>/dev/null || true"
+  ).trim()
+  if (!listing) { return }
+  def stale = listing.split('\n').findAll { it && !expected.contains(it) }
+  if (stale.isEmpty()) { return }
+  echo "cleanStaleAgentDirs: pruning ${stale.size()} non-whitelisted entry/entries in ${env.FINN_HOST_BUILD_DIR}: ${stale}"
+  stale.each { name ->
+    catchError(buildResult: null, stageResult: null,
+               message: "could not remove stale '${name}'; non-fatal") {
+      sh "rm -rf '${env.FINN_HOST_BUILD_DIR}/${name}'"
+    }
+  }
+}
+
+// iter-6 A.2: fail the shard fast if the agent's scratch is below threshold.
+// Prevents the mid-pytest OSError-28 cascade observed on xircseeng01 in #18.
+void checkAgentFreeSpace(int minFreeGB) {
+  if (minFreeGB <= 0) { return }
+  String target = env.FINN_HOST_BUILD_DIR ?: '/scratch'
+  def raw = sh(returnStdout: true, script:
+      "df -BG '${target}' | awk 'NR==2 {print \$4}' | tr -d 'G'"
+  ).trim()
+  int freeGB = raw.isInteger() ? raw.toInteger() : 0
+  echo "checkAgentFreeSpace[${env.NODE_NAME}]: ${freeGB} GB free on ${target} (threshold ${minFreeGB} GB)"
+  if (freeGB < minFreeGB) {
+    error "agent ${env.NODE_NAME} has only ${freeGB} GB free on ${target} (< ${minFreeGB} GB threshold); aborting shard to avoid mid-run disk exhaustion. Free space by pruning /scratch or reduce concurrent shards on this agent (see jenkins_ci.md iter-6)."
   }
 }
 

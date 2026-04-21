@@ -123,9 +123,7 @@ void collectBuildArtifacts() {
   dir('docker/jenkins') {
     stash name: 'bnn_test_files', includes: 'test_bnn_hw_pytest.py'
   }
-  dir("${env.ARTIFACT_DIR}") {
-    HW_TEST_TYPES.each { testType -> stashBuildArtifacts(testType) }
-  }
+  HW_TEST_TYPES.each { testType -> stashBuildArtifacts(testType) }
 }
 
 Map<String, Closure> buildHwStageMap(String testType) {
@@ -222,15 +220,46 @@ String hwStashName(String testType, String board) {
   return "${testType}_${board}"
 }
 
-void stashBuildArtifacts(String testDir) {
-  dir("${testDir}") {
-    def files = findFiles()
-    files.each { f ->
-      def file = f.toString()
-      def extIndex = file.lastIndexOf('.')
-      def boardName = file.substring(0, extIndex)
-      stash name: "${testDir}_${boardName}_zip", includes: "${f}"
+// iter-6: locate the most-recent <board>.zip for each HW board, falling back
+// across layouts in order:
+//   1. legacy fixed:  $ARTIFACT_DIR/<testType>/<board>.zip
+//   2. iter-5 sanity: $ARTIFACT_DIR/sanity_build_hardware/<board>.zip
+//   3. iter-5 full:   $ARTIFACT_DIR/bnn_*/<board>.zip  (per-shard dirs, newest wins)
+// The SW (finn_ci_speedup) pipeline writes per-shard directories
+// (bnn_u250_1, bnn_u250_2, ...) so the legacy fixed paths are empty after
+// iter-5 takes over. Globbing preserves HW pipeline compatibility without
+// requiring SW to also mirror zips into the legacy union paths. Returns ""
+// when no zip is found; caller logs and skips the HW shard for that board.
+String findBoardZip(String testType, String board) {
+  String legacy = "${env.ARTIFACT_DIR}/${testType}/${board}.zip"
+  if (fileExists(legacy)) { return legacy }
+  String glob = (testType == 'bnn_build_sanity')
+      ? "${env.ARTIFACT_DIR}/sanity_build_hardware/${board}.zip"
+      : "${env.ARTIFACT_DIR}/bnn_*/${board}.zip"
+  def hit = sh(returnStdout: true, script:
+      "ls -1t ${glob} 2>/dev/null | head -1 || true"
+  ).trim()
+  return hit
+}
+
+void stashBuildArtifacts(String testType) {
+  HW_SHARDS.each { row ->
+    String board = row.board as String
+    if (!isOnline(row.onlineEnv as String)) {
+      echo "stashBuildArtifacts[${testType}]: ${board} agent offline; skipping"
+      return
     }
+    String src = findBoardZip(testType, board)
+    if (!src) {
+      echo "stashBuildArtifacts[${testType}]: no ${board}.zip found under ${env.ARTIFACT_DIR} (legacy ${testType}/ nor iter-5 per-shard layout); HW shard for ${board}/${testType} will skip"
+      return
+    }
+    echo "stashBuildArtifacts[${testType}]: ${board} <- ${src}"
+    // Copy into workspace so `stash` (which is workspace-relative) can pick
+    // it up regardless of the absolute ARTIFACT_DIR path.
+    sh "cp '${src}' '${board}.zip'"
+    stash name: "${testType}_${board}_zip", includes: "${board}.zip"
+    sh "rm -f '${board}.zip'"
   }
 }
 
