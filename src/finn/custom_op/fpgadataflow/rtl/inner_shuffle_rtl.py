@@ -129,7 +129,13 @@ class InnerShuffle_rtl(InnerShuffle, RTLBackend):
         """Constructs and returns the TCL for node instantiation in Vivado IPI."""
         code_gen_dir = self.get_nodeattr("code_gen_dir_ipgen")
         top_module = self.get_nodeattr("gen_top_module")
-        sourcefiles = ["inner_shuffle.sv", "skid.sv", "queue.sv", "elasticmem.sv", f"{top_module}.v"]
+        sourcefiles = [
+            "inner_shuffle.sv",
+            "skid.sv",
+            "queue.sv",
+            "elasticmem.sv",
+            f"{top_module}.v",
+        ]
         sourcefiles = [os.path.join(code_gen_dir, f) for f in sourcefiles]
 
         cmd = []
