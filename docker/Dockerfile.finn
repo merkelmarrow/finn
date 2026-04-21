@@ -55,6 +55,7 @@ RUN apt-get update && \
     libjsoncpp-dev \
     libxml2-dev \
     libzmq3-dev \
+    libpixman-1-0 \
     nano \
     zsh \
     rsync \
