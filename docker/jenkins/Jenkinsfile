@@ -444,32 +444,31 @@ void cleanPreviousBuildFiles(String buildDir) {
   """
 }
 
-// iter-6 A.1: prune directories in FINN_HOST_BUILD_DIR that aren't an
-// expected stash for this build. Safe across concurrent shards because the
-// whitelist is identical in every shard, so no two shards ever disagree on
-// which sibling is stale. In-progress siblings are whitelisted, so this
-// never races with a live build. Only touches immediate children, never
-// recurses into files we don't own.
+// iter-6 A.1 (disabled in #22 postmortem):
+// Original intent was to prune directories in FINN_HOST_BUILD_DIR that aren't
+// an expected stash for this build, using expectedStashes() as the whitelist.
+// That turned out to be unsafe: when several shards start concurrently on the
+// same agent (typical on xircseeng01 with 5 executors), shard B's
+// cleanStaleAgentDirs lists the parent tmp dir AFTER shard A already mkdir'd
+// its per-shard subdir. If expectedStashes() in shard B's CPS frame returns
+// a list that is missing shard A's stash (reproducibly observed in #22 —
+// root cause is not fully understood, probably a params.get() evaluation
+// quirk across parallel CPS threads), shard B `rm -rf`s shard A's live
+// workspace mid-run. Shard A's running container then hits EPERM/ENOENT on
+// its own FINN_HOST_BUILD_DIR and every test fails with PermissionError on
+// writes (#22 symptom: End2end (1/3) died at 40s with EPERM on a freshly
+// mkdtemp'd subdir; simultaneously log shows another shard's cleanStale
+// pruning [end2end_1, ...] as "non-whitelisted").
+//
+// Cross-build residue is now handled out-of-band by
+// scripts/docker_clean_finn_tmp.sh (rootless, for agents where cse-jenkins
+// lacks sudo) and scripts/reclaim_finn_build_tmp.sh (sudo path). Per-shard
+// cleanup of THIS shard's own dir is handled by cleanPreviousBuildFiles at
+// the start of runShard, which is race-free (each shard only touches its
+// own stashName).
 void cleanStaleAgentDirs() {
-  if (!env.FINN_HOST_BUILD_DIR) { return }
-  def expected = new HashSet(expectedStashes())
-  def listing = sh(returnStdout: true, script:
-      "ls -1A '${env.FINN_HOST_BUILD_DIR}' 2>/dev/null || true"
-  ).trim()
-  if (!listing) { return }
-  // readLines() returns an ArrayList<String>; split('\n') returns String[]
-  // whose iterator is org.codehaus.groovy.util.ArrayIterator, which is not
-  // serializable and fails the CPS checkpoint on the sh inside .each below
-  // (same class of bug as the IntRange fix in iter-5).
-  def stale = listing.readLines().findAll { it && !expected.contains(it) }
-  if (stale.isEmpty()) { return }
-  echo "cleanStaleAgentDirs: pruning ${stale.size()} non-whitelisted entry/entries in ${env.FINN_HOST_BUILD_DIR}: ${stale}"
-  stale.each { name ->
-    catchError(buildResult: null, stageResult: null,
-               message: "could not remove stale '${name}'; non-fatal") {
-      sh "rm -rf '${env.FINN_HOST_BUILD_DIR}/${name}'"
-    }
-  }
+  // Deliberate no-op. Do NOT re-enable without solving the cross-shard CPS
+  // races in expectedStashes() — see the giant comment above.
 }
 
 // iter-6 A.2: fail the shard fast if the agent's scratch is below threshold.
