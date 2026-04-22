@@ -97,8 +97,14 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
         "floating_point_v7_0_26",
     ]
 
+    # FINN_XELAB_OVERRIDE lets an out-of-band dispatcher (e.g. an LSF shim)
+    # intercept xelab. Unlike FINN's other Xilinx-tool call sites which go
+    # through ``subprocess.run(["bash", <script>])`` and therefore honour a
+    # PATH shim installed via BASH_ENV, this call site is a direct
+    # ``launch_process_helper`` of the binary, so PATH shims are not visible.
+    # The env-var override is the narrowest interception point.
     cmd_xelab = [
-        "xelab",
+        os.environ.get("FINN_XELAB_OVERRIDE", "xelab"),
         "work." + top_module_name,
         "-relax",
         "-prj",
