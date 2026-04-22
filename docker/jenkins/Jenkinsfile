@@ -1,20 +1,19 @@
-// Single source of truth for every parallel stage. One row per logical stage.
-// Adding a row is the ONLY CI edit needed for a new marker/board. Shard count
-// times workers determines wall-clock; the tests/conftest.py plugin does the
-// actual hash-based split at pytest collection time. See docker/jenkins/README.md.
+// Shard config lives in tests/ci_shards.py (single source of truth shared
+// between this Jenkinsfile and conftest.py's --which-shard lookup).
+// Adding a row there is the ONLY CI edit needed for a new marker/board.
+// Shard count times workers determines wall-clock; the tests/conftest.py
+// plugin does the actual group-aware split at pytest collection time.
+// To find which shard a given test runs in, run inside ./run-docker.sh:
+//   pytest --collect-only --which-shard <nodeid-or-substring>
+// See docker/jenkins/README.md.
 
 import groovy.transform.Field
 
-// Per-board BNN rows — the single list that adding a new board requires
-// editing. BNN_BOARDS and the per-board rows in PARALLEL_SHARDS are both
-// derived from this so adding a board is a one-row change.
+// Populated from tests/ci_shards.py::STAGES in loadStageConfig(), called
+// at the start of the Validate stage where sh + readJSON are valid
+// pipeline steps (neither is CPS-safe at @Field init time).
 @Field
-List<Map> BNN_BOARD_ROWS = [
-    [stage: 'BNN U250',    marker: 'bnn_u250',    shards: 2, workers: 2, board: 'U250'],
-    [stage: 'BNN Pynq-Z1', marker: 'bnn_pynq',    shards: 3, workers: 2, board: 'Pynq-Z1'],
-    [stage: 'BNN ZCU104',  marker: 'bnn_zcu104',  shards: 2, workers: 4, board: 'ZCU104'],
-    [stage: 'BNN KV260',   marker: 'bnn_kv260',   shards: 2, workers: 2, board: 'KV260_SOM'],
-]
+List<Map> PARALLEL_SHARDS = []
 
 // Minimum free disk space (GB) required on each finn-build agent for a shard
 // to start. Sized for ~2 concurrent fpgadataflow/bnn build trees on one agent
@@ -22,34 +21,19 @@ List<Map> BNN_BOARD_ROWS = [
 @Field
 int FINN_CI_MIN_FREE_GB = 120
 
-@Field
-List<String> BNN_BOARDS = BNN_BOARD_ROWS.collect { it.board }
-
-@Field
-List<Map> PARALLEL_SHARDS = [
-    // Sanity - Build Hardware rebuilds the same scenarios covered by the
-    // bnn_* rows below, so skip it when end2end also runs.
-    [param: 'sanity',       stage: 'Sanity - Build Hardware', marker: 'sanity_bnn',
-     shards: 1, workers: 1, skipWhen: 'end2end', zipBoards: BNN_BOARDS],
-    [param: 'sanity',       stage: 'Sanity - Unit Tests',     marker: 'util or brevitas_export or streamline or transform or notebooks',
-     shards: 1, workers: 8, coverage: true],
-    [param: 'fpgadataflow', stage: 'fpgadataflow',            marker: 'fpgadataflow',
-     shards: 2, workers: 8, coverage: true],
-    // iter-6: end2end has 3 xdist_groups (cybsec, ext_weights, mobilenet) and
-    // mobilenet is the critical path (~705 min in #18). shards=3 lets the
-    // round-robin-over-sorted-groups scheduler in conftest.py isolate mobilenet
-    // on its own shard, leaving cybsec + ext_weights to finish quickly.
-    [param: 'end2end',      stage: 'End2end',                 marker: 'end2end',
-     shards: 3, workers: 6, distMode: 'loadgroup'],
-] + BNN_BOARD_ROWS.collect { r ->
-    // Per-board shard counts were rebalanced in iter-6 against observed .timings.json
-    // from #18: over-sharded boards (U250 4->2, ZCU104 3->2) wasted wall-clock on
-    // guard-skipped scenarios (wbits > abits) producing chain-break noise without
-    // adding pass throughput. Group-aware sharding (conftest.py) keeps scenario
-    // steps co-located so reducing shard count does not re-introduce chain breaks.
-    [param: 'end2end', stage: r.stage, marker: r.marker,
-     shards: r.shards, workers: r.workers, distMode: 'loadgroup',
-     zipBoards: [r.board]]
+// Import tests/ci_shards.py::STAGES into PARALLEL_SHARDS. The Python module
+// is the sole source of truth; this Groovy side does zero expansion (rows
+// in STAGES are fully-explicit, including per-board end2end entries and
+// the sanity_bnn zipBoards list). Keeping expansion out of Groovy means
+// the maintainer CLI (pytest --which-shard) and Jenkins cannot drift.
+// Must run after the implicit declarative checkout (i.e. inside a stage
+// with an `agent` directive), which the Validate stage provides.
+void loadStageConfig() {
+  String json = sh(returnStdout: true, script:
+    "python3 -c 'import json, sys; sys.path.insert(0, \"tests\"); " +
+    "from ci_shards import STAGES; print(json.dumps(STAGES))'"
+  ).trim()
+  PARALLEL_SHARDS = readJSON(text: json).collect { it as Map }
 }
 
 // Marker expressions are interpolated into shell. Restrict to identifier
@@ -72,7 +56,7 @@ pipeline {
   stages {
     stage('Validate') {
       agent { label 'finn-build' }
-      steps { script { validateShards() } }
+      steps { script { loadStageConfig(); validateShards() } }
     }
     stage('Build Docker Image') {
       agent { label 'finn-build' }
@@ -112,6 +96,9 @@ String paramString(String name) {
 // Pre-flight: marker regex + executor budget. Marker violations are hard
 // errors; budget overshoot is UNSTABLE because CI queues correctly anyway.
 void validateShards() {
+  if (!PARALLEL_SHARDS) {
+    error "PARALLEL_SHARDS is empty; loadStageConfig() must run before validateShards()"
+  }
   PARALLEL_SHARDS.each { row ->
     if (!MARKER_SAFE_PATTERN.matcher(row.marker as String).matches()) {
       error "PARALLEL_SHARDS row '${row.stage}' has unsafe marker '${row.marker}' (only [A-Za-z0-9_ ] allowed)"
@@ -119,12 +106,6 @@ void validateShards() {
     if (!(row.shards instanceof Integer) || (row.shards as int) < 1) {
       error "PARALLEL_SHARDS row '${row.stage}' has invalid shards=${row.shards}"
     }
-  }
-  // BNN_BOARDS must match the derived set from BNN_BOARD_ROWS (derived is the
-  // source of truth; this asserts nobody hard-wired a stale value elsewhere).
-  def derivedBnn = BNN_BOARD_ROWS.collect { it.board }
-  if (BNN_BOARDS != derivedBnn) {
-    error "BNN_BOARDS (${BNN_BOARDS}) drift from BNN_BOARD_ROWS (${derivedBnn})"
   }
   def activeCount = 0
   eachActiveShard { row, id -> activeCount++ }
