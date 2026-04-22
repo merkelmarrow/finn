@@ -516,8 +516,19 @@ void findCopyZip(String board, String findDir, String copyDir) {
       "find ${findDir} -maxdepth 2 -type d -name '${board}' -path '*/hw_deployment_*/*' | head -1"
   ).trim()
   if (!found) { return }
-  sh "mkdir -p ${copyDir}"
-  sh "cp -r ${found} ${copyDir}/"
+  // Reused Jenkins workspaces can leave a stale ${copyDir}/${board} tree from
+  // an earlier build. Git's default 0555 mode on .git/objects/pack/ then makes
+  // `cp -r` merge-into-target fail on .idx/.pack creation (EACCES) and also
+  // blocks `rm -rf` from traversing. chmod -R u+w restores the write bit so we
+  // can unlink, then rm to guarantee cp writes into a fresh destination.
+  sh """
+    mkdir -p '${copyDir}'
+    if [ -e '${copyDir}/${board}' ]; then
+      chmod -R u+w '${copyDir}/${board}'
+      rm -rf '${copyDir}/${board}'
+    fi
+    cp -r '${found}' '${copyDir}/'
+  """
   dir(copyDir) {
     sh "zip -r ${board}.zip ${board}/"
     sh "mkdir -p ${env.ARTIFACT_DIR}/${copyDir}/"
