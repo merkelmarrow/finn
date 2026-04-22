@@ -1,10 +1,14 @@
 # FINN Jenkins CI — maintainer guide
 
-Every parallel stage is defined by **one row** of `PARALLEL_SHARDS` at the
-top of [`Jenkinsfile`](./Jenkinsfile). Actual test selection and shard
+Every parallel stage is defined by **one row** of `STAGES` in
+[`tests/ci_shards.py`](../../tests/ci_shards.py). That one Python list is
+the single source of truth: [`Jenkinsfile`](./Jenkinsfile) imports it at
+the Validate stage (via `python3 -c ... readJSON`) into `PARALLEL_SHARDS`,
+and [`tests/conftest.py`](../../tests/conftest.py) imports it for the
+`--which-shard` maintainer lookup. Actual test selection and shard
 splitting are done by the standard `-m <marker>` expression plus the tiny
-`--num-shards` / `--shard-id` plugin in [`tests/conftest.py`](../../tests/conftest.py).
-No state, no allowlists, no rebalancing script.
+`--num-shards` / `--shard-id` plugin in `tests/conftest.py`. No state, no
+allowlists, no rebalancing script.
 
 The HW-tethered [`Jenkinsfile_HW`](./Jenkinsfile_HW) uses the same pattern
 with a parallel `HW_SHARDS` table for per-board shards.
@@ -30,9 +34,12 @@ lands in some shard of the board's marker automatically.
 2. Add a line to `_BNN_MARKER_BY_BOARD` in
    `tests/end2end/test_end2end_bnn_pynq.py` and a matching entry in
    `test_board_map` (`src/finn/util/basic.py`).
-3. Add one row to `BNN_BOARD_ROWS` in `Jenkinsfile` — marker, shard count,
-   worker count, board name. `PARALLEL_SHARDS` and `BNN_BOARDS` are both
-   derived so nothing else changes.
+3. Add one row to `STAGES` in [`tests/ci_shards.py`](../../tests/ci_shards.py):
+   `{"param": "end2end", "stage": "BNN <board>", "marker": "bnn_<board>",
+   "shards": N, "workers": M, "distMode": "loadgroup",
+   "zipBoards": ["<board>"]}`. Rows are fully explicit (no expansion),
+   so this one edit is visible to Jenkins and to
+   `pytest --which-shard` without any derived lists.
 4. (HW pipeline only.) Adding a board is a **three-place edit** in
    `Jenkinsfile_HW`:
    a. Add a row to `HW_SHARDS` with `board`, `label`, `onlineEnv`,
@@ -105,12 +112,34 @@ Each shard emits `reports/<stash>.timings.json`:
 }
 ```
 
-### … find which stage runs a given test?
+### … find which stage and shard runs a given test?
 
-Run `pytest --collect-only -m '<marker>' <path/to/test.py>` locally. The
-marker is what CI selects on. The Jenkins console log also echoes
+Run inside `./run-docker.sh`:
+
+```bash
+pytest --collect-only --which-shard test_relu_elementwisemax
+pytest --collect-only --which-shard test_end2end_bnn_pynq
+```
+
+This walks every row of `STAGES` in `tests/ci_shards.py`, reuses the
+canonical `_assign_groups_to_shards()` algorithm from `conftest.py`
+(i.e. the exact assignment the Jenkins shard will use), and prints one
+row per match:
+
+```
+stage          marker      shards  shard  stash          nodeid
+-------------  ---------- ------- ------  -------------  ------------------
+fpgadataflow   fpgadataflow  2       0      fpgadataflow_1  tests/.../test_x.py::...
+```
+
+The `stash` column is the exact Jenkins stash name — pass it as
+`STAGES=<substring>` to the Jenkinsfile job to run only that shard for
+debugging. The Jenkins console log also echoes
 `runPytest[<stash>]: FINN_CI_MARKER='<marker>'; python -m pytest …` at
 the start of every stage.
+
+No caching, no YAML, no extra tool — one pytest flag, reads the same
+source of truth the CI uses.
 
 ### … verify a marker still has CI coverage?
 
@@ -135,11 +164,18 @@ because the BNN rows rebuild the same scenarios.
 
 ## Pre-flight validation
 
-The first stage of every build is `Validate`, which runs `validateShards()`:
+The first stage of every build is `Validate`, which runs
+`loadStageConfig()` (imports `STAGES` from `tests/ci_shards.py` into
+`PARALLEL_SHARDS` via `python3 -c` + `readJSON`) and then
+`validateShards()`:
 
+- `STAGES` imports cleanly (runtime check: the `python3 -c` invocation
+  non-zero-exits if `tests/ci_shards.py` has a syntax error or missing
+  key, which is how a broken row surfaces here rather than mid-pipeline).
 - Every `PARALLEL_SHARDS` row's `marker` matches `^[A-Za-z0-9_ ]+$`.
 - `shards` is a positive integer.
-- `BNN_BOARDS` is consistent with `BNN_BOARD_ROWS` (drift check).
+- `PARALLEL_SHARDS` is non-empty (catches the mistake of calling
+  `validateShards()` without `loadStageConfig()` first).
 - The total active shard count across all enabled params doesn't exceed
   the `finn-build` label's total executors — UNSTABLE (not FAILURE) if
   over-budget, since CI queues correctly either way but wall-clock will
