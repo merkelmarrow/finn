@@ -76,6 +76,12 @@ def pytest_addoption(parser):
                     help="Which shard (0-indexed) to run. Requires --num-shards.")
     group.addoption("--dry-run-shards", action="store_true", default=False,
                     help="Print shard assignment table and exit without running tests.")
+    group.addoption("--which-shard", default=None, metavar="QUERY",
+                    help="For each CI stage in tests/ci_shards.py whose marker "
+                         "covers a collected test whose nodeid contains QUERY, "
+                         "print stage | marker | shards | shard | stash, then "
+                         "exit. Use with --collect-only and no -m. Answers "
+                         "'which Jenkins shard runs this test?' in one step.")
 
 
 def pytest_configure(config):
@@ -147,11 +153,69 @@ def _assign_groups_to_shards(groups, num_shards):
     return assignment
 
 
+def _marker_tokens(marker_expr):
+    # ci_shards.STAGES rows have marker expressions constrained to
+    # MARKER_SAFE_PATTERN (`^[A-Za-z0-9_ ]+$` -- see Jenkinsfile), so tokens
+    # are whitespace-split and the only connective allowed is literal `or`.
+    # Any token that is not `or` is a marker name.
+    return [t for t in marker_expr.split() if t != "or"]
+
+
+def _item_matches_marker_expr(item, marker_expr):
+    # Item matches the stage's marker expression iff any token names a mark
+    # attached to the item. Mirrors how pytest's -m resolves the same
+    # expression under our regex constraint, without using private API.
+    tokens = _marker_tokens(marker_expr)
+    return any(any(True for _ in item.iter_markers(name=t)) for t in tokens)
+
+
+def _run_which_shard(config, items, query):
+    # Re-uses _assign_groups_to_shards() verbatim per matching stage so the
+    # table shown here is the exact assignment the Jenkins shard will use.
+    from ci_shards import STAGES, stash_name  # local, lets pytest start without it
+    rows = []
+    for stage in STAGES:
+        matching = [it for it in items
+                    if _item_matches_marker_expr(it, stage["marker"])]
+        if not matching:
+            continue
+        groups = {}
+        for it in matching:
+            groups.setdefault(_group_key(it), []).append(it)
+        assignment = _assign_groups_to_shards(groups, int(stage["shards"]))
+        for it in matching:
+            if query not in it.nodeid:
+                continue
+            shard_id = assignment[_group_key(it)]
+            rows.append((
+                stage["stage"], stage["marker"], int(stage["shards"]),
+                shard_id, stash_name(stage["stage"], int(stage["shards"]), shard_id),
+                it.nodeid,
+            ))
+    if not rows:
+        print("[finn-sharding] --which-shard: no test matched %r in any stage" % query)
+    else:
+        header = ("stage", "marker", "shards", "shard", "stash", "nodeid")
+        widths = [max(len(str(c)) for c in col)
+                  for col in zip(header, *rows)]
+        fmt = "  ".join("%%-%ds" % w for w in widths)
+        print(fmt % header)
+        print(fmt % tuple("-" * w for w in widths))
+        for r in rows:
+            print(fmt % tuple(str(c) for c in r))
+    config.hook.pytest_deselected(items=list(items))
+    items[:] = []
+
+
 @pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(config, items):
     # trylast=True ensures pytest's own `-m` deselection has already reduced
     # `items` before we shard it, so each shard sees only tests matching
     # the marker expression.
+    which = config.getoption("--which-shard")
+    if which:
+        _run_which_shard(config, items, which)
+        return
     num_shards = config.getoption("--num-shards")
     dry_run = config.getoption("--dry-run-shards")
     if num_shards <= 0:
