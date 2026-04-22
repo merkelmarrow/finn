@@ -123,7 +123,10 @@ from finn.transformation.qonnx.convert_qonnx_to_finn import ConvertQONNXtoFINN
 from finn.transformation.qonnx.quant_act_to_multithreshold import (
     default_filter_function_generator,
 )
-from finn.transformation.streamline import ExtractMultiThresholdScaleBias, Streamline
+from finn.transformation.streamline import Streamline
+from finn.transformation.streamline.extract_multithreshold_scale_bias import (
+    ExtractMultiThresholdScaleBias,
+)
 from finn.transformation.streamline.reorder import MakeMaxPoolNHWC
 from finn.transformation.streamline.round_thresholds import RoundAndClipThresholds
 from finn.util.basic import get_liveness_threshold_cycles, get_rtlsim_trace_depth

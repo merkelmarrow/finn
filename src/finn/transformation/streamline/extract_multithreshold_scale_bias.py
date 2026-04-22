@@ -6,7 +6,8 @@
 #
 # Copyright is held by AMD and is provided under BSD-3-Clause license.
 #
-# Note: This transform is inspired by the ExtractNormScaleBias transformation, but for Multithreshold nodes.
+# Note: This transform is inspired by the ExtractNormScaleBias
+# transformation, but for Multithreshold nodes.
 #
 ############################################################################
 
@@ -80,7 +81,9 @@ class ExtractMultiThresholdScaleBias(Transformation):
                     # Create a scalar initializer for the bias value
                     bias_tensor_name = model.make_new_valueinfo_name()
                     model.set_initializer(bias_tensor_name, np.array(out_bias, dtype=np.float32))
-                    bias_node = oh.make_node("Add", [bias_act_in_name, bias_tensor_name], [final_output])
+                    bias_node = oh.make_node(
+                        "Add", [bias_act_in_name, bias_tensor_name], [final_output]
+                    )
                     last_node.output[0] = bias_act_in_name
                     graph.node.append(bias_node)
                     # Reset bias in MultiThreshold node to 0.0

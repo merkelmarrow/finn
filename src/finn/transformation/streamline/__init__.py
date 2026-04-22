@@ -53,9 +53,6 @@ from finn.transformation.streamline.collapse_repeated import (
     CollapseRepeatedAdd,
     CollapseRepeatedMul,
 )
-from finn.transformation.streamline.extract_multithreshold_scale_bias import (
-    ExtractMultiThresholdScaleBias,
-)
 from finn.transformation.streamline.reorder import (
     MoveAddPastConv,
     MoveAddPastMul,
