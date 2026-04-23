@@ -13,6 +13,32 @@ allowlists, no rebalancing script.
 The HW-tethered [`Jenkinsfile_HW`](./Jenkinsfile_HW) uses the same pattern
 with a parallel `HW_SHARDS` table for per-board shards.
 
+## Per-build host tmp (`ci_runs`) and rotation
+
+On `finn-build` agents, each run’s per-shard **host** build directory is not a
+flat `…/workspace/tmp/<stash>` path (which collided across builds and jobs).
+Instead the Jenkinsfile uses:
+
+`$FINN_AGENT_NFS_ROOT/workspace/tmp/ci_runs/<jobKey>/<BUILD_NUMBER>/<stash>`
+
+- **`jobKey`:** `JOB_NAME` sanitised to one path segment (avoids collision
+  between e.g. `finn` and `finn_ci_speedup` at the same `BUILD_NUMBER`).
+- **Pytest / Jenkins** “stash” names (`fpgadataflow_1`, `end2end_2`, …) are
+  **unchanged**; only the bind-mount root on the host moved.
+
+**Rotation:** the Validate stage runs
+[`scripts/rotate_finn_ci_tmp.sh`](../../scripts/rotate_finn_ci_tmp.sh) once
+per build. It keeps the **largest N** numeric build directories under
+`…/ci_runs/<jobKey>/`, always keeps the **current** `BUILD_NUMBER`, and
+removes directories older than **M** days (except the current build). Tuning
+constants live in the Jenkinsfile: `FINN_CI_TMP_RETAIN_BUILDS` (default 5) and
+`FINN_CI_TMP_MAX_AGE_DAYS` (default 14). Pass `--dry-run` to the script to log
+what would be deleted.
+
+**Legacy:** pre-change flat paths `…/workspace/tmp/<stash>` are **not** removed
+by rotation; delete them with an out-of-band admin pass if they still hold
+space (see ops notes in the NFS migration continuation doc).
+
 ## How do I …
 
 ### … add a new test?

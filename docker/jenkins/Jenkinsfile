@@ -21,6 +21,15 @@ List<Map> PARALLEL_SHARDS = []
 @Field
 int FINN_CI_MIN_FREE_GB = 120
 
+// Per-build NFS tree under <FINN_AGENT_NFS_ROOT>/workspace/tmp/ci_runs/<jobKey>/<BUILD_NUMBER>/
+// to avoid cross-build races on fixed per-shard names (e.g. fpgadataflow_1). Pruned by
+// rotateFinnCiBuildTmp (Validate stage) to bounded disk. See docker/jenkins/README.md.
+@Field
+int FINN_CI_TMP_RETAIN_BUILDS = 5
+
+@Field
+int FINN_CI_TMP_MAX_AGE_DAYS = 14
+
 // Import tests/ci_shards.py::STAGES into PARALLEL_SHARDS. The Python module
 // is the sole source of truth; this Groovy side does zero expansion (rows
 // in STAGES are fully-explicit, including per-board end2end entries and
@@ -61,7 +70,7 @@ pipeline {
     // pipeline step, not a declarative construct.
     stage('Validate') {
       agent { label 'finn-build' }
-      steps { script { withAgentNfsEnv { loadStageConfig(); validateShards() } } }
+      steps { script { withAgentNfsEnv { loadStageConfig(); validateShards(); rotateFinnCiBuildTmp() } } }
     }
     stage('Build Docker Image') {
       agent { label 'finn-build' }
@@ -196,6 +205,34 @@ String shardStashName(Map row, int id) {
   return row.shards == 1 ? base : "${base}_${id + 1}"
 }
 
+// One path segment for <jobKey> under ci_runs/; avoids collision between different jobs
+// (e.g. build 12 of "finn" vs build 12 of "finn_ci_speedup" on the same host).
+String finnCiJobKey() {
+  String jn = env.JOB_NAME ?: 'job'
+  return jn.replaceAll('[^A-Za-z0-9._-]+', '_')
+}
+
+// Absolute parent for this run's per-shard dirs: .../ci_runs/<jobKey>/<BUILD_NUMBER>
+String finnCiPerBuildRoot() {
+  String r = env.FINN_AGENT_NFS_ROOT
+  if (!r) { error "FINN_AGENT_NFS_ROOT is unset on ${env.NODE_NAME} (expected from agent env_vars)" }
+  if (!env.BUILD_NUMBER) { error "BUILD_NUMBER is unset" }
+  return "${r}/workspace/tmp/ci_runs/${finnCiJobKey()}/${env.BUILD_NUMBER}"
+}
+
+// Prune old .../workspace/tmp/ci_runs/<jobKey>/<N>/ trees; once per build (Validate).
+void rotateFinnCiBuildTmp() {
+  String root = env.FINN_AGENT_NFS_ROOT
+  if (!root) { return }
+  String jk = finnCiJobKey()
+  String bn = env.BUILD_NUMBER
+  String ws = env.WORKSPACE
+  if (!ws) { echo "rotateFinnCiBuildTmp: WORKSPACE unset; skipping"; return }
+  sh """
+    bash "${ws}/scripts/rotate_finn_ci_tmp.sh" "${root}" "${jk}" "${bn}" ${FINN_CI_TMP_RETAIN_BUILDS} ${FINN_CI_TMP_MAX_AGE_DAYS}
+  """
+}
+
 // Resolve agent-local paths off FINN_AGENT_NFS_ROOT so a second finn-build
 // host is a slaves.yml edit (not a Jenkinsfile edit). Must wrap the body of
 // every `node('finn-build')` block in this file — it can ONLY run after node
@@ -234,12 +271,16 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
     withAgentNfsEnv {
     stage(stageName) {
       checkout scm
-      // iter-6 A.1: prune legacy siblings under the parent tmp dir before we
-      // remap FINN_HOST_BUILD_DIR to the per-shard path. Must run here so
-      // `env.FINN_HOST_BUILD_DIR` still points at the shared parent.
+      // iter-6 A.1: (no-op) had been sibling prune under the parent tmp; see
+      // cleanStaleAgentDirs. Runs before the inner withEnv so env still has
+      // withAgentNfsEnv's .../workspace/tmp for FINN_HOST_BUILD_DIR.
       cleanStaleAgentDirs()
-      def buildDir = "${env.FINN_HOST_BUILD_DIR}/${stashName}"
+      String perBuildRoot = finnCiPerBuildRoot()
+      def buildDir = "${perBuildRoot}/${stashName}"
       withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
+        // Ensure ancestor exists so checkAgentFreeSpace/ df never sees a dead path, and
+        // bind mount src exists before docker (iter-6 C; see withAgentNfsEnv comment).
+        sh "mkdir -p '${perBuildRoot}'"
         // iter-6 A.2: fail the shard fast if /scratch is below threshold
         // rather than letting pytest OOM-disk mid-run (5 such cascades in #18).
         checkAgentFreeSpace(FINN_CI_MIN_FREE_GB)
