@@ -82,6 +82,11 @@ def _determine_impl_style(node, fpgapart, model):
                     return "rtl"
                 else:
                     return "hls"
+            elif optype == "Requant":
+                if _requant_rtl_possible(node, fpgapart):
+                    return "rtl"
+                else:
+                    return "hls"
             return "rtl"
         # but if no rtl variant, set impl_style to hls
         elif hls_variant:
@@ -175,6 +180,17 @@ def _determine_impl_style(node, fpgapart, model):
                 )
                 warnings.warn(warn_str)
                 return "hls"
+        elif optype == "Requant":
+            if _requant_rtl_possible(node, fpgapart):
+                return "rtl"
+            else:
+                warn_str = """There is no RTL variant for %s. The node will automatically be
+                        set to HLS variant. The RTL Requant layers currently only supports
+                        integer inputs, unsigned outputs and non-narrow quantization.""" % (
+                    node.name,
+                )
+                warnings.warn(warn_str)
+                return "hls"
 
         if rtl_variant:
             return "rtl"
@@ -255,8 +271,8 @@ def _mvu_rtl_possible(n, fpgapart, model):
     # we now check if input and weight data types are in range
     # we only use rtl mvau if the dtypes are at least 2 bit
     idt = node_inst.get_input_datatype()
-    inp_width_in_range = (2 <= idt.bitwidth() <= 8) or (idt.bitwidth() == 9 and idt.signed())
-    weight_width_in_range = 2 <= wdt.bitwidth() <= 8
+    inp_width_in_range = 2 <= idt.bitwidth()
+    weight_width_in_range = 2 <= wdt.bitwidth()
 
     return inp_width_in_range and weight_width_in_range
 
@@ -328,6 +344,20 @@ def _layernorm_rtl_possible(n, fpgapart):
         return False
     else:
         return True
+
+
+def _requant_rtl_possible(n, fpgapart):
+    # Checks whether RTL-based Requant is supported
+    # RTL Requant requires:
+    # - Integer input (not float)
+    # - Unsigned output (RTL clips to [0, 2^N-1])
+    # - Full range (narrow=0)
+    node_inst = getCustomOp(n)
+    idt = node_inst.get_input_datatype(0)
+    odt = node_inst.get_output_datatype(0)
+    narrow = node_inst.get_nodeattr("narrow")
+    # RTL backend works with integer inputs, unsigned outputs, and full range
+    return idt.is_integer() and not odt.signed() and narrow == 0
 
 
 class SpecializeLayers(Transformation):
