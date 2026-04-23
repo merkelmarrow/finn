@@ -60,7 +60,7 @@ def array2hexstring(array, dtype, pad_to_nbits, prefix="0x", reverse=False):
     if pad_to_nbits < 4:
         pad_to_nbits = 4
     # ensure input is a numpy array with float values
-    if type(array) is not np.ndarray or array.dtype is not np.float32:
+    if type(array) is not np.ndarray or array.dtype != np.float32:
         # try to convert to a float numpy array (container dtype is float)
         array = np.asarray(array, dtype=np.float32)
     # ensure one-dimensional array to pack
@@ -243,7 +243,7 @@ def numpy_to_hls_code(ndarray, dtype, hls_var_name, pack_innermost_dim=True, no_
     emitted string.
     """
     hls_dtype = dtype.get_hls_datatype_str()
-    if type(ndarray) is not np.ndarray or ndarray.dtype is not np.float32:
+    if type(ndarray) is not np.ndarray or ndarray.dtype != np.float32:
         # try to convert to a float numpy array (container dtype is float)
         ndarray = np.asarray(ndarray, dtype=np.float32)
     if pack_innermost_dim:
@@ -386,7 +386,7 @@ def finnpy_to_packed_bytearray(
             # reverse endianness and return
             return np.flip(packed_data, axis=-1)
 
-    if (not issubclass(type(ndarray), np.ndarray)) or ndarray.dtype is not np.float32:
+    if (not issubclass(type(ndarray), np.ndarray)) or ndarray.dtype != np.float32:
         # try to convert to a float numpy array (container dtype is float)
         ndarray = np.asarray(ndarray, dtype=np.float32)
     # pack innermost dim to hex strings padded to 8 bits
@@ -422,9 +422,7 @@ def packed_bytearray_to_finnpy(
     packed dimension
     """
 
-    if (
-        not issubclass(type(packed_bytearray), np.ndarray)
-    ) or packed_bytearray.dtype is not np.uint8:
+    if (not issubclass(type(packed_bytearray), np.ndarray)) or packed_bytearray.dtype != np.uint8:
         raise Exception("packed_bytearray_to_finnpy needs NumPy uint8 arrays")
     if packed_bytearray.ndim == 0:
         raise Exception("packed_bytearray_to_finnpy expects at least 1D ndarray")
