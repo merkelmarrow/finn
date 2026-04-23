@@ -127,9 +127,6 @@ from finn.transformation.qonnx.quant_act_to_multithreshold import (
     default_filter_function_generator,
 )
 from finn.transformation.streamline import Streamline
-from finn.transformation.streamline.extract_multithreshold_scale_bias import (
-    ExtractMultiThresholdScaleBias,
-)
 from finn.transformation.streamline.reorder import MakeMaxPoolNHWC
 from finn.transformation.streamline.round_thresholds import RoundAndClipThresholds
 from finn.util.basic import get_liveness_threshold_cycles, get_rtlsim_trace_depth
@@ -405,10 +402,6 @@ def step_streamline(model: ModelWrapper, cfg: DataflowBuildConfig):
         model = model.transform(absorb.AbsorbConsecutiveTransposes())
     model = model.transform(ConvertBipolarMatMulToXnorPopcount())
     model = model.transform(Streamline())
-    # extract MultiThreshold scale/bias if using standalone thresholds
-    # (required for InferThresholdingLayer which expects scale=1.0, bias=0.0)
-    if cfg.standalone_thresholds:
-        model = model.transform(ExtractMultiThresholdScaleBias())
     # absorb final add-mul nodes into TopK
     model = model.transform(absorb.AbsorbScalarMulAddIntoTopK())
     model = model.transform(InferDataLayouts())

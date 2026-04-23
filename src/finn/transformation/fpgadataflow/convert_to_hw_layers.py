@@ -213,11 +213,15 @@ class InferThresholdingLayer(Transformation):
                 odt = model.get_tensor_datatype(thl_output)
                 scale = getCustomOp(node).get_nodeattr("out_scale")
                 assert scale == 1.0, (
-                    node.name + ": MultiThreshold out_scale must be 1 for HLS conversion."
+                    f"{node.name}: MultiThreshold out_scale must be 1 for HLS conversion. "
+                    f"Hint: Consider running ExtractMultiThresholdScaleBias() transformation "
+                    f"as a custom step to extract scale/bias into separate Add/Mul nodes."
                 )
                 actval = getCustomOp(node).get_nodeattr("out_bias")
                 assert int(actval) == actval, (
-                    node.name + ": MultiThreshold out_bias must be integer for HLS conversion."
+                    f"{node.name}: MultiThreshold out_bias must be integer for HLS conversion. "
+                    f"Hint: Consider running ExtractMultiThresholdScaleBias() transformation "
+                    f"as a custom step to extract scale/bias into separate Add/Mul nodes."
                 )
                 actval = int(actval)
 
