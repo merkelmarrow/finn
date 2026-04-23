@@ -59,12 +59,13 @@ class CallHLS:
         # xsi kernel lib name depends on Vivado version (renamed in 2024.2)
         match = re.search(r"\b(20\d{2})\.(1|2)\b", vivado_path)
         year, minor = int(match.group(1)), int(match.group(2))
+        tcl_arg = os.path.basename(self.tcl_script)
         if (year, minor) > (2024, 2):
             tool = resolve_xilinx_tool("vitis-run", "FINN_VITIS_RUN_OVERRIDE")
-            vitis_cmd = "%s --mode hls --tcl %s\n" % (tool, self.tcl_script)
+            vitis_cmd = "%s --mode hls --tcl %s\n" % (tool, tcl_arg)
         else:
             tool = resolve_xilinx_tool("vitis_hls", "FINN_VITIS_HLS_OVERRIDE")
-            vitis_cmd = "%s %s\n" % (tool, self.tcl_script)
+            vitis_cmd = "%s %s\n" % (tool, tcl_arg)
         self.code_gen_dir = code_gen_dir
         self.ipgen_script = str(self.code_gen_dir) + "/ipgen.sh"
         working_dir = os.environ["PWD"]
