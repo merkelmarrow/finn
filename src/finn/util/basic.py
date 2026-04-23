@@ -254,6 +254,26 @@ def which(program):
     return None
 
 
+def resolve_xilinx_tool(default_name, override_env_var):
+    """Return the Xilinx-tool command to embed in generated bash scripts.
+
+    Honours ``<override_env_var>`` (e.g. ``FINN_VIVADO_OVERRIDE``) so an
+    out-of-band dispatcher (e.g. an LSF shim) can intercept the call at a
+    narrower point than a PATH shim.  Falls back to ``default_name`` for
+    local runs.  Mirrors the xelab pattern in ``finn_xsi.adapter``.
+
+    The returned string is written verbatim into the generated bash script,
+    so it may be either a bare tool name (resolved via PATH at runtime) or
+    an absolute path to a shim.
+    """
+    tool = os.environ.get(override_env_var, default_name)
+    assert which(tool) is not None, "%s not found in PATH (override=%s)" % (
+        tool,
+        override_env_var,
+    )
+    return tool
+
+
 mem_primitives_versal = {
     "URAM_72x4096": (72, 4096),
     "URAM_36x8192": (36, 8192),
