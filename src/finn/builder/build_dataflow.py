@@ -152,13 +152,8 @@ def build_dataflow_cfg(model_filename, cfg: DataflowBuildConfig):
     # Add the file handler (only file output, no console output)
     log.addHandler(log_file_handler)
 
-    # IMPORTANT: log_file_handler holds an open file descriptor on
-    # <output_dir>/build_dataflow.log via a strong reference from the
-    # module-level "build_dataflow" logger. If we leak it, callers that
-    # subsequently do shutil.rmtree(<output_dir>) on NFS hit silly-rename
-    # (.nfsXXXX) followed by EBUSY on cleanup, because the same Python
-    # process still holds the fd. Always remove and close in a finally
-    # block so the fd is released before the function returns.
+    # close the fd on exit so callers can rmtree(output_dir) on NFS without
+    # hitting .nfsXXXX silly-rename / EBUSY on the still-open log file.
     try:
         stdout_logger = StreamToLogger(log, logging.INFO)
         stderr_logger = StreamToLogger(log, logging.ERROR)

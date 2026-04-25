@@ -45,12 +45,9 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
         }
         verilog_header_incl_str = " ".join(["--include " + x for x in verilog_headers])
 
-        # Elaborate *_pkg.{sv,v} before modules that import them (e.g.
-        # `module add_multi import mvu_pkg::*;`). A stable partition preserves
-        # caller-supplied dependency order within each bucket; sorted() with
-        # an (is_pkg, name) key does not, because the name tie-breaker
-        # reorders the non-package bucket and can push importers ahead of
-        # their packages.
+        # *_pkg.{sv,v} must elaborate before modules that import them.
+        # Stable partition preserves caller-supplied dependency order within
+        # each bucket (sorted() would reorder the non-package bucket).
         def _is_pkg_src(p):
             base = os.path.basename(p)
             return base.endswith("_pkg.sv") or base.endswith("_pkg.v")
@@ -97,12 +94,7 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
         "floating_point_v7_0_26",
     ]
 
-    # FINN_XELAB_OVERRIDE lets an out-of-band dispatcher (e.g. an LSF shim)
-    # intercept xelab. Unlike FINN's other Xilinx-tool call sites which go
-    # through ``subprocess.run(["bash", <script>])`` and therefore honour a
-    # PATH shim installed via BASH_ENV, this call site is a direct
-    # ``launch_process_helper`` of the binary, so PATH shims are not visible.
-    # The env-var override is the narrowest interception point.
+    # direct binary invocation; PATH shims are not visible here, hence the env override
     cmd_xelab = [
         os.environ.get("FINN_XELAB_OVERRIDE", "xelab"),
         "work." + top_module_name,
@@ -128,8 +120,7 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
     if locate_glbl() is not None:
         cmd_xelab.insert(1, "work.glbl")
 
-    # check=True surfaces xelab compile errors as CalledProcessError instead
-    # of masking them as a downstream "xsimk.so missing" FileNotFoundError.
+    # check=True surfaces compile errors instead of masking them as a later "xsimk.so missing"
     launch_process_helper(cmd_xelab, cwd=sim_out_dir, check=True)
     out_so_relative_path = "xsim.dir/%s/xsimk.so" % top_module_name
     out_so_full_path = sim_out_dir + "/" + out_so_relative_path

@@ -25,38 +25,22 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Sharding, coverage-guard and timing-observability plugin for FINN CI.
+"""Sharding and timing-observability plugin for FINN CI.
 
-Adding a test requires nothing beyond the usual `@pytest.mark.<marker>`:
-the Jenkinsfile runs each marker with `--num-shards N --shard-id I`, and
-the hook below does deterministic round-robin-by-group sharding over the
-collected items. No `.test_durations`, no per-file allowlist, no
-rebalance script.
+Each Jenkins stage runs ``pytest -m <marker> --num-shards N --shard-id I``;
+this module deterministically assigns groups to shards using checked-in
+per-group seconds from ``tests/ci_timings.json`` (LPT-greedy bin packing,
+falls back to round-robin when the file is absent or has no signal).
 
-iter-6 change: switched from hash-by-group to round-robin over
-sorted-group-keys. Hashing permitted collisions where two big groups
-landed on one shard and another shard ran empty; the pathological case
-in #18 was `bnn_u250_3: 54 skipped, 0 passed in 11.9 s` where the shard
-received only chain-break-prone late steps from guard-skipped scenarios.
-Round-robin guarantees balanced group COUNT per shard and deterministic
-placement that is identical across runs of the same test set, so a late
-step's upstream is always in the same shard it was in last run.
+Items sharing an ``@pytest.mark.xdist_group(name=X)`` always land in the
+same shard so chained ``load_test_checkpoint_or_skip`` steps don't break.
+Items without an explicit group are grouped by nodeid.
 
-Chain integrity rule: items that share an `@pytest.mark.xdist_group(name=X)`
-ALWAYS land in the same shard (they form a `load_test_checkpoint_or_skip`
-sequence and splitting them silently skips downstream steps). Items
-without an explicit xdist_group are grouped by nodeid (one item per
-group), which is fine for leaf unit tests.
-
-If `-m <marker>` ever selects zero tests while sharding is requested, the
-hook raises — catching "silently skipped in CI" at collection time rather
-than allowing the skip to ship.
-
-`@pytest.mark.shard(N)` pins a test (and its xdist_group siblings) to a
-specific shard, overriding round-robin. `--dry-run-shards` prints the
-shard assignment table and exits. A `<stash>.timings.json` sidecar is
-emitted next to the junit XML when `--num-shards` is set so the
-Jenkinsfile can echo per-shard wall-clock.
+``@pytest.mark.shard(N)`` pins a group to shard N. ``--dry-run-shards``
+prints the shard table and exits. ``--which-shard QUERY`` prints which
+Jenkins shard a given nodeid would run on. A ``<stash>.timings.json``
+sidecar is emitted next to the junit XML so aggregation can flag outliers
+and so timings can be regenerated (see ``scripts/regen_ci_timings.py``).
 """
 import json
 import os
@@ -66,6 +50,7 @@ import pytest
 
 
 SHARD_MARKER_NAME = "shard"
+TIMINGS_FILE = os.path.join(os.path.dirname(__file__), "ci_timings.json")
 
 
 def pytest_addoption(parser):
@@ -77,26 +62,19 @@ def pytest_addoption(parser):
     group.addoption("--dry-run-shards", action="store_true", default=False,
                     help="Print shard assignment table and exit without running tests.")
     group.addoption("--which-shard", default=None, metavar="QUERY",
-                    help="For each CI stage in tests/ci_shards.py whose marker "
-                         "covers a collected test whose nodeid contains QUERY, "
-                         "print stage | marker | shards | shard | stash, then "
-                         "exit. Use with --collect-only and no -m. Answers "
-                         "'which Jenkins shard runs this test?' in one step.")
+                    help="Print which Jenkins shard each ci_shards.STAGES row "
+                         "would run a matching test on; use with --collect-only.")
 
 
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "shard(N): pin this test to shard N, overriding hash-based assignment "
-        "(use for flaky-test isolation).",
+        "shard(N): pin this test to shard N (use sparingly for flaky-test isolation).",
     )
 
 
 def _group_key(item):
-    # Tests sharing an `xdist_group` form a sequence (downstream steps use
-    # `load_test_checkpoint_or_skip` against upstream outputs), so they must
-    # land in the SAME shard or the chain silently skips. Return the group
-    # name when set, else the nodeid (each leaf item its own "group of 1").
+    """Return the xdist_group name for ``item``, or its nodeid as a singleton."""
     for mark in item.iter_markers(name="xdist_group"):
         if mark.args:
             return str(mark.args[0])
@@ -107,8 +85,6 @@ def _group_key(item):
 
 
 def _pinned_shard(item, num_shards):
-    # `@pytest.mark.shard(N)` overrides round-robin placement. An
-    # out-of-range pin is a loud UsageError rather than a silent skip.
     for mark in item.iter_markers(name=SHARD_MARKER_NAME):
         if not mark.args:
             continue
@@ -127,15 +103,27 @@ def _pinned_shard(item, num_shards):
     return None
 
 
+def _load_group_weights():
+    """Return ``{group_name: seconds}`` from TIMINGS_FILE, or {} if absent."""
+    try:
+        with open(TIMINGS_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    weights = data.get("groups") if isinstance(data, dict) else None
+    if not isinstance(weights, dict):
+        return {}
+    return {str(k): float(v) for k, v in weights.items() if v}
+
+
 def _assign_groups_to_shards(groups, num_shards):
-    # groups: dict of group_key -> list[items]. Return dict of group_key -> shard.
-    #
-    # Two-phase: first honour any @pytest.mark.shard(N) pins (erroring if a
-    # single xdist_group has conflicting pins across its members); then
-    # round-robin the unpinned groups over shards in SORTED key order. Sorted
-    # order is intentional: the assignment becomes deterministic and
-    # reproducible across runs of the same test set, so a downstream step
-    # always lands in the same shard its upstream did last time.
+    """Map ``{group_key: [items]}`` to ``{group_key: shard_id}``.
+
+    Honours @pytest.mark.shard(N) pins, then LPT-greedy assigns the
+    remaining groups by descending weight from ``ci_timings.json`` (groups
+    without a recorded weight get the median, falling back to 1.0).
+    Ties are broken by sorted group key for reproducibility.
+    """
     assignment = {}
     for key, members in groups.items():
         pins = {_pinned_shard(it, num_shards) for it in members}
@@ -147,32 +135,36 @@ def _assign_groups_to_shards(groups, num_shards):
             )
         if pins:
             assignment[key] = pins.pop()
-    unpinned = sorted(k for k in groups if k not in assignment)
-    for i, key in enumerate(unpinned):
-        assignment[key] = i % num_shards
+    if num_shards <= 1:
+        for key in groups:
+            assignment.setdefault(key, 0)
+        return assignment
+    weights_table = _load_group_weights()
+    known = [w for w in weights_table.values() if w > 0]
+    fallback = sorted(known)[len(known) // 2] if known else 1.0
+    unpinned = [k for k in groups if k not in assignment]
+    unpinned.sort(key=lambda k: (-weights_table.get(k, fallback), k))
+    shard_load = [0.0] * num_shards
+    for key in unpinned:
+        weight = weights_table.get(key, fallback)
+        target = min(range(num_shards), key=lambda s: (shard_load[s], s))
+        assignment[key] = target
+        shard_load[target] += weight
     return assignment
 
 
 def _marker_tokens(marker_expr):
-    # ci_shards.STAGES rows have marker expressions constrained to
-    # MARKER_SAFE_PATTERN (`^[A-Za-z0-9_ ]+$` -- see Jenkinsfile), so tokens
-    # are whitespace-split and the only connective allowed is literal `or`.
-    # Any token that is not `or` is a marker name.
+    """Split a ci_shards marker expression into individual marker names."""
     return [t for t in marker_expr.split() if t != "or"]
 
 
 def _item_matches_marker_expr(item, marker_expr):
-    # Item matches the stage's marker expression iff any token names a mark
-    # attached to the item. Mirrors how pytest's -m resolves the same
-    # expression under our regex constraint, without using private API.
     tokens = _marker_tokens(marker_expr)
     return any(any(True for _ in item.iter_markers(name=t)) for t in tokens)
 
 
 def _run_which_shard(config, items, query):
-    # Re-uses _assign_groups_to_shards() verbatim per matching stage so the
-    # table shown here is the exact assignment the Jenkins shard will use.
-    from ci_shards import STAGES, stash_name  # local, lets pytest start without it
+    from ci_shards import STAGES, stash_name
     rows = []
     for stage in STAGES:
         matching = [it for it in items
@@ -209,9 +201,7 @@ def _run_which_shard(config, items, query):
 
 @pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(config, items):
-    # trylast=True ensures pytest's own `-m` deselection has already reduced
-    # `items` before we shard it, so each shard sees only tests matching
-    # the marker expression.
+    # trylast lets pytest's own -m deselection run before we shard.
     which = config.getoption("--which-shard")
     if which:
         _run_which_shard(config, items, which)
@@ -226,9 +216,8 @@ def pytest_collection_modifyitems(config, items):
             "--shard-id=%d out of range for --num-shards=%d" % (shard_id, num_shards)
         )
     if not items:
-        # Zero items before sharding means the `-m` expression selected nothing.
-        # In CI that is a silent-skip footgun (marker typo, stale PARALLEL_SHARDS
-        # row, etc.), so we fail loudly instead.
+        # An empty selection under sharding is a silent-skip footgun (stale
+        # marker, typo). Fail loudly instead.
         raise pytest.UsageError(
             "no tests collected for this marker; CI shard configuration is "
             "out of sync with the test markers"
@@ -240,18 +229,26 @@ def pytest_collection_modifyitems(config, items):
     assignment = _assign_groups_to_shards(groups, num_shards)
 
     if dry_run:
-        per_shard = {i: {"items": 0, "groups": []} for i in range(num_shards)}
+        weights_table = _load_group_weights()
+        known = [w for w in weights_table.values() if w > 0]
+        fallback = sorted(known)[len(known) // 2] if known else 1.0
+        per_shard = {i: {"items": 0, "groups": [], "seconds": 0.0}
+                     for i in range(num_shards)}
         for key, members in groups.items():
             s = assignment[key]
             per_shard[s]["items"] += len(members)
             per_shard[s]["groups"].append(key)
+            per_shard[s]["seconds"] += weights_table.get(key, fallback)
         print("\n--- dry-run-shards (num_shards=%d, groups=%d, items=%d) ---"
               % (num_shards, len(groups), len(items)))
-        print("%-8s %-8s %-8s %s" % ("shard", "items", "groups", "sample_group"))
+        print("%-8s %-8s %-8s %-10s %s"
+              % ("shard", "items", "groups", "weight_s", "sample_group"))
         for i in range(num_shards):
             gs = sorted(per_shard[i]["groups"])
             sample = gs[0] if gs else "(empty)"
-            print("%-8d %-8d %-8d %s" % (i, per_shard[i]["items"], len(gs), sample))
+            print("%-8d %-8d %-8d %-10.1f %s"
+                  % (i, per_shard[i]["items"], len(gs),
+                     per_shard[i]["seconds"], sample))
         config.hook.pytest_deselected(items=list(items))
         items[:] = []
         return
@@ -267,18 +264,12 @@ def pytest_collection_modifyitems(config, items):
     items[:] = kept
 
 
-# ---------------------------------------------------------------------------
-# Per-shard timing observability (WS 1 of iter-5)
-#
-# When --num-shards is set, emit `<stash>.timings.json` next to the junit XML
-# so the Jenkinsfile can echo per-marker shard-wise wall-clock and warn about
-# outliers. Group-level times are keyed by xdist_group so the aggregation
-# matches the hash-sharding key.
-# ---------------------------------------------------------------------------
+# Per-shard timing observability: emit <stash>.timings.json next to the
+# junit XML when --num-shards is set, so aggregation can flag outliers
+# and operators can regenerate ci_timings.json from a recent run.
 
-# Module-level accumulator. Set in pytest_sessionstart on the controller; left
-# as None on xdist workers (where pytest_runtest_logreport would double-count
-# against the controller's copy of the same report).
+# Set on the controller in pytest_sessionstart; left None on xdist workers
+# so log-reports don't double-count.
 _TIMINGS = None
 
 
@@ -317,8 +308,8 @@ def pytest_collection_finish(session):
 def pytest_runtest_logreport(report):
     if _TIMINGS is None:
         return
-    # Accumulate setup+call+teardown durations per nodeid. Under xdist the
-    # controller receives each worker's report here with the worker's timing.
+    # Accumulate setup+call+teardown per nodeid; xdist forwards worker
+    # reports here so summing covers the full session.
     duration = float(getattr(report, "duration", 0.0) or 0.0)
     _TIMINGS["per_test_seconds"][report.nodeid] = (
         _TIMINGS["per_test_seconds"].get(report.nodeid, 0.0) + duration
@@ -354,5 +345,4 @@ def pytest_sessionfinish(session, exitstatus):
         with open(out_path, "w") as f:
             json.dump(payload, f, indent=2)
     except OSError:
-        # Timing I/O failure must never fail the session.
         pass

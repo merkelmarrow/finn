@@ -367,17 +367,10 @@ def deploy_based_on_board(model, model_title, topology, wbits, abits, board):
         model.set_metadata_prop("cpp_deploy_dir", deployment_dir)
 
 
-# The (marker, wbits, abits, topology, board) cross-product covered by this
-# file. Each scenario is tagged with the single marker for the shard that
-# should run it; pytest's own `-m <marker>` filter then does the selection.
-# Adding a new board is a one-row addition to `_BNN_MARKER_BY_BOARD` and a
-# matching line in `test_board_map` — the Jenkinsfile PARALLEL_SHARDS row
-# picks it up by marker without any change here.
-#
-# Sanity scenarios are a fixed 4-tuple — one per board — that exercise
-# representative (w,a,topology) combinations. They are kept separate from
-# the full per-board cross-product so `-m sanity_bnn` stays a single build
-# per board rather than the 12 scenarios of `-m bnn_<board>`.
+# Each scenario carries the single marker for the shard that should run it,
+# so pytest's own `-m <marker>` filter does the selection. Sanity scenarios
+# are a fixed 4-tuple (one per board) so `-m sanity_bnn` stays a single
+# build per board, separate from the 12-scenario `-m bnn_<board>` matrix.
 _SANITY_BNN_CONFIGS = [
     (1, 1, "lfc", "Pynq-Z1"),
     (1, 2, "cnv", "KV260_SOM"),

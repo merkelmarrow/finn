@@ -1,42 +1,21 @@
-// Shard config lives in tests/ci_shards.py (single source of truth shared
-// between this Jenkinsfile and conftest.py's --which-shard lookup).
-// Adding a row there is the ONLY CI edit needed for a new marker/board.
-// Shard count times workers determines wall-clock; the tests/conftest.py
-// plugin does the actual group-aware split at pytest collection time.
-// To find which shard a given test runs in, run inside ./run-docker.sh:
-//   pytest --collect-only --which-shard <nodeid-or-substring>
-// See docker/jenkins/README.md.
+// Stage config lives in tests/ci_shards.py and is loaded into PARALLEL_SHARDS
+// at the Validate stage. See docker/jenkins/README.md.
 
 import groovy.transform.Field
 
-// Populated from tests/ci_shards.py::STAGES in loadStageConfig(), called
-// at the start of the Validate stage where sh + readJSON are valid
-// pipeline steps (neither is CPS-safe at @Field init time).
 @Field
 List<Map> PARALLEL_SHARDS = []
 
-// Minimum free disk space (GB) required on each finn-build agent for a shard
-// to start. Sized for ~2 concurrent fpgadataflow/bnn build trees on one agent
-// (~60-80 GB each) plus headroom. Set 0 to disable (e.g. for --dry-run).
+// Sized for ~2 concurrent build trees per agent (~60-80 GB each) plus headroom.
 @Field
 int FINN_CI_MIN_FREE_GB = 120
 
-// Per-build NFS tree under <FINN_AGENT_NFS_ROOT>/workspace/tmp/ci_runs/<jobKey>/<BUILD_NUMBER>/
-// to avoid cross-build races on fixed per-shard names (e.g. fpgadataflow_1). Pruned by
-// rotateFinnCiBuildTmp (Validate stage) to bounded disk. See docker/jenkins/README.md.
 @Field
 int FINN_CI_TMP_RETAIN_BUILDS = 5
 
 @Field
 int FINN_CI_TMP_MAX_AGE_DAYS = 14
 
-// Import tests/ci_shards.py::STAGES into PARALLEL_SHARDS. The Python module
-// is the sole source of truth; this Groovy side does zero expansion (rows
-// in STAGES are fully-explicit, including per-board end2end entries and
-// the sanity_bnn zipBoards list). Keeping expansion out of Groovy means
-// the maintainer CLI (pytest --which-shard) and Jenkins cannot drift.
-// Must run after the implicit declarative checkout (i.e. inside a stage
-// with an `agent` directive), which the Validate stage provides.
 void loadStageConfig() {
   String json = sh(returnStdout: true, script:
     "python3 -c 'import json, sys; sys.path.insert(0, \"tests\"); " +
@@ -45,8 +24,7 @@ void loadStageConfig() {
   PARALLEL_SHARDS = readJSON(text: json).collect { it as Map }
 }
 
-// Marker expressions are interpolated into shell. Restrict to identifier
-// characters + spaces so nothing can inject shell metacharacters.
+// Marker is interpolated into shell; reject anything that could escape.
 @Field
 java.util.regex.Pattern MARKER_SAFE_PATTERN = ~/^[A-Za-z0-9_ ]+$/
 
@@ -63,11 +41,8 @@ pipeline {
            description: 'Substring filter on stage name (empty = all). Use to run one row for debugging.')
   }
   stages {
-    // Every finn-build stage wraps its body in withAgentNfsEnv so
-    // FINN_HOST_BUILD_DIR / FINN_XRT_PATH / FINN_DOCKER_EXTRA resolve off
-    // the agent's FINN_AGENT_NFS_ROOT (jenkins_slaves.yml env_vars). The
-    // wrap must live inside `script { ... }` because withEnv is a
-    // pipeline step, not a declarative construct.
+    // Every finn-build stage wraps its body in withAgentNfsEnv so paths
+    // resolve off FINN_AGENT_NFS_ROOT (per-agent env_vars in jenkins_slaves.yml).
     stage('Validate') {
       agent { label 'finn-build' }
       steps { script { withAgentNfsEnv { loadStageConfig(); validateShards(); rotateFinnCiBuildTmp() } } }
@@ -87,14 +62,7 @@ pipeline {
   }
 }
 
-// Return a job parameter via java.util.Map.get — `params` is a
-// Collections$UnmodifiableMap, so standard Map access is sandbox-safe.
-// (Earlier iter-5 draft used `params.getProperty(name)` under the mistaken
-// assumption that `params[name]` was a sandbox hazard like `env[k]=v` from
-// iter-1. `env` is EnvActionImpl, not a Map; `params` IS a Map, so
-// DefaultGroovyMethods.getAt(Map,Object) applies and is whitelisted.
-// `params.getProperty(name)` fails with MissingMethodException because
-// UnmodifiableMap has no such method — verified on #16.)
+// `params` is an UnmodifiableMap; use Map.get (sandbox-safe), not getProperty.
 boolean paramBool(String name) {
   def v = params.get(name)
   if (v == null) { return false }
@@ -107,8 +75,7 @@ String paramString(String name) {
   return v == null ? '' : v.toString()
 }
 
-// Pre-flight: marker regex + executor budget. Marker violations are hard
-// errors; budget overshoot is UNSTABLE because CI queues correctly anyway.
+// Marker violations are hard errors; over-subscribing executors is UNSTABLE.
 void validateShards() {
   if (!PARALLEL_SHARDS) {
     error "PARALLEL_SHARDS is empty; loadStageConfig() must run before validateShards()"
@@ -144,16 +111,15 @@ void buildAndPublishDockerImage() {
   }
 }
 
-// Publish the built image to FINN_DOCKER_SHARED_DIR so other agents
-// `docker load` it instead of rebuilding. Tag must match run-docker.sh.
+// Publish to FINN_DOCKER_SHARED_DIR so other agents `docker load` instead
+// of rebuilding. Tag must match run-docker.sh.
 void publishSharedDockerImage(String sharedDir) {
   def tag = sh(returnStdout: true, script:
       'echo "xilinx/finn:$(git describe --always --tags --dirty).${XRT_DEB_VERSION:-xrt_202220.2.14.354_22.04-amd64-xrt}"'
   ).trim()
   sh "mkdir -p ${sharedDir}"
   sh "echo '${tag}' > ${sharedDir}/finn-docker-tag.txt"
-  // #!/bin/bash required: Jenkins durable-task defaults to /bin/sh (dash),
-  // which lacks `set -o pipefail`.
+  // bash needed for `set -o pipefail`; Jenkins defaults sh to dash.
   sh """#!/bin/bash
 set -o pipefail
 if command -v pigz >/dev/null 2>&1; then
@@ -164,9 +130,8 @@ fi
 """
 }
 
-// Expand PARALLEL_SHARDS into (stage -> closure) pairs honouring param gates,
-// skipWhen cross-param suppression, and the STAGES substring filter. Stash
-// names are derived so adding a row does not require editing expectedStashes().
+// Expand PARALLEL_SHARDS into stage -> closure pairs honouring param gates
+// and the STAGES substring filter.
 Map<String, Closure> buildParallelStageMap() {
   def branches = [:]
   eachActiveShard { row, id ->
@@ -184,10 +149,8 @@ void eachActiveShard(Closure body) {
     if (!paramBool(row.param as String)) { continue }
     if (row.skipWhen && paramBool(row.skipWhen as String)) { continue }
     int numShards = row.shards as int
-    // C-style for-loop (not `(0..<n).each`): groovy.lang.IntRange is not
-    // Serializable, and when a range is a live local in the CPS frame that
-    // reaches `parallel(...)`, every branch fails to persist with
-    // NotSerializableException at the first checkpoint.
+    // C-style for-loop: groovy.lang.IntRange is not Serializable and breaks
+    // CPS persistence when it survives into `parallel(...)`.
     for (int id = 0; id < numShards; id++) {
       String stage = shardStageName(row, id)
       if (filter && !stage.contains(filter)) { continue }
@@ -205,14 +168,13 @@ String shardStashName(Map row, int id) {
   return row.shards == 1 ? base : "${base}_${id + 1}"
 }
 
-// One path segment for <jobKey> under ci_runs/; avoids collision between different jobs
-// (e.g. build 12 of "finn" vs build 12 of "finn_ci_speedup" on the same host).
+// jobKey segment under ci_runs/ avoids collisions between jobs sharing
+// build numbers on the same host.
 String finnCiJobKey() {
   String jn = env.JOB_NAME ?: 'job'
   return jn.replaceAll('[^A-Za-z0-9._-]+', '_')
 }
 
-// Absolute parent for this run's per-shard dirs: .../ci_runs/<jobKey>/<BUILD_NUMBER>
 String finnCiPerBuildRoot() {
   String r = env.FINN_AGENT_NFS_ROOT
   if (!r) { error "FINN_AGENT_NFS_ROOT is unset on ${env.NODE_NAME} (expected from agent env_vars)" }
@@ -220,7 +182,7 @@ String finnCiPerBuildRoot() {
   return "${r}/workspace/tmp/ci_runs/${finnCiJobKey()}/${env.BUILD_NUMBER}"
 }
 
-// Prune old .../workspace/tmp/ci_runs/<jobKey>/<N>/ trees; once per build (Validate).
+// Prune old per-build trees once per Validate stage.
 void rotateFinnCiBuildTmp() {
   String root = env.FINN_AGENT_NFS_ROOT
   if (!root) { return }
@@ -233,28 +195,15 @@ void rotateFinnCiBuildTmp() {
   """
 }
 
-// Resolve agent-local paths off FINN_AGENT_NFS_ROOT so a second finn-build
-// host is a slaves.yml edit (not a Jenkinsfile edit). Must wrap the body of
-// every `node('finn-build')` block in this file — it can ONLY run after node
-// binding because the env var comes from the agent's env_vars entry in
-// jenkins-deploy/.../jenkins_slaves.yml. See
-// knowledge/continuations/jenkins_workspaces_on_nfs_migration.md §3.3 and
-// knowledge/experiments/2026-04-23_jenkins_nfs_workspace_probes.md for the
-// gate probes that cleared this cutover (container uid 92382 writes clean
-// to NFS under root_squash; LSF farm hosts see NFS workspace files).
+// Resolve agent-local paths off FINN_AGENT_NFS_ROOT (per-agent env_vars in
+// jenkins_slaves.yml) so adding a finn-build host is a slaves.yml edit only.
+// Must run after node binding; resolves ${NODE_NAME} in Groovy because
+// run-docker.sh does not re-expand vars stored inside FINN_DOCKER_EXTRA.
 void withAgentNfsEnv(Closure body) {
   String agentNfsRoot = env.FINN_AGENT_NFS_ROOT
   if (!agentNfsRoot) {
-    error "FINN_AGENT_NFS_ROOT is unset on ${env.NODE_NAME}; add it to env_vars in jenkins-deploy/jenkins/xirengvm092015.xilinx.com/vars/jenkins_slaves.yml for this agent (see knowledge/continuations/jenkins_workspaces_on_nfs_migration.md)."
+    error "FINN_AGENT_NFS_ROOT is unset on ${env.NODE_NAME}; add it to env_vars in jenkins_slaves.yml for this agent."
   }
-  // -v <root>/caches/vivado_ip_cache:/tmp/vivado_ip_cache is additive to the
-  // DSL's FINN_DOCKER_EXTRA; --hostname ${NODE_NAME} replaces the literal
-  // `--hostname xircseeng01` that used to live in the DSL (LSF master still
-  // sees the agent hostname, just parameterised). POC-4 gotcha 7a no longer
-  // applies: run-docker.sh does NOT re-expand vars stored inside
-  // FINN_DOCKER_EXTRA, which is precisely why we resolve ${env.NODE_NAME}
-  // here in Groovy (before shell) instead of pushing $NODE_NAME into the
-  // env-var string.
   withEnv([
     "FINN_HOST_BUILD_DIR=${agentNfsRoot}/workspace/tmp",
     "FINN_XRT_PATH=${agentNfsRoot}/caches/xrt",
@@ -264,25 +213,17 @@ void withAgentNfsEnv(Closure body) {
   ]) { body() }
 }
 
-// The single parallel-stage body. Every row goes through here, so `stash` in
-// `finally` and `junit`-first aggregation stay load-bearing for all shards.
+// One body for every parallel shard. `safeStashReport` in `finally` is
+// load-bearing so failed stages still publish their JUnit XML.
 void runShard(Map row, int shardIdx, String stageName, String stashName) {
   node('finn-build') {
     withAgentNfsEnv {
     stage(stageName) {
       checkout scm
-      // iter-6 A.1: (no-op) had been sibling prune under the parent tmp; see
-      // cleanStaleAgentDirs. Runs before the inner withEnv so env still has
-      // withAgentNfsEnv's .../workspace/tmp for FINN_HOST_BUILD_DIR.
-      cleanStaleAgentDirs()
       String perBuildRoot = finnCiPerBuildRoot()
       def buildDir = "${perBuildRoot}/${stashName}"
       withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
-        // Ensure ancestor exists so checkAgentFreeSpace/ df never sees a dead path, and
-        // bind mount src exists before docker (iter-6 C; see withAgentNfsEnv comment).
         sh "mkdir -p '${perBuildRoot}'"
-        // iter-6 A.2: fail the shard fast if /scratch is below threshold
-        // rather than letting pytest OOM-disk mid-run (5 such cascades in #18).
         checkAgentFreeSpace(FINN_CI_MIN_FREE_GB)
         sh "mkdir -p ${stashName}"
         cleanPreviousBuildFiles(buildDir)
@@ -293,17 +234,9 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
                 stash: stashName,
                 workers: row.workers as int,
                 distMode: row.distMode,
+                numShards: row.shards as int,
+                shardId: shardIdx,
             ]
-            if ((row.shards as int) > 1) {
-              opts.numShards = row.shards as int
-              opts.shardId = shardIdx
-            } else {
-              // Even unsharded rows emit timings via --num-shards=1 so the
-              // observability path is uniform. conftest.py treats --num-shards=1
-              // as a no-op for sharding but still writes <stash>.timings.json.
-              opts.numShards = 1
-              opts.shardId = 0
-            }
             if (row.coverage) {
               opts.extraArgs = "--cov --cov-report=html:coverage_${stashName}"
             }
@@ -314,18 +247,16 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
             }
           }
         } finally {
-          // MUST stay in `finally` so failed stages still publish their XML.
           safeStashReport(stashName)
         }
       }
     }
-    }  // withAgentNfsEnv
+    }
   }
 }
 
-// Stash <stash>.xml + <stash>.html + <stash>.timings.json iff pytest produced
-// them. The defensive catchError ensures a stash hiccup cannot affect build
-// status — pytest's own catchError already determines pass/fail.
+// Stash whichever of <stash>.{xml,html,timings.json} pytest produced.
+// catchError keeps a stash hiccup from masking pytest's own pass/fail.
 void safeStashReport(String stashName) {
   catchError(buildResult: null, stageResult: null,
              message: "safeStashReport(${stashName}) failed; aggregation may be partial") {
@@ -337,8 +268,7 @@ void safeStashReport(String stashName) {
   }
 }
 
-// Swallows "stash does not exist" when a stage was skipped or failed before
-// publishing, so aggregation still sees every stash that did publish.
+// Swallows "stash does not exist" so aggregation still sees the rest.
 void unstashIfPresent(String stashName) {
   try {
     unstash stashName
@@ -354,9 +284,8 @@ void archiveStageFolder(String folder) {
   }
 }
 
-// Order is load-bearing: junit FIRST (workspace-local, never flakes), then
-// the defensive merge + archive (agent->controller tar transfer can flake on
-// glob counts > ~10). Reversing this loses the test tree on transfer flake.
+// junit first (workspace-local, never flakes); merge + archive second since
+// agent->controller tar transfer can flake on large globs.
 void aggregateReports() {
   sh 'mkdir -p reports'
   cleanPreviousBuildFiles('reports')
@@ -384,85 +313,22 @@ void aggregateReports() {
   }
 }
 
-// Per-shard wall-clock summary. Reads reports/*.timings.json (emitted by the
-// conftest plugin) and groups by marker family (stripped trailing _N). Warns
-// when any shard is > 1.5x the median wall-clock for its family.
+// Per-shard wall-clock summary; warns when a shard exceeds 1.5x family median.
 void echoShardTimings() {
   catchError(buildResult: null, stageResult: null,
              message: 'echoShardTimings failed; non-fatal') {
     if (!fileExists('reports')) { return }
-    def count = sh(returnStdout: true, script:
-        "find reports -maxdepth 1 -type f -name '*.timings.json' | wc -l").trim()
-    if (count == '0') {
-      echo 'echoShardTimings: no timings.json found; skipping summary'
-      return
-    }
-    sh '''#!/bin/bash
-set -eo pipefail
-python3 - <<'PY'
-import glob, json, os, re, collections
-rows = []
-for p in sorted(glob.glob("reports/*.timings.json")):
-    try:
-        with open(p) as f:
-            d = json.load(f)
-    except Exception as e:
-        print("!! could not parse %s: %s" % (p, e))
-        continue
-    stash = d.get("stash") or os.path.basename(p).split(".")[0]
-    groups = d.get("groups") or []
-    top = groups[0] if groups else {"name": "(none)", "seconds": 0.0}
-    rows.append((stash, int(d.get("shard", {}).get("id", 0)),
-                 float(d.get("wall_seconds", 0.0)),
-                 float(top.get("seconds", 0.0)), str(top.get("name", ""))))
-if not rows:
-    print("echoShardTimings: no parseable timings.json files")
-    raise SystemExit(0)
-
-def family(s):
-    return re.sub(r"_\\d+$", "", s)
-
-by_family = collections.defaultdict(list)
-for r in rows:
-    by_family[family(r[0])].append(r)
-
-print()
-print("=== per-shard wall-clock ===")
-print("%-36s %3s %10s %12s  %s" % ("stash", "id", "wall_s", "max_group_s", "max_group"))
-print("-" * 100)
-unstable_found = False
-for fam in sorted(by_family):
-    rs = sorted(by_family[fam], key=lambda r: r[1])
-    walls = sorted(r[2] for r in rs)
-    median = walls[len(walls)//2] if walls else 0.0
-    for (stash, sid, wall, mx_sec, mx_name) in rs:
-        flag = ""
-        if median > 0.0 and wall > 1.5 * median:
-            flag = "  <<< SLOW SHARD (%.1fx median)" % (wall / median)
-            unstable_found = True
-        print("%-36s %3d %10.1f %12.1f  %s%s" % (stash, sid, wall, mx_sec, mx_name, flag))
-    print()
-if unstable_found:
-    print("echoShardTimings: one or more shards are > 1.5x family median; "
-          "consider rebalancing `shards:` in PARALLEL_SHARDS")
-PY
-'''
+    sh "python3 scripts/summarize_ci_timings.py reports/"
   }
 }
 
-// Post-condition: every active row declaring zipBoards must have produced a
-// <board>.zip in ARTIFACT_DIR for each board. Missing zips mean no shard ran
-// the bitstream-emitting scenario — a silent-skip class the pre-shard coverage
-// guard doesn't catch (marker has items, but the specific parametrisation
-// that emits bitstreams isn't in any of them). UNSTABLE, not FAILURE, because
-// the upstream cause (marker typo, test filter) would surface via junit too.
+// UNSTABLE if a row declared zipBoards but no shard produced the bitstream zip.
 void assertZipBoardsEmitted() {
   catchError(buildResult: null, stageResult: null,
              message: 'assertZipBoardsEmitted failed; non-fatal') {
     def missing = []
     eachActiveShard { row, id ->
-      if (!row.zipBoards) { return }
-      if (id != 0) { return }  // check once per row, not once per shard
+      if (!row.zipBoards || id != 0) { return }
       String stash = shardStashName(row, id)
       (row.zipBoards ?: []).each { board ->
         String expected = "${env.ARTIFACT_DIR}/${stash}/${board}.zip"
@@ -473,7 +339,7 @@ void assertZipBoardsEmitted() {
     }
     if (!missing.isEmpty()) {
       echo "assertZipBoardsEmitted: missing ${missing.size()} expected board zip(s):\n  - " + missing.join('\n  - ')
-      unstable "assertZipBoardsEmitted: ${missing.size()} expected board zip(s) missing (see log above); no shard emitted the bitstream-producing scenario"
+      unstable "assertZipBoardsEmitted: ${missing.size()} expected board zip(s) missing"
     }
   }
 }
@@ -485,18 +351,15 @@ List<String> expectedStashes() {
   return stashes
 }
 
-// iter-6 C: clean buildDir on the host AND pre-create it so docker's `-v`
-// mount finds an existing source and doesn't auto-create the bind parent as
-// root:root (which the in-container cse-jenkins user can't then write to,
-// observed as PermissionError on end2end tests in #21). The existence check
-// after rm fails loud if a previous container left root-owned residue that
-// this shard can't clean — the operator needs to nuke it with sudo once.
+// Pre-create buildDir as the unprivileged user; otherwise docker's -v mount
+// auto-creates the bind parent as root:root and the in-container user can't
+// write to it. Hard-fail on root-owned residue (operator must `sudo rm -rf`).
 void cleanPreviousBuildFiles(String buildDir) {
   if (!buildDir || buildDir.empty) { return }
   sh """
     rm -rf '${buildDir}' 2>/dev/null || true
     if [ -d '${buildDir}' ]; then
-      echo "cleanPreviousBuildFiles: '${buildDir}' still exists after rm; likely root-owned residue from a previous container. Ask an admin to 'sudo rm -rf ${buildDir}' on this agent. Contents:"
+      echo "cleanPreviousBuildFiles: '${buildDir}' still exists after rm; likely root-owned residue. Ask an admin to 'sudo rm -rf ${buildDir}' on this agent."
       ls -la '${buildDir}' | head -40
       exit 1
     fi
@@ -504,42 +367,13 @@ void cleanPreviousBuildFiles(String buildDir) {
   """
 }
 
-// iter-6 A.1 (disabled in #22 postmortem):
-// Original intent was to prune directories in FINN_HOST_BUILD_DIR that aren't
-// an expected stash for this build, using expectedStashes() as the whitelist.
-// That turned out to be unsafe: when several shards start concurrently on the
-// same agent (typical on xircseeng01 with 5 executors), shard B's
-// cleanStaleAgentDirs lists the parent tmp dir AFTER shard A already mkdir'd
-// its per-shard subdir. If expectedStashes() in shard B's CPS frame returns
-// a list that is missing shard A's stash (reproducibly observed in #22 —
-// root cause is not fully understood, probably a params.get() evaluation
-// quirk across parallel CPS threads), shard B `rm -rf`s shard A's live
-// workspace mid-run. Shard A's running container then hits EPERM/ENOENT on
-// its own FINN_HOST_BUILD_DIR and every test fails with PermissionError on
-// writes (#22 symptom: End2end (1/3) died at 40s with EPERM on a freshly
-// mkdtemp'd subdir; simultaneously log shows another shard's cleanStale
-// pruning [end2end_1, ...] as "non-whitelisted").
-//
-// Cross-build residue is now handled out-of-band by
-// scripts/docker_clean_finn_tmp.sh (rootless, for agents where cse-jenkins
-// lacks sudo) and scripts/reclaim_finn_build_tmp.sh (sudo path). Per-shard
-// cleanup of THIS shard's own dir is handled by cleanPreviousBuildFiles at
-// the start of runShard, which is race-free (each shard only touches its
-// own stashName).
-void cleanStaleAgentDirs() {
-  // Deliberate no-op. Do NOT re-enable without solving the cross-shard CPS
-  // races in expectedStashes() — see the giant comment above.
-}
-
-// iter-6 A.2: fail the shard fast if the agent's scratch is below threshold.
-// Prevents the mid-pytest OSError-28 cascade observed on xircseeng01 in #18.
+// Fail the shard fast if scratch is below threshold rather than letting
+// pytest hit ENOSPC mid-run.
 void checkAgentFreeSpace(int minFreeGB) {
   if (minFreeGB <= 0) { return }
   String target = env.FINN_HOST_BUILD_DIR ?: '/scratch'
-  // The shard's own dir doesn't exist yet (mkdir happens later in runShard),
-  // so climb up to the nearest existing ancestor before calling df. Without
-  // this, df emits a single "No such file or directory" line, awk returns
-  // empty, and the parser falls back to 0 -> every shard aborts (#19).
+  // Climb to the nearest existing ancestor: the shard's own dir is not yet
+  // mkdir'd, and df on a missing path returns empty.
   def raw = sh(returnStdout: true, script: """
 d='${target}'
 while [ ! -d "\$d" ] && [ "\$d" != '/' ]; do d=\$(dirname "\$d"); done
@@ -552,17 +386,14 @@ df -BG "\$d" | awk 'NR==2 {print \$4}' | tr -d 'G'
     return
   }
   if (freeGB < minFreeGB) {
-    error "agent ${env.NODE_NAME} has only ${freeGB} GB free on ${target} (< ${minFreeGB} GB threshold); aborting shard to avoid mid-run disk exhaustion. Free space by pruning /scratch or reduce concurrent shards on this agent (see jenkins_ci.md iter-6)."
+    error "agent ${env.NODE_NAME} has only ${freeGB} GB free on ${target} (< ${minFreeGB} GB threshold); aborting shard to avoid mid-run disk exhaustion."
   }
 }
 
-// Single pytest entry point. Feeds the command line via a temporary script
-// because run-docker.sh re-tokenises argv and would split quoted metacharacters
-// in `-m` expressions otherwise. Marker expression is passed via an env var
-// rather than single-quote interpolation so shell metachars in a (malformed)
-// marker value can't escape — validateShards() already rejects those, this is
-// defence in depth. Args (Map): marker/stash required; workers, distMode,
-// numShards/shardId, extraArgs optional.
+// Marker is passed via env var (not interpolated) so a malformed marker
+// can't escape into the shell. The wrapper script avoids run-docker.sh
+// re-tokenising the `-m "..."` argv. Exit 5 = "no tests collected" is
+// treated as success (already loud-failed by the conftest plugin).
 void runPytest(Map opts) {
   def parts = ["python -m pytest -m \"\$FINN_CI_MARKER\""]
   if (opts.workers) {
@@ -575,31 +406,23 @@ void runPytest(Map opts) {
   if (opts.extraArgs) { parts << opts.extraArgs }
   def cmd = parts.join(' ')
   echo "runPytest[${opts.stash}]: FINN_CI_MARKER='${opts.marker}'; ${cmd}"
-  // pytest exit 5 = "no tests collected". With hash-sharding this happens
-  // legitimately when an over-provisioned shard count leaves one shard empty;
-  // pre-shard-empty is already caught loudly by the plugin in tests/conftest.py,
-  // so exit 5 here is a "reduce shards: in PARALLEL_SHARDS" hint, not a failure.
   writeFile file: 'run-tests.sh', text:
       "#!/bin/bash\nset -o pipefail\nexport FINN_CI_MARKER='${opts.marker}'\n${cmd}\nec=\$?\n[ \$ec -eq 5 ] && exit 0 || exit \$ec\n"
   sh 'chmod 777 run-tests.sh'
   sh './run-docker.sh ./run-tests.sh'
 }
 
-// Silent no-op if the board's hw_deployment_* directory is absent: with hash
-// sharding, only the shard that happened to run cnv-w2a2 produces artefacts.
-// The zipBoards postcondition in aggregateReports catches the case where NO
-// shard produced the expected artefact.
+// Silent no-op if the board's hw_deployment_* dir is absent: under hash
+// sharding only one shard runs cnv-w2a2; assertZipBoardsEmitted catches
+// the case where no shard produced it.
 void findCopyZip(String board, String findDir, String copyDir) {
   if (!fileExists("${findDir}")) { return }
   def found = sh(returnStdout: true, script:
       "find ${findDir} -maxdepth 2 -type d -name '${board}' -path '*/hw_deployment_*/*' | head -1"
   ).trim()
   if (!found) { return }
-  // Reused Jenkins workspaces can leave a stale ${copyDir}/${board} tree from
-  // an earlier build. Git's default 0555 mode on .git/objects/pack/ then makes
-  // `cp -r` merge-into-target fail on .idx/.pack creation (EACCES) and also
-  // blocks `rm -rf` from traversing. chmod -R u+w restores the write bit so we
-  // can unlink, then rm to guarantee cp writes into a fresh destination.
+  // Reused workspaces can leave a stale ${copyDir}/${board} from an earlier
+  // build with read-only .git/objects/pack/ that blocks both rm and cp -r.
   sh """
     mkdir -p '${copyDir}'
     if [ -e '${copyDir}/${board}' ]; then

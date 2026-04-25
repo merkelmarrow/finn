@@ -166,20 +166,9 @@ def make_build_dir(prefix=""):
 def robust_rmtree(path, retries=6, initial_delay=0.1, backoff=2.0):
     """Remove a directory tree, retrying transient NFS ``ENOTEMPTY`` races.
 
-    NOTE: This helper only retries transient ``ENOTEMPTY`` races caused by
-    *external* filesystem activity (e.g. NFS server-side directory listing
-    lag). It deliberately does NOT retry on ``EBUSY`` against ``.nfsXXXX``
-    "silly-rename" files, because those indicate that the *current* Python
-    process still holds an open file descriptor on a file inside ``path``.
-    Sleeping cannot release a fd held by the same live process, so a retry
-    here would just delay the eventual failure.
-
-    If you see ``EBUSY`` on a ``.nfsXXXX`` filename, fix the file-descriptor
-    leak in the caller (close all file handles, ``logging.FileHandler``s,
-    subprocesses, etc. on objects inside ``path`` BEFORE calling
-    :func:`robust_rmtree` or :func:`shutil.rmtree`).
+    Does NOT retry ``EBUSY`` on ``.nfsXXXX`` files: that signals an open fd
+    in the current process, which sleeping cannot release.
     """
-
     if not path or not os.path.exists(path):
         return
 
@@ -247,11 +236,8 @@ class CppBuilder:
 def launch_process_helper(args, proc_env=None, cwd=None, check=False):
     """Helper function to launch a process in a way that facilitates logging
     stdout/stderr with Python loggers.
-    Returns (cmd_out, cmd_err).
-
-    If ``check`` is True, raises :class:`subprocess.CalledProcessError` when
-    the process exits non-zero. Default ``check=False`` preserves historical
-    behaviour; prefer ``check=True`` at new call sites."""
+    Returns (cmd_out, cmd_err). Raises :class:`subprocess.CalledProcessError`
+    when ``check`` is True and the process exits non-zero."""
     if proc_env is None:
         proc_env = os.environ.copy()
     with subprocess.Popen(
@@ -294,14 +280,9 @@ def which(program):
 def resolve_xilinx_tool(default_name, override_env_var):
     """Return the Xilinx-tool command to embed in generated bash scripts.
 
-    Honours ``<override_env_var>`` (e.g. ``FINN_VIVADO_OVERRIDE``) so an
-    out-of-band dispatcher (e.g. an LSF shim) can intercept the call at a
-    narrower point than a PATH shim.  Falls back to ``default_name`` for
-    local runs.  Mirrors the xelab pattern in ``finn_xsi.adapter``.
-
-    The returned string is written verbatim into the generated bash script,
-    so it may be either a bare tool name (resolved via PATH at runtime) or
-    an absolute path to a shim.
+    Honours ``<override_env_var>`` so an out-of-band dispatcher can intercept
+    the call at a narrower point than a PATH shim. The returned string is
+    written verbatim into the script, so a bare name or absolute path both work.
     """
     tool = os.environ.get(override_env_var, default_name)
     assert which(tool) is not None, "%s not found in PATH (override=%s)" % (

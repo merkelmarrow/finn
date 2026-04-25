@@ -1,18 +1,12 @@
-// HW-tethered pipeline. Mirrors docker/jenkins/Jenkinsfile's `PARALLEL_SHARDS`
-// single-source-of-truth pattern — adding a board is one row in HW_SHARDS.
+// HW-tethered pipeline. One row per board in HW_SHARDS, mirroring the
+// PARALLEL_SHARDS pattern in docker/jenkins/Jenkinsfile.
 //
-// Shared helpers (`safeStashReport`, `aggregateReports`, `archiveStageFolder`,
-// `unstashIfPresent`, `cleanPreviousBuildFiles`) are DUPLICATED verbatim from
-// Jenkinsfile below; Jenkins declarative-pipeline CPS does not expose a clean
-// shared-library hook in this repo. Keep the two copies in sync — iter-2 bug
-// fix #12 and iter-3 bug fix #13 (junit first, safeStashReport + try/finally)
-// are load-bearing here too.
+// Shared helpers (safeStashReport, aggregateReports, unstashIfPresent,
+// cleanPreviousBuildFiles) are duplicated from Jenkinsfile because Jenkins
+// declarative pipelines have no shared-library hook here. Keep in sync.
 
 import groovy.transform.Field
 
-// One row per board. The HW pipeline runs two test types per board
-// (sanity + full build); `buildHwStageMap(testType)` expands the 4 rows
-// x 1 testType = 4 parallel shards for each test-type stage.
 @Field
 List<Map> HW_SHARDS = [
     [board: 'U250',      agentLabel: 'finn-u250',  credentialsId: null,
@@ -62,11 +56,8 @@ pipeline {
   }
 }
 
-// Refresh online-status env vars. Called twice (before reboot and after) to
-// handle boards that went offline during the reboot window. Static env.X =
-// writes only — dynamic `env.setProperty(k, v)` hit the Groovy sandbox in
-// iter-1 (bug #11) so we hardcode the 4 assignments here even though
-// HW_SHARDS already declares the four onlineEnv names.
+// Static env.X = writes only; dynamic env.setProperty(k, v) trips the
+// Groovy sandbox, so the four assignments are spelled out by hand.
 void refreshNodeOnlineFlags() {
   env.ALVEO_HOST_ONLINE = isNodeOnline('finn-u250')  ? 'true' : 'false'
   env.PYNQ_ONLINE       = isNodeOnline('finn-pynq')  ? 'true' : 'false'
@@ -74,8 +65,7 @@ void refreshNodeOnlineFlags() {
   env.KV260_ONLINE      = isNodeOnline('finn-kv260') ? 'true' : 'false'
 }
 
-// Read an online-status env var by name, using static property access for
-// each of the 4 known flags. Matches the sandbox-safe write pattern above.
+// Sandbox-safe lookup matching the static writes in refreshNodeOnlineFlags.
 boolean isOnline(String onlineEnvName) {
   switch (onlineEnvName) {
     case 'ALVEO_HOST_ONLINE': return env.ALVEO_HOST_ONLINE == 'true'
@@ -87,9 +77,8 @@ boolean isOnline(String onlineEnvName) {
   }
 }
 
-// One parallel reboot per board that needs it (pynq-class only). U250 is
-// skipped because restartPrep=false; offline boards are skipped via the
-// onlineEnv gate inside runReboot().
+// One parallel reboot per board with restartPrep=true; offline boards
+// skipped inside runReboot().
 Map<String, Closure> buildRebootMap() {
   def branches = [:]
   HW_SHARDS.each { row ->
@@ -107,8 +96,6 @@ void runReboot(Map row, String stageName) {
   }
   node(row.agentLabel) {
     stage(stageName) {
-      // beforeAgent behaviour is simulated by the isNodeOnline check above —
-      // we never enter node() for an offline label, so the stage cannot hang.
       catchError(stageResult: 'FAILURE') {
         withHwCredentials(row) {
           restartZynqPlatform()
@@ -136,10 +123,8 @@ Map<String, Closure> buildHwStageMap(String testType) {
   return branches
 }
 
-// Body of every HW shard. Structure mirrors runShard() in Jenkinsfile:
-// try { pytest work } finally { safeStashReport(...) }  — the stash-in-finally
-// pattern ensures failed stages still publish their junit XML (iter-3 bug
-// fix #12).
+// Mirrors runShard() in Jenkinsfile; safeStashReport in `finally` so failed
+// stages still publish their junit XML.
 void runHwShard(Map row, String testType, String stageName) {
   if (!isOnline(row.onlineEnv as String)) {
     echo "${stageName} skipped: ${row.onlineEnv} != 'true'"
@@ -164,8 +149,7 @@ void runHwShard(Map row, String testType, String stageName) {
   }
 }
 
-// Boards requiring credentials get a withCredentials wrapper; alveo (U250)
-// runs with no credentials and just executes the closure.
+// Boards with credentialsId get a withCredentials wrapper; alveo has none.
 void withHwCredentials(Map row, Closure body) {
   if (!row.credentialsId) {
     body.call()
@@ -199,9 +183,8 @@ void runHwTest(Map row, String testType) {
   }
 }
 
-// Env-setup script is board-kind-specific. Kept minimal on purpose: the
-// marker is passed in as an env var (not interpolated) so shell metachars in
-// a (malformed) marker value can't escape.
+// Marker is passed via env var (not interpolated) so shell metachars
+// in a malformed marker can't escape.
 void createTestScript(Map row, String testResultsFilename) {
   String setup = (row.setupScript == 'alveo')
       ? '. /opt/xilinx/xrt/setup.sh\n. ${VENV_ACTIVATE}'
@@ -220,16 +203,9 @@ String hwStashName(String testType, String board) {
   return "${testType}_${board}"
 }
 
-// iter-6: locate the most-recent <board>.zip for each HW board, falling back
-// across layouts in order:
-//   1. legacy fixed:  $ARTIFACT_DIR/<testType>/<board>.zip
-//   2. iter-5 sanity: $ARTIFACT_DIR/sanity_build_hardware/<board>.zip
-//   3. iter-5 full:   $ARTIFACT_DIR/bnn_*/<board>.zip  (per-shard dirs, newest wins)
-// The SW (finn_ci_speedup) pipeline writes per-shard directories
-// (bnn_u250_1, bnn_u250_2, ...) so the legacy fixed paths are empty after
-// iter-5 takes over. Globbing preserves HW pipeline compatibility without
-// requiring SW to also mirror zips into the legacy union paths. Returns ""
-// when no zip is found; caller logs and skips the HW shard for that board.
+// Find the newest <board>.zip across the legacy fixed path, the
+// sanity-build single-dir, and the per-shard full-build dirs. Returns ""
+// when no zip is found; caller logs and skips that HW shard.
 String findBoardZip(String testType, String board) {
   String legacy = "${env.ARTIFACT_DIR}/${testType}/${board}.zip"
   if (fileExists(legacy)) { return legacy }
@@ -251,21 +227,19 @@ void stashBuildArtifacts(String testType) {
     }
     String src = findBoardZip(testType, board)
     if (!src) {
-      echo "stashBuildArtifacts[${testType}]: no ${board}.zip found under ${env.ARTIFACT_DIR} (legacy ${testType}/ nor iter-5 per-shard layout); HW shard for ${board}/${testType} will skip"
+      echo "stashBuildArtifacts[${testType}]: no ${board}.zip found under ${env.ARTIFACT_DIR}; HW shard for ${board}/${testType} will skip"
       return
     }
     echo "stashBuildArtifacts[${testType}]: ${board} <- ${src}"
-    // Copy into workspace so `stash` (which is workspace-relative) can pick
-    // it up regardless of the absolute ARTIFACT_DIR path.
+    // stash is workspace-relative, so copy into workspace first.
     sh "cp '${src}' '${board}.zip'"
     stash name: "${testType}_${board}_zip", includes: "${board}.zip"
     sh "rm -f '${board}.zip'"
   }
 }
 
-// Derived from HW_SHARDS × HW_TEST_TYPES, filtered by onlineEnv so offline
-// boards don't appear in the expected-stash set (otherwise unstash would warn
-// on every build where a board is offline).
+// Filtered by onlineEnv so offline boards don't appear in the expected
+// stash set (avoids spurious unstash warnings).
 List<String> expectedStashes() {
   def stashes = []
   HW_TEST_TYPES.each { testType ->
@@ -278,8 +252,7 @@ List<String> expectedStashes() {
   return stashes
 }
 
-// Node-online probe used both for offline-agent gating and for selecting
-// which stashes to wait for in Check Stage Results.
+// Used for offline-agent gating and for filtering expectedStashes.
 def isNodeOnline(String labelName) {
   Label label = Jenkins.instance.getLabel(labelName)
   def agentOnline = false
@@ -305,9 +278,6 @@ def isNodeOnline(String labelName) {
 // Shared helpers — DUPLICATED from docker/jenkins/Jenkinsfile. Keep in sync.
 // --------------------------------------------------------------------------
 
-// Stash <stash>.xml + <stash>.html iff pytest produced them. The defensive
-// catchError ensures a stash hiccup cannot affect build status — the per-shard
-// catchError already determines pass/fail.
 void safeStashReport(String stashName, String fileBase) {
   catchError(buildResult: null, stageResult: null,
              message: "safeStashReport(${stashName}) failed; aggregation may be partial") {
@@ -319,8 +289,6 @@ void safeStashReport(String stashName, String fileBase) {
   }
 }
 
-// Swallows "stash does not exist" when a board was offline or a stage failed
-// before publishing, so aggregation still sees every stash that did publish.
 void unstashIfPresent(String stashName) {
   try {
     unstash stashName
@@ -329,9 +297,7 @@ void unstashIfPresent(String stashName) {
   }
 }
 
-// Order is load-bearing: junit FIRST (workspace-local, never flakes), then
-// the defensive merge + archive (agent->controller tar transfer can flake on
-// glob counts > ~10). Reversing this loses the test tree on transfer flake.
+// junit first (workspace-local, never flakes); merge + archive second.
 void aggregateReports() {
   sh 'mkdir -p reports'
   cleanPreviousBuildFiles('reports')

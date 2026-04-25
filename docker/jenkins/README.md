@@ -1,244 +1,135 @@
 # FINN Jenkins CI — maintainer guide
 
 Every parallel stage is defined by **one row** of `STAGES` in
-[`tests/ci_shards.py`](../../tests/ci_shards.py). That one Python list is
-the single source of truth: [`Jenkinsfile`](./Jenkinsfile) imports it at
-the Validate stage (via `python3 -c ... readJSON`) into `PARALLEL_SHARDS`,
-and [`tests/conftest.py`](../../tests/conftest.py) imports it for the
-`--which-shard` maintainer lookup. Actual test selection and shard
-splitting are done by the standard `-m <marker>` expression plus the tiny
-`--num-shards` / `--shard-id` plugin in `tests/conftest.py`. No state, no
-allowlists, no rebalancing script.
+[`tests/ci_shards.py`](../../tests/ci_shards.py). The
+[`Jenkinsfile`](./Jenkinsfile) loads that list at the Validate stage into
+`PARALLEL_SHARDS` (via `python3 -c ... readJSON`); the pytest plugin in
+[`tests/conftest.py`](../../tests/conftest.py) reads it for the
+`--which-shard` lookup. Test selection is the standard `-m <marker>`
+expression; shard splitting is the `--num-shards` / `--shard-id` plugin.
 
-The HW-tethered [`Jenkinsfile_HW`](./Jenkinsfile_HW) uses the same pattern
-with a parallel `HW_SHARDS` table for per-board shards.
+The HW-tethered [`Jenkinsfile_HW`](./Jenkinsfile_HW) follows the same
+pattern with a parallel `HW_SHARDS` table.
 
 ## Per-build host tmp (`ci_runs`) and rotation
 
-On `finn-build` agents, each run’s per-shard **host** build directory is not a
-flat `…/workspace/tmp/<stash>` path (which collided across builds and jobs).
-Instead the Jenkinsfile uses:
+On `finn-build` agents, each run uses a per-shard host build directory at:
 
 `$FINN_AGENT_NFS_ROOT/workspace/tmp/ci_runs/<jobKey>/<BUILD_NUMBER>/<stash>`
 
-- **`jobKey`:** `JOB_NAME` sanitised to one path segment (avoids collision
-  between e.g. `finn` and `finn_ci_speedup` at the same `BUILD_NUMBER`).
-- **Pytest / Jenkins** “stash” names (`fpgadataflow_1`, `end2end_2`, …) are
-  **unchanged**; only the bind-mount root on the host moved.
+`jobKey` is `JOB_NAME` sanitised to one path segment (so e.g. `finn` and
+`finn_ci_speedup` at the same `BUILD_NUMBER` cannot collide). Stash names
+are unchanged.
 
-**Rotation:** the Validate stage runs
-[`scripts/rotate_finn_ci_tmp.sh`](../../scripts/rotate_finn_ci_tmp.sh) once
-per build. It keeps the **largest N** numeric build directories under
-`…/ci_runs/<jobKey>/`, always keeps the **current** `BUILD_NUMBER`, and
-removes directories older than **M** days (except the current build). Tuning
-constants live in the Jenkinsfile: `FINN_CI_TMP_RETAIN_BUILDS` (default 5) and
-`FINN_CI_TMP_MAX_AGE_DAYS` (default 14). Pass `--dry-run` to the script to log
-what would be deleted.
-
-**Legacy:** pre-change flat paths `…/workspace/tmp/<stash>` are **not** removed
-by rotation; delete them with an out-of-band admin pass if they still hold
-space (see ops notes in the NFS migration continuation doc).
+The Validate stage runs
+[`scripts/rotate_finn_ci_tmp.sh`](../../scripts/rotate_finn_ci_tmp.sh)
+once per build. It keeps the largest N numeric build directories under
+`…/ci_runs/<jobKey>/`, always keeps the current `BUILD_NUMBER`, and
+removes directories older than M days. Tuning constants live at the top
+of `Jenkinsfile`: `FINN_CI_TMP_RETAIN_BUILDS` (default 5) and
+`FINN_CI_TMP_MAX_AGE_DAYS` (default 14). Pass `--dry-run` to the script
+to preview deletions.
 
 ## How do I …
 
 ### … add a new test?
 
 Decorate it with the existing marker (`@pytest.mark.fpgadataflow`,
-`@pytest.mark.end2end`, `@pytest.mark.bnn_u250`, …). That is the entire CI
-change. The next CI run deterministically hashes the new test's `nodeid`
-into one of the shards for that marker.
+`@pytest.mark.end2end`, `@pytest.mark.bnn_u250`, …). The next CI run picks
+it up automatically.
 
 ### … add a new BNN parameter value (e.g. a new `(wbits, abits)` combo)?
 
-Edit the lists in `tests/end2end/test_end2end_bnn_pynq.py` (the `_BNN_WBITS`
-/ `_BNN_ABITS` / `_BNN_TOPOLOGY` constants). Nothing else. The new parameter
-lands in some shard of the board's marker automatically.
+Edit the `_BNN_WBITS` / `_BNN_ABITS` / `_BNN_TOPOLOGY` constants in
+`tests/end2end/test_end2end_bnn_pynq.py`. Nothing else.
 
 ### … add a new BNN board?
 
-1. Add the marker (`bnn_<board>`) to `setup.cfg` under `[tool:pytest]` `markers`.
+1. Add the marker (`bnn_<board>`) to `setup.cfg` under `[tool:pytest]`.
 2. Add a line to `_BNN_MARKER_BY_BOARD` in
    `tests/end2end/test_end2end_bnn_pynq.py` and a matching entry in
    `test_board_map` (`src/finn/util/basic.py`).
-3. Add one row to `STAGES` in [`tests/ci_shards.py`](../../tests/ci_shards.py):
-   `{"param": "end2end", "stage": "BNN <board>", "marker": "bnn_<board>",
-   "shards": N, "workers": M, "distMode": "loadgroup",
-   "zipBoards": ["<board>"]}`. Rows are fully explicit (no expansion),
-   so this one edit is visible to Jenkins and to
-   `pytest --which-shard` without any derived lists.
-4. (HW pipeline only.) Adding a board is a **three-place edit** in
-   `Jenkinsfile_HW`:
-   a. Add a row to `HW_SHARDS` with `board`, `label`, `onlineEnv`,
-      `credentialsId`, `testType`, and `restartPrep` fields.
-   b. Add a matching arm to the static `isOnline(onlineEnvName)` `switch`
-      — `switch` is used (not dynamic `env.getProperty()`) to stay inside
-      the Groovy sandbox whitelist. A missing arm raises a clear runtime
-      `error`.
-   c. Add a matching static assignment in `refreshNodeOnlineFlags()`
-      (`env.<ONLINE_ENV> = isNodeOnline('<label>') ? 'true' : 'false'`).
-   There is no `validateShards` equivalent for `HW_SHARDS`; a missed edit
-   only fails at runtime when the board first comes online.
+3. Add one row to `STAGES` in
+   [`tests/ci_shards.py`](../../tests/ci_shards.py).
+4. (HW pipeline only.) In `Jenkinsfile_HW`:
+   - add a row to `HW_SHARDS` with `board`, `agentLabel`, `onlineEnv`,
+     `credentialsId`, `setupScript`, `marker`, `restartPrep`;
+   - add a matching arm to `isOnline(onlineEnvName)` (a static `switch`
+     so we stay inside the Groovy sandbox whitelist);
+   - add a matching `env.<ONLINE_ENV> = isNodeOnline(...)` line in
+     `refreshNodeOnlineFlags()`.
 
 ### … debug one stage without running the whole pipeline?
 
-Trigger a build with `STAGES=<substring>` set on the `Jenkinsfile` job.
-`eachActiveShard` skips rows whose stage name does not contain the
+Trigger a build with `STAGES=<substring>` set on the Jenkins job;
+`eachActiveShard` skips rows whose stage name doesn't contain the
 substring. Combine with the boolean params (`sanity` / `fpgadataflow` /
-`end2end`) as usual. Example: `STAGES='Sanity - Unit Tests'` to run only
-the sanity unit shard; `STAGES='BNN U250'` to run only the U250 row.
+`end2end`) as usual.
 
 ### … pin a flaky test to a specific shard?
 
-Decorate the test with `@pytest.mark.shard(N)` where `0 <= N < num_shards`
-for that marker. The sharding hook honours the pin instead of hashing. Use
-this for test isolation during debugging; remove once the flake is fixed so
-balanced hashing resumes.
+`@pytest.mark.shard(N)` pins a test (and its xdist_group siblings) to
+shard N. If the pinned test shares an `xdist_group` with siblings that
+hash elsewhere, pin every member explicitly to avoid splitting the
+chain.
 
-**Trap:** if the pinned test shares an `@pytest.mark.xdist_group(...)` with
-siblings that hash to a different shard, the chain splits and downstream
-`load_test_checkpoint_or_skip` calls silently skip. Either pin *every* test
-in the group to the same `N`, or only pin tests that are already in a
-singleton group (e.g. top-of-chain tests like `test_export`). The hook
-validates that `N` is in range, but cannot see `xdist_group` membership.
-
-### … preview a shard split before pushing a `shards:` bump?
-
-Run the pytest plugin in dry-run mode locally:
+### … preview a shard split before pushing?
 
 ```bash
 pytest --collect-only --num-shards 4 --dry-run-shards -m '<marker>'
 ```
 
-It prints a `shard | count | sample_nodeid` table and exits without
-running any tests.
-
-### … handle a test that got much slower?
-
-Check the per-shard timing summary at the top of `Check Stage Results` in
-the console log — `aggregateReports()` prints a
-`stash | id | wall_s | max_group_s | max_group` table and flags any shard
-exceeding 1.5x the family median. `reports/<stash>.timings.json` is also
-archived for offline analysis. If a whole marker's wall-clock grows out
-of budget, bump its `shards:` count in `PARALLEL_SHARDS`.
-
-### … read the timing JSON directly?
-
-Each shard emits `reports/<stash>.timings.json`:
-
-```json
-{
-  "stash": "fpgadataflow_1",
-  "shard": {"num": 2, "id": 0},
-  "wall_seconds": 1843.2,
-  "total_test_seconds": 7123.4,
-  "groups": [
-    {"name": "<xdist_group>", "count": 18, "seconds": 982.1},
-    ...
-  ]
-}
-```
+Prints `shard | items | groups | weight_s | sample_group` and exits.
 
 ### … find which stage and shard runs a given test?
 
-Run inside `./run-docker.sh`:
-
 ```bash
 pytest --collect-only --which-shard test_relu_elementwisemax
-pytest --collect-only --which-shard test_end2end_bnn_pynq
 ```
 
-This walks every row of `STAGES` in `tests/ci_shards.py`, reuses the
-canonical `_assign_groups_to_shards()` algorithm from `conftest.py`
-(i.e. the exact assignment the Jenkins shard will use), and prints one
-row per match:
+Walks every row of `STAGES`, reuses the canonical
+`_assign_groups_to_shards()` from `conftest.py`, and prints
+`stage | marker | shards | shard | stash | nodeid` rows. The `stash`
+column is the exact Jenkins stash name; pass it as `STAGES=<substring>`
+to re-run only that shard.
 
+## Calibrating shard balance
+
+Group → wall-seconds for the LPT-greedy bin packing in
+`_assign_groups_to_shards()` is checked in at
+[`tests/ci_timings.json`](../../tests/ci_timings.json). Regenerate after
+test set changes that materially shift wall-clock:
+
+```bash
+# pull *.timings.json artefacts from a recent green build, then:
+python3 scripts/regen_ci_timings.py path/to/reports/
 ```
-stage          marker      shards  shard  stash          nodeid
--------------  ---------- ------- ------  -------------  ------------------
-fpgadataflow   fpgadataflow  2       0      fpgadataflow_1  tests/.../test_x.py::...
-```
 
-The `stash` column is the exact Jenkins stash name — pass it as
-`STAGES=<substring>` to the Jenkinsfile job to run only that shard for
-debugging. The Jenkins console log also echoes
-`runPytest[<stash>]: FINN_CI_MARKER='<marker>'; python -m pytest …` at
-the start of every stage.
-
-No caching, no YAML, no extra tool — one pytest flag, reads the same
-source of truth the CI uses.
-
-### … verify a marker still has CI coverage?
-
-Any marker used in `PARALLEL_SHARDS` that collects **zero** tests will fail
-the stage loudly — the plugin raises `UsageError`. A silent-skip is
-impossible by construction. At pipeline start, `validateShards()` also
-checks every row's marker against `^[A-Za-z0-9_ ]+$` and fails fast if a
-marker could inject shell metacharacters.
-
-Note: iter-5 extends this guard to **unsharded rows** too (they run with
-`--num-shards=1 --shard-id=0` so timings are uniform). Markers that were
-legitimately empty in iter-4 used to exit 5 → 0 silently; they now hard-fail
-at collection. If you see a new "no tests collected for this marker"
-failure after iter-5, this is why.
-
-## Stage → param mapping
-
-Stages are gated by the job parameters `sanity`, `fpgadataflow`, `end2end`,
-and optionally filtered further by `STAGES` (substring match on stage
-name). The `Sanity - Build Hardware` row is suppressed when `end2end=true`
-because the BNN rows rebuild the same scenarios.
-
-## Pre-flight validation
-
-The first stage of every build is `Validate`, which runs
-`loadStageConfig()` (imports `STAGES` from `tests/ci_shards.py` into
-`PARALLEL_SHARDS` via `python3 -c` + `readJSON`) and then
-`validateShards()`:
-
-- `STAGES` imports cleanly (runtime check: the `python3 -c` invocation
-  non-zero-exits if `tests/ci_shards.py` has a syntax error or missing
-  key, which is how a broken row surfaces here rather than mid-pipeline).
-- Every `PARALLEL_SHARDS` row's `marker` matches `^[A-Za-z0-9_ ]+$`.
-- `shards` is a positive integer.
-- `PARALLEL_SHARDS` is non-empty (catches the mistake of calling
-  `validateShards()` without `loadStageConfig()` first).
-- The total active shard count across all enabled params doesn't exceed
-  the `finn-build` label's total executors — UNSTABLE (not FAILURE) if
-  over-budget, since CI queues correctly either way but wall-clock will
-  extend silently.
-
-Per-row marker regex violations are a hard `error`; over-budget is
-`unstable`. Fix by tightening the marker expression or reducing `shards:`
-values.
+`Check Stage Results` runs
+[`scripts/summarize_ci_timings.py`](../../scripts/summarize_ci_timings.py)
+on every build; shards that exceed 1.5x their family's median wall-clock
+are flagged loudly so it's obvious when the file is stale. Bumping
+`shards:` in `tests/ci_shards.py` is still valid for permanent capacity
+changes.
 
 ## Artefacts
 
 - `reports/*.xml`, `reports/*.html` (merged via `pytest_html_merger`)
-- `reports/<stash>.timings.json` per shard (per-group wall-clock)
+- `reports/<stash>.timings.json` per shard
 - `coverage_<stash>/` per row with `coverage: true`
-- `<Board>.zip` per row with `zipBoards: [...]`.
-  `assertZipBoardsEmitted()` in `aggregateReports()` verifies at least one
-  of the expected zips exists per active row and emits `UNSTABLE` with a
-  clear diagnostic if a row's bitstream-producing scenario was not
-  executed (e.g. hash-sharding happened to skip the cnv-w2a2 scenario on
-  every shard).
+- `<Board>.zip` per row with `zipBoards: [...]`. `assertZipBoardsEmitted`
+  flags the row UNSTABLE if no shard produced the expected zip.
 
 ## HW pipeline
 
-[`Jenkinsfile_HW`](./Jenkinsfile_HW) runs the board-tethered tests. It is
-structured around `HW_SHARDS` (one row per board) and `HW_TEST_TYPES`
-(`bnn_build_sanity` + `bnn_build_full`). Offline boards are gated at stage
-entry via the `isNodeOnline(label)` helper called in
-`refreshNodeOnlineFlags()` — the pipeline never enters `node(offlineLabel)`
-so offline boards cannot hang the build.
+[`Jenkinsfile_HW`](./Jenkinsfile_HW) runs the board-tethered tests. It
+is structured around `HW_SHARDS` (one row per board) and
+`HW_TEST_TYPES` (`bnn_build_sanity` + `bnn_build_full`). Offline boards
+are gated by `isNodeOnline(label)` so the pipeline never enters
+`node(offlineLabel)`.
 
-HW aggregation uses the same `aggregateReports()` helper shape as the
-main `Jenkinsfile` (junit FIRST, then defensive `archiveArtifacts`). The
-helpers (`safeStashReport`, `aggregateReports`, `cleanPreviousBuildFiles`,
-`unstashIfPresent`) are **duplicated** verbatim between the two files —
-Jenkins shared libraries are not available in this repo. A `// keep in
-sync` comment at the top of each duplicated block flags this.
-
-Changes to iter-5's `Jenkinsfile` (SW CI) are validated by
-`finn_ci_speedup #17`; changes to `Jenkinsfile_HW` require a separate
-`finn-hw` build with at least one board online.
+The shared helpers (`safeStashReport`, `unstashIfPresent`,
+`aggregateReports`, `cleanPreviousBuildFiles`) are duplicated between
+`Jenkinsfile` and `Jenkinsfile_HW` because Jenkins shared libraries are
+not available in this repo. A `// keep in sync` comment marks the
+duplicated block.
