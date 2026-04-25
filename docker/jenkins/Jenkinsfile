@@ -204,9 +204,13 @@ void withAgentNfsEnv(Closure body) {
   if (!agentNfsRoot) {
     error "FINN_AGENT_NFS_ROOT is unset on ${env.NODE_NAME}; add it to env_vars in jenkins_slaves.yml for this agent."
   }
+  // Per-agent torch.hub / huggingface cache so the brevitas mobilenet .pth and
+  // similar weights survive container restarts; pre-empts GitHub-Releases /
+  // CDN flakes turning into pytest.skip cascades downstream.
   withEnv([
     "FINN_HOST_BUILD_DIR=${agentNfsRoot}/workspace/tmp",
     "FINN_XRT_PATH=${agentNfsRoot}/caches/xrt",
+    "FINN_DOCKER_CACHE_DIR=${agentNfsRoot}/caches/finn_cache",
     "FINN_DOCKER_EXTRA=${env.FINN_DOCKER_EXTRA ?: ''} " +
       "-v ${agentNfsRoot}/caches/vivado_ip_cache:/tmp/vivado_ip_cache " +
       "--hostname ${env.NODE_NAME}",

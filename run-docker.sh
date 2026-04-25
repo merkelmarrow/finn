@@ -244,7 +244,8 @@ DOCKER_EXEC+="-e XILINX_LOCAL_USER_DATA=no "
 # parallel CI runs. Mount is /finn_cache (NOT under $HOME — Docker creates
 # bind parents as root, which would break pip install --user).
 : ${FINN_DOCKER_CACHE_DIR=""}
-if [ -n "$FINN_DOCKER_CACHE_DIR" ] && [ -d "$FINN_DOCKER_CACHE_DIR" ]; then
+if [ -n "$FINN_DOCKER_CACHE_DIR" ]; then
+  mkdir -p "$FINN_DOCKER_CACHE_DIR/torch" "$FINN_DOCKER_CACHE_DIR/huggingface"
   DOCKER_EXEC+="-v $FINN_DOCKER_CACHE_DIR:/finn_cache "
   DOCKER_EXEC+="-e TORCH_HOME=/finn_cache/torch "
   DOCKER_EXEC+="-e HF_HOME=/finn_cache/huggingface "
