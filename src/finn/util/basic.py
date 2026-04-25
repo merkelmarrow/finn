@@ -164,7 +164,21 @@ def make_build_dir(prefix=""):
 
 
 def robust_rmtree(path, retries=6, initial_delay=0.1, backoff=2.0):
-    """Remove a directory tree, retrying transient NFS ``ENOTEMPTY`` races."""
+    """Remove a directory tree, retrying transient NFS ``ENOTEMPTY`` races.
+
+    NOTE: This helper only retries transient ``ENOTEMPTY`` races caused by
+    *external* filesystem activity (e.g. NFS server-side directory listing
+    lag). It deliberately does NOT retry on ``EBUSY`` against ``.nfsXXXX``
+    "silly-rename" files, because those indicate that the *current* Python
+    process still holds an open file descriptor on a file inside ``path``.
+    Sleeping cannot release a fd held by the same live process, so a retry
+    here would just delay the eventual failure.
+
+    If you see ``EBUSY`` on a ``.nfsXXXX`` filename, fix the file-descriptor
+    leak in the caller (close all file handles, ``logging.FileHandler``s,
+    subprocesses, etc. on objects inside ``path`` BEFORE calling
+    :func:`robust_rmtree` or :func:`shutil.rmtree`).
+    """
 
     if not path or not os.path.exists(path):
         return

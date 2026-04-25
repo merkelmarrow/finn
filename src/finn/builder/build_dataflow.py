@@ -152,54 +152,70 @@ def build_dataflow_cfg(model_filename, cfg: DataflowBuildConfig):
     # Add the file handler (only file output, no console output)
     log.addHandler(log_file_handler)
 
-    stdout_logger = StreamToLogger(log, logging.INFO)
-    stderr_logger = StreamToLogger(log, logging.ERROR)
-    stdout_orig = sys.stdout
-    stderr_orig = sys.stderr
-    for transform_step in build_dataflow_steps:
-        try:
-            step_name = transform_step.__name__
-            print("Running step: %s [%d/%d]" % (step_name, step_num, len(build_dataflow_steps)))
-            # redirect output to logfile
-            if not cfg.verbose:
-                sys.stdout = stdout_logger
-                sys.stderr = stderr_logger
-                # also log current step name to logfile
-                print("Running step: %s [%d/%d]" % (step_name, step_num, len(build_dataflow_steps)))
-            # run the step
-            step_start = time.time()
-            model = transform_step(model, cfg)
-            step_end = time.time()
-            # restore stdout/stderr
-            sys.stdout = stdout_orig
-            sys.stderr = stderr_orig
-            time_per_step[step_name] = step_end - step_start
-            chkpt_name = "%s.onnx" % (step_name)
-            if cfg.save_intermediate_models:
-                intermediate_model_dir = cfg.output_dir + "/intermediate_models"
-                if not os.path.exists(intermediate_model_dir):
-                    os.makedirs(intermediate_model_dir)
-                model.save("%s/%s" % (intermediate_model_dir, chkpt_name))
-            step_num += 1
-        except:  # noqa
-            # restore stdout/stderr
-            sys.stdout = stdout_orig
-            sys.stderr = stderr_orig
-            # print exception info and traceback
-            extype, value, tb = sys.exc_info()
-            traceback.print_exc()
-            # start postmortem debug if configured
-            if cfg.enable_build_pdb_debug:
-                pdb.post_mortem(tb)
-            else:
-                print("enable_build_pdb_debug not set in build config, exiting...")
-            print("Build failed")
-            return -1
+    # IMPORTANT: log_file_handler holds an open file descriptor on
+    # <output_dir>/build_dataflow.log via a strong reference from the
+    # module-level "build_dataflow" logger. If we leak it, callers that
+    # subsequently do shutil.rmtree(<output_dir>) on NFS hit silly-rename
+    # (.nfsXXXX) followed by EBUSY on cleanup, because the same Python
+    # process still holds the fd. Always remove and close in a finally
+    # block so the fd is released before the function returns.
+    try:
+        stdout_logger = StreamToLogger(log, logging.INFO)
+        stderr_logger = StreamToLogger(log, logging.ERROR)
+        stdout_orig = sys.stdout
+        stderr_orig = sys.stderr
+        for transform_step in build_dataflow_steps:
+            try:
+                step_name = transform_step.__name__
+                print(
+                    "Running step: %s [%d/%d]" % (step_name, step_num, len(build_dataflow_steps))
+                )
+                # redirect output to logfile
+                if not cfg.verbose:
+                    sys.stdout = stdout_logger
+                    sys.stderr = stderr_logger
+                    # also log current step name to logfile
+                    print(
+                        "Running step: %s [%d/%d]"
+                        % (step_name, step_num, len(build_dataflow_steps))
+                    )
+                # run the step
+                step_start = time.time()
+                model = transform_step(model, cfg)
+                step_end = time.time()
+                # restore stdout/stderr
+                sys.stdout = stdout_orig
+                sys.stderr = stderr_orig
+                time_per_step[step_name] = step_end - step_start
+                chkpt_name = "%s.onnx" % (step_name)
+                if cfg.save_intermediate_models:
+                    intermediate_model_dir = cfg.output_dir + "/intermediate_models"
+                    if not os.path.exists(intermediate_model_dir):
+                        os.makedirs(intermediate_model_dir)
+                    model.save("%s/%s" % (intermediate_model_dir, chkpt_name))
+                step_num += 1
+            except:  # noqa
+                # restore stdout/stderr
+                sys.stdout = stdout_orig
+                sys.stderr = stderr_orig
+                # print exception info and traceback
+                extype, value, tb = sys.exc_info()
+                traceback.print_exc()
+                # start postmortem debug if configured
+                if cfg.enable_build_pdb_debug:
+                    pdb.post_mortem(tb)
+                else:
+                    print("enable_build_pdb_debug not set in build config, exiting...")
+                print("Build failed")
+                return -1
 
-    with open(cfg.output_dir + "/time_per_step.json", "w") as f:
-        json.dump(time_per_step, f, indent=2)
-    print("Completed successfully")
-    return 0
+        with open(cfg.output_dir + "/time_per_step.json", "w") as f:
+            json.dump(time_per_step, f, indent=2)
+        print("Completed successfully")
+        return 0
+    finally:
+        log.removeHandler(log_file_handler)
+        log_file_handler.close()
 
 
 def build_dataflow_directory(path_to_cfg_dir: str):
