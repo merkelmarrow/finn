@@ -89,8 +89,12 @@ def export_model_to_qonnx(input_size=10, hidden_size=20, num_layers=4, output_si
     model(x)  # Initialise scale factors
     model.eval()
 
-    # Export the model to ONNX format
-    onnx_path = os.environ["FINN_BUILD_DIR"] + f"/simple_module_{num_layers}layers.onnx"
+    # Filename includes input_size so xdist workers running different
+    # parametrizations of the same test do not collide on this path.
+    onnx_path = (
+        os.environ["FINN_BUILD_DIR"]
+        + f"/simple_module_{num_layers}layers_{input_size}in.onnx"
+    )
     with torch.no_grad():
         bo.export_qonnx(
             model,
