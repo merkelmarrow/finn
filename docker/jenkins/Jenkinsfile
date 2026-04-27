@@ -1,5 +1,5 @@
-// Stage config lives in tests/ci_shards.py and is loaded into PARALLEL_SHARDS
-// at the Validate stage. See docker/jenkins/README.md.
+// Shard config in tests/ci_shards.py is the single source of truth shared
+// with pytest. See docker/jenkins/README.md.
 
 import groovy.transform.Field
 
@@ -24,7 +24,7 @@ void loadStageConfig() {
   PARALLEL_SHARDS = readJSON(text: json).collect { it as Map }
 }
 
-// Marker is interpolated into a shell command, so reject anything that could escape.
+// Marker is interpolated into a shell command, so reject anything that could escape it.
 @Field
 java.util.regex.Pattern MARKER_SAFE_PATTERN = ~/^[A-Za-z0-9_ ]+$/
 
@@ -41,8 +41,8 @@ pipeline {
            description: 'Substring filter on stage name (empty = all). Use to run one row for debugging.')
   }
   stages {
-    // Every finn-build stage wraps its body in withAgentNfsEnv so paths
-    // resolve off FINN_AGENT_NFS_ROOT (per-agent env_vars in jenkins_slaves.yml).
+    // Funnel per-agent config through withAgentNfsEnv so adding a finn-build
+    // host is a jenkins_slaves.yml edit only, never a Jenkinsfile edit.
     stage('Validate') {
       agent { label 'finn-build' }
       steps { script { withAgentNfsEnv { loadStageConfig(); validateShards(); rotateFinnCiBuildTmp() } } }
@@ -62,7 +62,7 @@ pipeline {
   }
 }
 
-// `params` is an UnmodifiableMap, so use Map.get (sandbox-safe) not getProperty.
+// params is an UnmodifiableMap, so use Map.get (sandbox-safe) not getProperty.
 boolean paramBool(String name) {
   def v = params.get(name)
   if (v == null) { return false }
@@ -75,7 +75,8 @@ String paramString(String name) {
   return v == null ? '' : v.toString()
 }
 
-// Marker violations are hard errors. Over-subscribing executors is UNSTABLE.
+// Marker violations are hard errors. Over-subscribing executors only warns
+// because queueing is recoverable, just slow.
 void validateShards() {
   if (!PARALLEL_SHARDS) {
     error "PARALLEL_SHARDS is empty; loadStageConfig() must run before validateShards()"
@@ -111,15 +112,15 @@ void buildAndPublishDockerImage() {
   }
 }
 
-// Publish to FINN_DOCKER_SHARED_DIR so other agents `docker load` instead
-// of rebuilding. Tag must match run-docker.sh.
+// Other agents docker load from FINN_DOCKER_SHARED_DIR instead of rebuilding.
+// Tag must match run-docker.sh.
 void publishSharedDockerImage(String sharedDir) {
   def tag = sh(returnStdout: true, script:
       'echo "xilinx/finn:$(git describe --always --tags --dirty).${XRT_DEB_VERSION:-xrt_202220.2.14.354_22.04-amd64-xrt}"'
   ).trim()
   sh "mkdir -p ${sharedDir}"
   sh "echo '${tag}' > ${sharedDir}/finn-docker-tag.txt"
-  // bash needed for `set -o pipefail` -- Jenkins defaults sh to dash.
+  // bash for set -o pipefail because Jenkins defaults sh to dash.
   sh """#!/bin/bash
 set -o pipefail
 if command -v pigz >/dev/null 2>&1; then
@@ -130,8 +131,6 @@ fi
 """
 }
 
-// Expand PARALLEL_SHARDS into stage -> closure pairs honouring param gates
-// and the STAGES substring filter.
 Map<String, Closure> buildParallelStageMap() {
   def branches = [:]
   eachActiveShard { row, id ->
@@ -149,8 +148,8 @@ void eachActiveShard(Closure body) {
     if (!paramBool(row.param as String)) { continue }
     if (row.skipWhen && paramBool(row.skipWhen as String)) { continue }
     int numShards = row.shards as int
-    // C-style for-loop: groovy.lang.IntRange is not Serializable and breaks
-    // CPS persistence when it survives into `parallel(...)`.
+    // C-style for-loop because groovy.lang.IntRange is not Serializable and
+    // breaks CPS persistence when it survives into parallel(...).
     for (int id = 0; id < numShards; id++) {
       String stage = shardStageName(row, id)
       if (filter && !stage.contains(filter)) { continue }
@@ -168,21 +167,28 @@ String shardStashName(Map row, int id) {
   return row.shards == 1 ? base : "${base}_${id + 1}"
 }
 
-// jobKey segment under ci_runs/ avoids collisions between jobs sharing
-// build numbers on the same host.
+// jobKey under ci_runs/ keeps two jobs that happen to share a build number
+// on the same host from colliding.
 String finnCiJobKey() {
   String jn = env.JOB_NAME ?: 'job'
   return jn.replaceAll('[^A-Za-z0-9._-]+', '_')
 }
 
+// Build trees are keyed on job/build so concurrent runs do not stomp on each
+// other. The shared NFS root makes them visible across agents when set,
+// otherwise the path is workspace-local but still build-keyed.
 String finnCiPerBuildRoot() {
-  String r = env.FINN_AGENT_NFS_ROOT
-  if (!r) { error "FINN_AGENT_NFS_ROOT is unset on ${env.NODE_NAME} (expected from agent env_vars)" }
   if (!env.BUILD_NUMBER) { error "BUILD_NUMBER is unset" }
-  return "${r}/workspace/tmp/ci_runs/${finnCiJobKey()}/${env.BUILD_NUMBER}"
+  String r = env.FINN_AGENT_NFS_ROOT
+  if (r) {
+    return "${r}/workspace/tmp/ci_runs/${finnCiJobKey()}/${env.BUILD_NUMBER}"
+  }
+  String ws = env.WORKSPACE
+  if (!ws) { error "WORKSPACE is unset; cannot derive a build root without FINN_AGENT_NFS_ROOT" }
+  return "${ws}/tmp/ci_runs/${env.BUILD_NUMBER}"
 }
 
-// Prune old per-build trees once per Validate stage.
+// Bound disk usage on the shared NFS root once per build. No-op when local.
 void rotateFinnCiBuildTmp() {
   String root = env.FINN_AGENT_NFS_ROOT
   if (!root) { return }
@@ -195,18 +201,16 @@ void rotateFinnCiBuildTmp() {
   """
 }
 
-// Resolve agent-local paths off FINN_AGENT_NFS_ROOT (per-agent env_vars in
-// jenkins_slaves.yml) so adding a finn-build host is a slaves.yml edit only.
-// Must run after node binding -- ${NODE_NAME} is resolved in Groovy because
-// run-docker.sh does not re-expand vars stored inside FINN_DOCKER_EXTRA.
+// Must run after node binding because ${NODE_NAME} resolves in Groovy and
+// run-docker.sh does not re-expand vars embedded in FINN_DOCKER_EXTRA. When
+// FINN_AGENT_NFS_ROOT is unset, the helper is a no-op and shards run
+// workspace-local without shared caches or hostname pinning.
 void withAgentNfsEnv(Closure body) {
   String agentNfsRoot = env.FINN_AGENT_NFS_ROOT
   if (!agentNfsRoot) {
-    error "FINN_AGENT_NFS_ROOT is unset on ${env.NODE_NAME}; add it to env_vars in jenkins_slaves.yml for this agent."
+    body()
+    return
   }
-  // Per-agent torch.hub / huggingface cache so the brevitas mobilenet .pth and
-  // similar weights survive container restarts. Pre-empts GitHub-Releases /
-  // CDN flakes turning into pytest.skip cascades downstream.
   withEnv([
     "FINN_HOST_BUILD_DIR=${agentNfsRoot}/workspace/tmp",
     "FINN_XRT_PATH=${agentNfsRoot}/caches/xrt",
@@ -217,8 +221,7 @@ void withAgentNfsEnv(Closure body) {
   ]) { body() }
 }
 
-// One body for every parallel shard. The `finally` is load-bearing so
-// failed stages still publish their JUnit XML via safeStashReport.
+// finally is load-bearing so failed stages still publish their JUnit XML.
 void runShard(Map row, int shardIdx, String stageName, String stashName) {
   node('finn-build') {
     withAgentNfsEnv {
@@ -262,7 +265,6 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
   }
 }
 
-// Stash whichever of <stash>.{xml,html,timings.json,stagemap} pytest produced.
 // catchError keeps a stash hiccup from masking pytest's own pass/fail.
 void safeStashReport(String stashName) {
   catchError(buildResult: null, stageResult: null,
@@ -273,7 +275,7 @@ void safeStashReport(String stashName) {
   }
 }
 
-// Swallows "stash does not exist" so aggregation still sees the rest.
+// Swallowing the missing-stash exception lets aggregation still see the rest.
 void unstashIfPresent(String stashName) {
   try {
     unstash stashName
@@ -289,8 +291,9 @@ void archiveStageFolder(String folder) {
   }
 }
 
-// junit first (workspace-local, never flakes), then merge + archive --
-// agent->controller tar transfer can flake on large globs.
+// junit first because it is workspace-local and never flakes. The merge and
+// archive steps come after because agent-to-controller tar transfer can
+// flake on large globs and we still want JUnit reported.
 void aggregateReports() {
   sh 'mkdir -p reports'
   cleanPreviousBuildFiles('reports')
@@ -333,7 +336,7 @@ void publishStageMap() {
   }
 }
 
-// Per-shard wall-clock summary -- warns when a shard exceeds 1.5x family median.
+// Warns when a shard exceeds 1.5x its family median wall clock.
 void echoShardTimings() {
   catchError(buildResult: null, stageResult: null,
              message: 'echoShardTimings failed; non-fatal') {
@@ -342,7 +345,7 @@ void echoShardTimings() {
   }
 }
 
-// UNSTABLE if a row declared zipBoards but no shard produced the bitstream zip.
+// Catches the case where a row declared zipBoards but no shard wrote the zip.
 void assertZipBoardsEmitted() {
   catchError(buildResult: null, stageResult: null,
              message: 'assertZipBoardsEmitted failed; non-fatal') {
@@ -364,7 +367,7 @@ void assertZipBoardsEmitted() {
   }
 }
 
-// Derived from PARALLEL_SHARDS so a new row is auto-included in aggregation.
+// Derived from PARALLEL_SHARDS so adding a new row auto-includes it here.
 List<String> expectedStashes() {
   def stashes = []
   eachActiveShard { row, id -> stashes << shardStashName(row, id) }
@@ -372,8 +375,8 @@ List<String> expectedStashes() {
 }
 
 // Pre-create buildDir as the unprivileged user. Otherwise docker's -v mount
-// auto-creates the bind parent as root:root and the in-container user can't
-// write to it. Hard-fail on root-owned residue (operator must `sudo rm -rf`).
+// auto-creates the bind parent as root:root and the in-container user cannot
+// write to it. Hard-fail on root-owned residue so an operator can sudo rm it.
 void cleanPreviousBuildFiles(String buildDir) {
   if (!buildDir || buildDir.empty) { return }
   sh """
@@ -387,13 +390,12 @@ void cleanPreviousBuildFiles(String buildDir) {
   """
 }
 
-// Fail the shard fast if scratch is below threshold rather than letting
-// pytest hit ENOSPC mid-run.
+// Fail fast on low scratch space so pytest does not hit ENOSPC mid-run.
 void checkAgentFreeSpace(int minFreeGB) {
   if (minFreeGB <= 0) { return }
   String target = env.FINN_HOST_BUILD_DIR ?: '/scratch'
-  // Climb to the nearest existing ancestor: the shard's own dir is not yet
-  // mkdir'd, and df on a missing path returns empty.
+  // Climb to the nearest existing ancestor because df on a missing path
+  // returns empty and the shard's own dir is not yet mkdir'd.
   def raw = sh(returnStdout: true, script: """
 d='${target}'
 while [ ! -d "\$d" ] && [ "\$d" != '/' ]; do d=\$(dirname "\$d"); done
@@ -410,10 +412,10 @@ df -BG "\$d" | awk 'NR==2 {print \$4}' | tr -d 'G'
   }
 }
 
-// Marker is passed via env var (not interpolated) so a malformed marker
-// can't escape into the shell. The wrapper script avoids run-docker.sh
-// re-tokenising the `-m "..."` argv. Exit 5 ("no tests collected") is
-// treated as success because the conftest plugin already loud-fails it.
+// Marker travels via env var so a malformed value cannot escape into the
+// shell, and the wrapper script keeps run-docker.sh from re-tokenising the
+// -m "..." argv. Exit 5 (no tests collected) maps to success because the
+// conftest plugin already loud-fails empty collection separately.
 void runPytest(Map opts) {
   def parts = ["python -m pytest -m \"\$FINN_CI_MARKER\""]
   if (opts.workers) {
@@ -432,9 +434,9 @@ void runPytest(Map opts) {
   sh './run-docker.sh ./run-tests.sh'
 }
 
-// Silent no-op if the board's hw_deployment_* dir is absent: under hash
-// sharding only one shard runs cnv-w2a2, and assertZipBoardsEmitted
-// catches the case where no shard produced it.
+// Silent no-op when the board's hw_deployment_* dir is absent because under
+// hash sharding only one shard runs cnv-w2a2. assertZipBoardsEmitted is the
+// safety net for the case where no shard produced it at all.
 void findCopyZip(String board, String findDir, String copyDir) {
   if (!fileExists("${findDir}")) { return }
   def found = sh(returnStdout: true, script:
@@ -442,7 +444,7 @@ void findCopyZip(String board, String findDir, String copyDir) {
   ).trim()
   if (!found) { return }
   // Reused workspaces can leave a stale ${copyDir}/${board} from an earlier
-  // build with read-only .git/objects/pack/ that blocks both rm and cp -r.
+  // build whose read-only .git/objects/pack/ blocks both rm and cp -r.
   sh """
     mkdir -p '${copyDir}'
     if [ -e '${copyDir}/${board}' ]; then
