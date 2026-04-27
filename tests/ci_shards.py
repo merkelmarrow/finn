@@ -16,8 +16,8 @@ Schema (only ``param``/``stage``/``marker``/``shards``/``workers`` required):
                 (interpolated into the pytest -m shell argument)
     shards    : int >= 1, conftest sharding split
     workers   : int >= 1, pytest-xdist ``-n`` count per shard
-    skipWhen  : optional other param; row skipped when both are true
-    coverage  : optional bool; enables coverage reporting
+    skipWhen  : optional other param -- row skipped when both are true
+    coverage  : optional bool toggling coverage reporting
     distMode  : optional xdist dist mode (e.g. "loadgroup")
     zipBoards : optional list of boards driving ``assertZipBoardsEmitted``
 """
@@ -35,7 +35,7 @@ STAGES = [
     {"param": "fpgadataflow", "stage": "fpgadataflow",
      "marker": "fpgadataflow",
      "shards": 2, "workers": 8, "coverage": True},
-    # end2end has 3 xdist_groups (cybsec, ext_weights, mobilenet);
+    # end2end has 3 xdist_groups (cybsec, ext_weights, mobilenet) and
     # shards=3 lets conftest isolate mobilenet on its own shard.
     {"param": "end2end", "stage": "End2end",
      "marker": "end2end",

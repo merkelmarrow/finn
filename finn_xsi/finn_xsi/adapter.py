@@ -94,7 +94,7 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
         "floating_point_v7_0_26",
     ]
 
-    # direct binary invocation; PATH shims are not visible here, hence the env override
+    # direct binary invocation, so PATH shims are not visible here -- hence the env override
     cmd_xelab = [
         os.environ.get("FINN_XELAB_OVERRIDE", "xelab"),
         "work." + top_module_name,

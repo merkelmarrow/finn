@@ -27,8 +27,8 @@
 
 """Sharding and timing-observability plugin for FINN CI.
 
-Each Jenkins stage runs ``pytest -m <marker> --num-shards N --shard-id I``;
-this module deterministically assigns groups to shards using checked-in
+Each Jenkins stage runs ``pytest -m <marker> --num-shards N --shard-id I``.
+This module deterministically assigns groups to shards using checked-in
 per-group seconds from ``tests/ci_timings.json`` (LPT-greedy bin packing,
 falls back to round-robin when the file is absent or has no signal).
 
@@ -116,6 +116,18 @@ def _load_group_weights():
     return {str(k): float(v) for k, v in weights.items() if v}
 
 
+def _weights_with_fallback():
+    """Return ``(weights_table, fallback)`` so callers don't recompute the median.
+
+    Fallback is the median of recorded weights (``1.0`` if the file is absent
+    or has no positive entries) and is used for groups not yet timed.
+    """
+    weights_table = _load_group_weights()
+    known = sorted(w for w in weights_table.values() if w > 0)
+    fallback = known[len(known) // 2] if known else 1.0
+    return weights_table, fallback
+
+
 def _assign_groups_to_shards(groups, num_shards):
     """Map ``{group_key: [items]}`` to ``{group_key: shard_id}``.
 
@@ -139,9 +151,7 @@ def _assign_groups_to_shards(groups, num_shards):
         for key in groups:
             assignment.setdefault(key, 0)
         return assignment
-    weights_table = _load_group_weights()
-    known = [w for w in weights_table.values() if w > 0]
-    fallback = sorted(known)[len(known) // 2] if known else 1.0
+    weights_table, fallback = _weights_with_fallback()
     unpinned = [k for k in groups if k not in assignment]
     unpinned.sort(key=lambda k: (-weights_table.get(k, fallback), k))
     shard_load = [0.0] * num_shards
@@ -229,9 +239,7 @@ def pytest_collection_modifyitems(config, items):
     assignment = _assign_groups_to_shards(groups, num_shards)
 
     if dry_run:
-        weights_table = _load_group_weights()
-        known = [w for w in weights_table.values() if w > 0]
-        fallback = sorted(known)[len(known) // 2] if known else 1.0
+        weights_table, fallback = _weights_with_fallback()
         per_shard = {i: {"items": 0, "groups": [], "seconds": 0.0}
                      for i in range(num_shards)}
         for key, members in groups.items():
@@ -268,7 +276,7 @@ def pytest_collection_modifyitems(config, items):
 # junit XML when --num-shards is set, so aggregation can flag outliers
 # and operators can regenerate ci_timings.json from a recent run.
 
-# Set on the controller in pytest_sessionstart; left None on xdist workers
+# Set on the controller in pytest_sessionstart, left None on xdist workers
 # so log-reports don't double-count.
 _TIMINGS = None
 
@@ -308,7 +316,7 @@ def pytest_collection_finish(session):
 def pytest_runtest_logreport(report):
     if _TIMINGS is None:
         return
-    # Accumulate setup+call+teardown per nodeid; xdist forwards worker
+    # Accumulate setup+call+teardown per nodeid. xdist forwards worker
     # reports here so summing covers the full session.
     duration = float(getattr(report, "duration", 0.0) or 0.0)
     _TIMINGS["per_test_seconds"][report.nodeid] = (

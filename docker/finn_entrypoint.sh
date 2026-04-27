@@ -58,8 +58,8 @@ recho () {
   echo -e "${RED}ERROR: $1${NC}"
 }
 
-# qonnx pyproject.toml workaround for https://github.com/pypa/pip/issues/7953;
-# trap restores the file if pip install aborts under `set -e`.
+# qonnx pyproject.toml workaround for https://github.com/pypa/pip/issues/7953.
+# Trap restores the file if pip install aborts under `set -e`.
 mv ${FINN_ROOT}/deps/qonnx/pyproject.toml ${FINN_ROOT}/deps/qonnx/pyproject.tmp
 trap 'mv ${FINN_ROOT}/deps/qonnx/pyproject.tmp ${FINN_ROOT}/deps/qonnx/pyproject.toml 2>/dev/null || true' EXIT
 pip install --user -e ${FINN_ROOT}/deps/qonnx

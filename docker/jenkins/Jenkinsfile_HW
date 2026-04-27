@@ -10,17 +10,22 @@ import groovy.transform.Field
 @Field
 List<Map> HW_SHARDS = [
     [board: 'U250',      agentLabel: 'finn-u250',  credentialsId: null,
-     restartPrep: false, setupScript: 'alveo',  marker: 'U250',      onlineEnv: 'ALVEO_HOST_ONLINE'],
+     restartPrep: false, setupScript: 'alveo',  marker: 'U250'],
     [board: 'Pynq-Z1',   agentLabel: 'finn-pynq',  credentialsId: 'pynq-z1-credentials',
-     restartPrep: true,  setupScript: 'pynq',   marker: 'Pynq',      onlineEnv: 'PYNQ_ONLINE'],
+     restartPrep: true,  setupScript: 'pynq',   marker: 'Pynq'],
     [board: 'ZCU104',    agentLabel: 'finn-zcu104', credentialsId: 'pynq-z1-credentials',
-     restartPrep: true,  setupScript: 'pynq',   marker: 'ZCU104',    onlineEnv: 'ZCU104_ONLINE'],
+     restartPrep: true,  setupScript: 'pynq',   marker: 'ZCU104'],
     [board: 'KV260_SOM', agentLabel: 'finn-kv260', credentialsId: 'user-ubuntu-credentials',
-     restartPrep: true,  setupScript: 'pynq',   marker: 'KV260_SOM', onlineEnv: 'KV260_ONLINE'],
+     restartPrep: true,  setupScript: 'pynq',   marker: 'KV260_SOM'],
 ]
 
 @Field
 List<String> HW_TEST_TYPES = ['bnn_build_sanity', 'bnn_build_full']
+
+// Populated by refreshNodeOnlineFlags() and read by isOnline(). Keyed by
+// agentLabel so HW_SHARDS rows are the single source of truth.
+@Field
+Map<String, Boolean> NODE_ONLINE = [:]
 
 pipeline {
   agent none
@@ -56,29 +61,19 @@ pipeline {
   }
 }
 
-// Static env.X = writes only; dynamic env.setProperty(k, v) trips the
-// Groovy sandbox, so the four assignments are spelled out by hand.
 void refreshNodeOnlineFlags() {
-  env.ALVEO_HOST_ONLINE = isNodeOnline('finn-u250')  ? 'true' : 'false'
-  env.PYNQ_ONLINE       = isNodeOnline('finn-pynq')  ? 'true' : 'false'
-  env.ZCU104_ONLINE     = isNodeOnline('finn-zcu104') ? 'true' : 'false'
-  env.KV260_ONLINE      = isNodeOnline('finn-kv260') ? 'true' : 'false'
-}
-
-// Sandbox-safe lookup matching the static writes in refreshNodeOnlineFlags.
-boolean isOnline(String onlineEnvName) {
-  switch (onlineEnvName) {
-    case 'ALVEO_HOST_ONLINE': return env.ALVEO_HOST_ONLINE == 'true'
-    case 'PYNQ_ONLINE':       return env.PYNQ_ONLINE       == 'true'
-    case 'ZCU104_ONLINE':     return env.ZCU104_ONLINE     == 'true'
-    case 'KV260_ONLINE':      return env.KV260_ONLINE      == 'true'
-    default:
-      error "isOnline: unknown onlineEnv '${onlineEnvName}' (HW_SHARDS out of sync with isOnline switch)"
+  HW_SHARDS.each { row ->
+    NODE_ONLINE[row.agentLabel as String] = isNodeOnline(row.agentLabel as String)
   }
 }
 
-// One parallel reboot per board with restartPrep=true; offline boards
-// skipped inside runReboot().
+boolean isOnline(String agentLabel) {
+  Boolean v = NODE_ONLINE[agentLabel]
+  return v != null && v
+}
+
+// One parallel reboot per board with restartPrep=true. Offline boards
+// are skipped inside runReboot().
 Map<String, Closure> buildRebootMap() {
   def branches = [:]
   HW_SHARDS.each { row ->
@@ -90,8 +85,8 @@ Map<String, Closure> buildRebootMap() {
 }
 
 void runReboot(Map row, String stageName) {
-  if (!isOnline(row.onlineEnv as String)) {
-    echo "${stageName} reboot skipped: ${row.onlineEnv} != 'true'"
+  if (!isOnline(row.agentLabel as String)) {
+    echo "${stageName} reboot skipped: agent ${row.agentLabel} offline"
     return
   }
   node(row.agentLabel) {
@@ -123,11 +118,11 @@ Map<String, Closure> buildHwStageMap(String testType) {
   return branches
 }
 
-// Mirrors runShard() in Jenkinsfile; safeStashReport in `finally` so failed
+// Mirrors runShard() in Jenkinsfile. safeStashReport in `finally` so failed
 // stages still publish their junit XML.
 void runHwShard(Map row, String testType, String stageName) {
-  if (!isOnline(row.onlineEnv as String)) {
-    echo "${stageName} skipped: ${row.onlineEnv} != 'true'"
+  if (!isOnline(row.agentLabel as String)) {
+    echo "${stageName} skipped: agent ${row.agentLabel} offline"
     return
   }
   node(row.agentLabel) {
@@ -149,7 +144,7 @@ void runHwShard(Map row, String testType, String stageName) {
   }
 }
 
-// Boards with credentialsId get a withCredentials wrapper; alveo has none.
+// Boards with credentialsId get a withCredentials wrapper -- alveo has none.
 void withHwCredentials(Map row, Closure body) {
   if (!row.credentialsId) {
     body.call()
@@ -205,7 +200,7 @@ String hwStashName(String testType, String board) {
 
 // Find the newest <board>.zip across the legacy fixed path, the
 // sanity-build single-dir, and the per-shard full-build dirs. Returns ""
-// when no zip is found; caller logs and skips that HW shard.
+// when no zip is found, in which case the caller logs and skips that shard.
 String findBoardZip(String testType, String board) {
   String legacy = "${env.ARTIFACT_DIR}/${testType}/${board}.zip"
   if (fileExists(legacy)) { return legacy }
@@ -221,13 +216,13 @@ String findBoardZip(String testType, String board) {
 void stashBuildArtifacts(String testType) {
   HW_SHARDS.each { row ->
     String board = row.board as String
-    if (!isOnline(row.onlineEnv as String)) {
-      echo "stashBuildArtifacts[${testType}]: ${board} agent offline; skipping"
+    if (!isOnline(row.agentLabel as String)) {
+      echo "stashBuildArtifacts[${testType}]: ${board} agent offline, skipping"
       return
     }
     String src = findBoardZip(testType, board)
     if (!src) {
-      echo "stashBuildArtifacts[${testType}]: no ${board}.zip found under ${env.ARTIFACT_DIR}; HW shard for ${board}/${testType} will skip"
+      echo "stashBuildArtifacts[${testType}]: no ${board}.zip under ${env.ARTIFACT_DIR}, HW shard for ${board}/${testType} will skip"
       return
     }
     echo "stashBuildArtifacts[${testType}]: ${board} <- ${src}"
@@ -238,13 +233,13 @@ void stashBuildArtifacts(String testType) {
   }
 }
 
-// Filtered by onlineEnv so offline boards don't appear in the expected
+// Filtered by agentLabel so offline boards don't appear in the expected
 // stash set (avoids spurious unstash warnings).
 List<String> expectedStashes() {
   def stashes = []
   HW_TEST_TYPES.each { testType ->
     HW_SHARDS.each { row ->
-      if (isOnline(row.onlineEnv as String)) {
+      if (isOnline(row.agentLabel as String)) {
         stashes << hwStashName(testType, row.board as String)
       }
     }
@@ -297,7 +292,7 @@ void unstashIfPresent(String stashName) {
   }
 }
 
-// junit first (workspace-local, never flakes); merge + archive second.
+// junit first (workspace-local, never flakes), then merge + archive.
 void aggregateReports() {
   sh 'mkdir -p reports'
   cleanPreviousBuildFiles('reports')

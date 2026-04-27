@@ -3,10 +3,10 @@
 Every parallel stage is defined by **one row** of `STAGES` in
 [`tests/ci_shards.py`](../../tests/ci_shards.py). The
 [`Jenkinsfile`](./Jenkinsfile) loads that list at the Validate stage into
-`PARALLEL_SHARDS` (via `python3 -c ... readJSON`); the pytest plugin in
-[`tests/conftest.py`](../../tests/conftest.py) reads it for the
+`PARALLEL_SHARDS` (via `python3 -c ... readJSON`), and the pytest plugin
+in [`tests/conftest.py`](../../tests/conftest.py) reads it for the
 `--which-shard` lookup. Test selection is the standard `-m <marker>`
-expression; shard splitting is the `--num-shards` / `--shard-id` plugin.
+expression. Shard splitting is the `--num-shards` / `--shard-id` plugin.
 
 The HW-tethered [`Jenkinsfile_HW`](./Jenkinsfile_HW) follows the same
 pattern with a parallel `HW_SHARDS` table.
@@ -51,17 +51,14 @@ Edit the `_BNN_WBITS` / `_BNN_ABITS` / `_BNN_TOPOLOGY` constants in
    `test_board_map` (`src/finn/util/basic.py`).
 3. Add one row to `STAGES` in
    [`tests/ci_shards.py`](../../tests/ci_shards.py).
-4. (HW pipeline only.) In `Jenkinsfile_HW`:
-   - add a row to `HW_SHARDS` with `board`, `agentLabel`, `onlineEnv`,
-     `credentialsId`, `setupScript`, `marker`, `restartPrep`;
-   - add a matching arm to `isOnline(onlineEnvName)` (a static `switch`
-     so we stay inside the Groovy sandbox whitelist);
-   - add a matching `env.<ONLINE_ENV> = isNodeOnline(...)` line in
-     `refreshNodeOnlineFlags()`.
+4. (HW pipeline only.) Add a row to `HW_SHARDS` in `Jenkinsfile_HW` with
+   `board`, `agentLabel`, `onlineEnv`, `credentialsId`, `setupScript`,
+   `marker`, and `restartPrep`. The online-flag map is populated by
+   iterating `HW_SHARDS`, so no second hand-edit is needed.
 
 ### … debug one stage without running the whole pipeline?
 
-Trigger a build with `STAGES=<substring>` set on the Jenkins job;
+Trigger a build with `STAGES=<substring>` set on the Jenkins job, and
 `eachActiveShard` skips rows whose stage name doesn't contain the
 substring. Combine with the boolean params (`sanity` / `fpgadataflow` /
 `end2end`) as usual.
@@ -90,7 +87,7 @@ pytest --collect-only --which-shard test_relu_elementwisemax
 Walks every row of `STAGES`, reuses the canonical
 `_assign_groups_to_shards()` from `conftest.py`, and prints
 `stage | marker | shards | shard | stash | nodeid` rows. The `stash`
-column is the exact Jenkins stash name; pass it as `STAGES=<substring>`
+column is the exact Jenkins stash name -- pass it as `STAGES=<substring>`
 to re-run only that shard.
 
 ## Calibrating shard balance
@@ -107,10 +104,10 @@ python3 scripts/regen_ci_timings.py path/to/reports/
 
 `Check Stage Results` runs
 [`scripts/summarize_ci_timings.py`](../../scripts/summarize_ci_timings.py)
-on every build; shards that exceed 1.5x their family's median wall-clock
-are flagged loudly so it's obvious when the file is stale. Bumping
-`shards:` in `tests/ci_shards.py` is still valid for permanent capacity
-changes.
+on every build, and shards that exceed 1.5x their family's median
+wall-clock are flagged loudly so it's obvious when the file is stale.
+Bumping `shards:` in `tests/ci_shards.py` is still valid for permanent
+capacity changes.
 
 ## Artefacts
 

@@ -240,8 +240,8 @@ DOCKER_EXEC+="-e LD_PRELOAD=/lib/x86_64-linux-gnu/libudev.so.1 "
 # Workaround for running multiple Vivado instances simultaneously, see:
 # https://adaptivesupport.amd.com/s/article/63253?language=en_US
 DOCKER_EXEC+="-e XILINX_LOCAL_USER_DATA=no "
-# Optional host cache for torch.hub / huggingface weights; avoids CDN 504s on
-# parallel CI runs. Mount is /finn_cache (NOT under $HOME — Docker creates
+# Optional host cache for torch.hub / huggingface weights to avoid CDN 504s
+# on parallel CI runs. Mount is /finn_cache (NOT under $HOME — Docker creates
 # bind parents as root, which would break pip install --user).
 : ${FINN_DOCKER_CACHE_DIR=""}
 if [ -n "$FINN_DOCKER_CACHE_DIR" ]; then

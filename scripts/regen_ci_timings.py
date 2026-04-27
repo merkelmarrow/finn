@@ -11,7 +11,7 @@ inputs (multiple shards or multiple runs) and written to
 ``tests/ci_timings.json`` for the LPT-greedy assignment used in
 ``_assign_groups_to_shards``.
 
-The ``groups`` array entries are keyed by group name; under
+The ``groups`` array entries are keyed by group name. Under
 ``--dist=loadgroup`` pytest-xdist suffixes the nodeid with ``@<group>``,
 which is stripped here so the key matches what ``_group_key()`` returns
 during collection. Tests without an xdist_group are recorded by nodeid.
@@ -24,7 +24,7 @@ import sys
 
 
 GROUP_SUFFIX_RE = re.compile(r"@(\S+)$")
-# Notebook nodeids contain absolute filesystem paths; collapse to the
+# Notebook nodeids contain absolute filesystem paths -- collapse to the
 # stable basename so timings stay portable across workspaces.
 NOTEBOOK_PARAM_RE = re.compile(r"\[(/[^\]]+\.ipynb)\]")
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))

@@ -24,7 +24,7 @@ void loadStageConfig() {
   PARALLEL_SHARDS = readJSON(text: json).collect { it as Map }
 }
 
-// Marker is interpolated into shell; reject anything that could escape.
+// Marker is interpolated into a shell command, so reject anything that could escape.
 @Field
 java.util.regex.Pattern MARKER_SAFE_PATTERN = ~/^[A-Za-z0-9_ ]+$/
 
@@ -62,7 +62,7 @@ pipeline {
   }
 }
 
-// `params` is an UnmodifiableMap; use Map.get (sandbox-safe), not getProperty.
+// `params` is an UnmodifiableMap, so use Map.get (sandbox-safe) not getProperty.
 boolean paramBool(String name) {
   def v = params.get(name)
   if (v == null) { return false }
@@ -75,7 +75,7 @@ String paramString(String name) {
   return v == null ? '' : v.toString()
 }
 
-// Marker violations are hard errors; over-subscribing executors is UNSTABLE.
+// Marker violations are hard errors. Over-subscribing executors is UNSTABLE.
 void validateShards() {
   if (!PARALLEL_SHARDS) {
     error "PARALLEL_SHARDS is empty; loadStageConfig() must run before validateShards()"
@@ -119,7 +119,7 @@ void publishSharedDockerImage(String sharedDir) {
   ).trim()
   sh "mkdir -p ${sharedDir}"
   sh "echo '${tag}' > ${sharedDir}/finn-docker-tag.txt"
-  // bash needed for `set -o pipefail`; Jenkins defaults sh to dash.
+  // bash needed for `set -o pipefail` -- Jenkins defaults sh to dash.
   sh """#!/bin/bash
 set -o pipefail
 if command -v pigz >/dev/null 2>&1; then
@@ -189,7 +189,7 @@ void rotateFinnCiBuildTmp() {
   String jk = finnCiJobKey()
   String bn = env.BUILD_NUMBER
   String ws = env.WORKSPACE
-  if (!ws) { echo "rotateFinnCiBuildTmp: WORKSPACE unset; skipping"; return }
+  if (!ws) { echo "rotateFinnCiBuildTmp: WORKSPACE unset, skipping"; return }
   sh """
     bash "${ws}/scripts/rotate_finn_ci_tmp.sh" "${root}" "${jk}" "${bn}" ${FINN_CI_TMP_RETAIN_BUILDS} ${FINN_CI_TMP_MAX_AGE_DAYS}
   """
@@ -197,7 +197,7 @@ void rotateFinnCiBuildTmp() {
 
 // Resolve agent-local paths off FINN_AGENT_NFS_ROOT (per-agent env_vars in
 // jenkins_slaves.yml) so adding a finn-build host is a slaves.yml edit only.
-// Must run after node binding; resolves ${NODE_NAME} in Groovy because
+// Must run after node binding -- ${NODE_NAME} is resolved in Groovy because
 // run-docker.sh does not re-expand vars stored inside FINN_DOCKER_EXTRA.
 void withAgentNfsEnv(Closure body) {
   String agentNfsRoot = env.FINN_AGENT_NFS_ROOT
@@ -205,7 +205,7 @@ void withAgentNfsEnv(Closure body) {
     error "FINN_AGENT_NFS_ROOT is unset on ${env.NODE_NAME}; add it to env_vars in jenkins_slaves.yml for this agent."
   }
   // Per-agent torch.hub / huggingface cache so the brevitas mobilenet .pth and
-  // similar weights survive container restarts; pre-empts GitHub-Releases /
+  // similar weights survive container restarts. Pre-empts GitHub-Releases /
   // CDN flakes turning into pytest.skip cascades downstream.
   withEnv([
     "FINN_HOST_BUILD_DIR=${agentNfsRoot}/workspace/tmp",
@@ -217,8 +217,8 @@ void withAgentNfsEnv(Closure body) {
   ]) { body() }
 }
 
-// One body for every parallel shard. `safeStashReport` in `finally` is
-// load-bearing so failed stages still publish their JUnit XML.
+// One body for every parallel shard. The `finally` is load-bearing so
+// failed stages still publish their JUnit XML via safeStashReport.
 void runShard(Map row, int shardIdx, String stageName, String stashName) {
   node('finn-build') {
     withAgentNfsEnv {
@@ -262,7 +262,7 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
   }
 }
 
-// Stash whichever of <stash>.{xml,html,timings.json} pytest produced.
+// Stash whichever of <stash>.{xml,html,timings.json,stagemap} pytest produced.
 // catchError keeps a stash hiccup from masking pytest's own pass/fail.
 void safeStashReport(String stashName) {
   catchError(buildResult: null, stageResult: null,
@@ -289,7 +289,7 @@ void archiveStageFolder(String folder) {
   }
 }
 
-// junit first (workspace-local, never flakes); merge + archive second since
+// junit first (workspace-local, never flakes), then merge + archive --
 // agent->controller tar transfer can flake on large globs.
 void aggregateReports() {
   sh 'mkdir -p reports'
@@ -333,7 +333,7 @@ void publishStageMap() {
   }
 }
 
-// Per-shard wall-clock summary; warns when a shard exceeds 1.5x family median.
+// Per-shard wall-clock summary -- warns when a shard exceeds 1.5x family median.
 void echoShardTimings() {
   catchError(buildResult: null, stageResult: null,
              message: 'echoShardTimings failed; non-fatal') {
@@ -371,7 +371,7 @@ List<String> expectedStashes() {
   return stashes
 }
 
-// Pre-create buildDir as the unprivileged user; otherwise docker's -v mount
+// Pre-create buildDir as the unprivileged user. Otherwise docker's -v mount
 // auto-creates the bind parent as root:root and the in-container user can't
 // write to it. Hard-fail on root-owned residue (operator must `sudo rm -rf`).
 void cleanPreviousBuildFiles(String buildDir) {
@@ -412,8 +412,8 @@ df -BG "\$d" | awk 'NR==2 {print \$4}' | tr -d 'G'
 
 // Marker is passed via env var (not interpolated) so a malformed marker
 // can't escape into the shell. The wrapper script avoids run-docker.sh
-// re-tokenising the `-m "..."` argv. Exit 5 = "no tests collected" is
-// treated as success (already loud-failed by the conftest plugin).
+// re-tokenising the `-m "..."` argv. Exit 5 ("no tests collected") is
+// treated as success because the conftest plugin already loud-fails it.
 void runPytest(Map opts) {
   def parts = ["python -m pytest -m \"\$FINN_CI_MARKER\""]
   if (opts.workers) {
@@ -433,8 +433,8 @@ void runPytest(Map opts) {
 }
 
 // Silent no-op if the board's hw_deployment_* dir is absent: under hash
-// sharding only one shard runs cnv-w2a2; assertZipBoardsEmitted catches
-// the case where no shard produced it.
+// sharding only one shard runs cnv-w2a2, and assertZipBoardsEmitted
+// catches the case where no shard produced it.
 void findCopyZip(String board, String findDir, String copyDir) {
   if (!fileExists("${findDir}")) { return }
   def found = sh(returnStdout: true, script:
