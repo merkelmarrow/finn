@@ -65,6 +65,39 @@ def _check_vitis_envvars():
     ), "XILINX_XRT must be set for Vitis, ensure the XRT env is sourced"
 
 
+_SLASH_ALLOWED_AXILITE_STEMS = {"s_axi_control"}
+
+
+def _check_slash_axilite_compat(kernel_model, node_name):
+    """Raise if a kernel exposes AXI-lite slaves that SLASH cannot use.
+
+    SLASH only supports at most one AXI-lite slave per kernel, and it must be
+    wired to an HLS control register block (ap_start/ap_done + scalar args).
+    Memstream-backed weight interfaces (e.g. from MVAU
+    runtime_writeable_weights=1) and additional control interfaces are
+    rejected.
+    """
+    raw = kernel_model.get_metadata_prop("vivado_stitch_ifnames")
+    if raw is None:
+        return
+    axilite = json.loads(raw).get("axilite", [])
+    if len(axilite) > 1:
+        raise Exception(
+            f"Kernel '{node_name}' exposes {len(axilite)} AXI-lite interfaces "
+            f"{axilite}, but SLASH supports at most one control AXI-lite slave "
+            "per kernel."
+        )
+    bad = [name for name in axilite if name.rsplit("_", 1)[0] not in _SLASH_ALLOWED_AXILITE_STEMS]
+    if bad:
+        raise Exception(
+            f"Kernel '{node_name}' exposes AXI-lite interfaces {bad} that "
+            "SLASH does not support. SLASH only accepts AXI-lite slaves wired "
+            "to a kernel control register block (e.g. 's_axi_control'). The "
+            "most common cause is an MVAU/VVAU/Thresholding node with "
+            "runtime_writeable_weights=1 -- disable it for SLASH builds."
+        )
+
+
 class VitisOptStrategy(Enum):
     "Values applicable to VitisBuild optimization strategy."
 
@@ -458,6 +491,7 @@ class SlashLink(Transformation):
             sdp_node = getCustomOp(node)
             dataflow_model_filename = sdp_node.get_nodeattr("model")
             kernel_model = ModelWrapper(dataflow_model_filename)
+            _check_slash_axilite_compat(kernel_model, node.name)
 
             vivado_proj_dir = Path(kernel_model.get_metadata_prop("vivado_stitch_proj"))
             component_xml_path = vivado_proj_dir / "ip" / "component.xml"
