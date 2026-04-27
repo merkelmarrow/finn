@@ -29,9 +29,10 @@ STAGES = [
      "marker": "sanity_bnn",
      "shards": 1, "workers": 1, "skipWhen": "end2end",
      "zipBoards": ["U250", "Pynq-Z1", "ZCU104", "KV260_SOM"]},
+    # loadgroup pins notebooks_cybsec 1->2->3 to one worker. worksteal ignores xdist_group.
     {"param": "sanity", "stage": "Sanity - Unit Tests",
      "marker": "util or brevitas_export or streamline or transform or notebooks",
-     "shards": 1, "workers": 8, "coverage": True},
+     "shards": 1, "workers": 8, "coverage": True, "distMode": "loadgroup"},
     {"param": "fpgadataflow", "stage": "fpgadataflow",
      "marker": "fpgadataflow",
      "shards": 2, "workers": 8, "coverage": True},

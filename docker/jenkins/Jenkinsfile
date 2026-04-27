@@ -45,12 +45,12 @@ pipeline {
     // host is a jenkins_slaves.yml edit only, never a Jenkinsfile edit.
     stage('Validate') {
       agent { label 'finn-build' }
-      steps { script { withAgentNfsEnv { loadStageConfig(); validateShards(); rotateFinnCiBuildTmp() } } }
+      steps { script { wipeStaleWorkspace(); withAgentNfsEnv { loadStageConfig(); validateShards(); rotateFinnCiBuildTmp() } } }
     }
     stage('Build Docker Image') {
       agent { label 'finn-build' }
       environment { FINN_DOCKER_PREBUILT = '0' }
-      steps { script { withAgentNfsEnv { buildAndPublishDockerImage() } } }
+      steps { script { wipeStaleWorkspace(); withAgentNfsEnv { buildAndPublishDockerImage() } } }
     }
     stage('Run Tests') {
       steps { script { parallel(buildParallelStageMap()) } }
@@ -221,12 +221,19 @@ void withAgentNfsEnv(Closure body) {
   ]) { body() }
 }
 
+// Cold start every shard so stale outputs cannot mask ordering bugs or
+// dep regressions in a reused workspace.
+void wipeStaleWorkspace() {
+  sh 'git clean -ffdx'
+}
+
 // finally is load-bearing so failed stages still publish their JUnit XML.
 void runShard(Map row, int shardIdx, String stageName, String stashName) {
   node('finn-build') {
     withAgentNfsEnv {
     stage(stageName) {
       checkout scm
+      wipeStaleWorkspace()
       String perBuildRoot = finnCiPerBuildRoot()
       def buildDir = "${perBuildRoot}/${stashName}"
       String stageMap = "[stage-map] build=${env.BUILD_NUMBER} stage='${stageName}' stash=${stashName} shard=${shardIdx + 1}/${row.shards} node=${env.NODE_NAME} workspace=${env.WORKSPACE} build_dir=${buildDir}"
