@@ -226,6 +226,9 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
       checkout scm
       String perBuildRoot = finnCiPerBuildRoot()
       def buildDir = "${perBuildRoot}/${stashName}"
+      String stageMap = "[stage-map] build=${env.BUILD_NUMBER} stage='${stageName}' stash=${stashName} shard=${shardIdx + 1}/${row.shards} node=${env.NODE_NAME} workspace=${env.WORKSPACE} build_dir=${buildDir}"
+      echo stageMap
+      writeFile file: "${stashName}.stagemap", text: "${stageMap}\n"
       withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
         sh "mkdir -p '${perBuildRoot}'"
         checkAgentFreeSpace(FINN_CI_MIN_FREE_GB)
@@ -264,11 +267,9 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
 void safeStashReport(String stashName) {
   catchError(buildResult: null, stageResult: null,
              message: "safeStashReport(${stashName}) failed; aggregation may be partial") {
-    if (fileExists("${stashName}.xml")) {
-      stash name: stashName,
-            includes: "${stashName}.xml,${stashName}.html,${stashName}.timings.json",
-            allowEmpty: false
-    }
+    stash name: stashName,
+          includes: "${stashName}.xml,${stashName}.html,${stashName}.timings.json,${stashName}.stagemap",
+          allowEmpty: true
   }
 }
 
@@ -298,6 +299,7 @@ void aggregateReports() {
   }
   junit allowEmptyResults: true, testResults: 'reports/*.xml'
   echoShardTimings()
+  publishStageMap()
   assertZipBoardsEmitted()
   catchError(buildResult: null, stageResult: 'UNSTABLE',
              message: 'pytest_html_merger failed; per-stage HTMLs still archived') {
@@ -314,6 +316,20 @@ void aggregateReports() {
   catchError(buildResult: null, stageResult: 'UNSTABLE',
              message: 'archiveArtifacts (timings.json) failed') {
     archiveArtifacts artifacts: 'reports/*.timings.json', allowEmptyArchive: true
+  }
+}
+
+void publishStageMap() {
+  catchError(buildResult: null, stageResult: null,
+             message: 'publishStageMap failed; non-fatal') {
+    if (!fileExists('reports')) { return }
+    sh "cat reports/*.stagemap 2>/dev/null | sort > reports/stage_map.txt || true"
+    if (!fileExists('reports/stage_map.txt')) { return }
+    archiveArtifacts artifacts: 'reports/stage_map.txt', allowEmptyArchive: true
+    String body = readFile('reports/stage_map.txt').trim()
+    if (body) {
+      currentBuild.description = body
+    }
   }
 }
 
