@@ -71,9 +71,7 @@ if command -v apt-get &> /dev/null; then
         zsh \
         python3 \
         python3-pip \
-        python3-venv \
-        libbz2-dev \
-        python3-bz2file
+        python3-venv
 
     # Required for finn_xsi (Vivado Python bindings) and finn-hlslib
     apt-get install -y \
