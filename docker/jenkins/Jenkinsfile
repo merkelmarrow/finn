@@ -247,21 +247,32 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
         cleanPreviousBuildFiles(buildDir)
         try {
           catchError(stageResult: 'FAILURE') {
-            Map opts = [
-                marker: row.marker,
-                stash: stashName,
-                workers: row.workers as int,
-                distMode: row.distMode,
-                numShards: row.shards as int,
-                shardId: shardIdx,
-            ]
-            if (row.coverage) {
-              opts.extraArgs = "--cov --cov-report=html:coverage_${stashName}"
-            }
-            runPytest(opts)
-            if (row.coverage) { archiveStageFolder("coverage_${stashName}") }
-            (row.zipBoards ?: []).each { board ->
-              findCopyZip(board, buildDir, stashName)
+            // Inner try/catch surfaces tool logs to console and tarballs
+            // them for Blue Ocean before letting catchError mark the stage
+            // red, so failures triage from the GUI without NFS access.
+            try {
+              Map opts = [
+                  marker: row.marker,
+                  stash: stashName,
+                  workers: row.workers as int,
+                  distMode: row.distMode,
+                  numShards: row.shards as int,
+                  shardId: shardIdx,
+              ]
+              if (row.coverage) {
+                opts.extraArgs = "--cov --cov-report=html:coverage_${stashName}"
+              }
+              runPytest(opts)
+              if (row.coverage) { archiveStageFolder("coverage_${stashName}") }
+              (row.zipBoards ?: []).each { board ->
+                findCopyZip(board, buildDir, stashName)
+              }
+              printLsfSummary(buildDir, stashName)
+            } catch (Exception e) {
+              printLsfSummary(buildDir, stashName)
+              printFailureTails(buildDir, stashName, 150)
+              archiveFailureLogs(buildDir, stashName)
+              throw e
             }
           }
         } finally {
@@ -296,6 +307,114 @@ void archiveStageFolder(String folder) {
   catchError(buildResult: null, stageResult: null,
              message: "archiveArtifacts(${folder}) failed; non-fatal") {
     archiveArtifacts artifacts: "${folder}/**/*", allowEmptyArchive: true
+  }
+}
+
+// Counts per-tool runs and the hosts they ran on so a Blue Ocean consumer
+// can confirm LSF fan-out without GUI access. Pulls from each tool's own
+// log because the wrapper writes its diagnostics to stderr which pytest
+// captures into a buffer the test runner does not flush per-step.
+void printLsfSummary(String buildDir, String stashName) {
+  catchError(buildResult: null, stageResult: null,
+             message: "printLsfSummary(${stashName}) failed; non-fatal") {
+    String agent = env.NODE_NAME ?: ''
+    sh """#!/bin/bash
+set +e
+bd='${buildDir}'
+agent='${agent}'
+tag='[lsf-summary ${stashName}]'
+if [ ! -d "\$bd" ]; then echo "\$tag no build dir"; exit 0; fi
+
+# vitis_hls prints "INFO: [HLS 200-10] ... on host '<host>'" once per run.
+# vivado prints "# Running On: <host>," at file head. Both markers land in
+# files vitis_hls itself or vivado itself create, never via shell redirect.
+hls_hosts=\$(find "\$bd" -name vitis_hls.log -exec grep -h "INFO: \\[HLS 200-10\\] .* on host '" {} + 2>/dev/null \\
+  | awk -F"on host '" '{print \$2}' | awk -F"'" '{print \$1}')
+viv_hosts=\$(find "\$bd" -name vivado.log -exec grep -h '^# Running On:' {} + 2>/dev/null \\
+  | awk -F'Running On: *' '{print \$2}' | awk -F',' '{print \$1}')
+
+all_hosts=\$(printf '%s\\n%s\\n' "\$hls_hosts" "\$viv_hosts" | grep -v '^\$')
+n_runs=\$(echo "\$all_hosts" | grep -c .)
+if [ "\$n_runs" = "0" ]; then
+  echo "\$tag no tool runs"
+  exit 0
+fi
+n_remote=\$(echo "\$all_hosts" | grep -vcx "\$agent")
+n_local=\$(echo "\$all_hosts" | grep -cx "\$agent")
+buckets=\$(echo "\$all_hosts" | sort | uniq -c | sort -rn)
+n_hosts=\$(echo "\$buckets" | grep -c .)
+
+if [ "\$n_remote" = "0" ]; then
+  echo "\$tag \$n_runs tool run(s) on this agent (no LSF dispatch)"
+else
+  echo "\$tag \$n_runs tool run(s) across \$n_hosts host(s) (\$n_remote remote / \$n_local local)"
+fi
+top=\$(echo "\$buckets" | head -5 | awk '{printf "%s(%d) ", \$2, \$1}')
+echo "                          top: \$top"
+"""
+  }
+}
+
+// Dumps the tail of every tool log carrying an ERROR: marker. Lets a
+// maintainer see the actual error in the Jenkins console without
+// downloading the artifact tarball. Wrapper-side bsub failures arrive
+// via pytest's captured stderr which Jenkins already prints on test
+// failure, so this layer focuses on tool-resident errors.
+void printFailureTails(String buildDir, String stashName, int tailLines) {
+  catchError(buildResult: null, stageResult: null,
+             message: "printFailureTails(${stashName}) failed; non-fatal") {
+    sh """#!/bin/bash
+set +e
+bd='${buildDir}'
+tag='[failure-tails ${stashName}]'
+if [ ! -d "\$bd" ]; then echo "\$tag no build dir"; exit 0; fi
+
+mapfile -t failed < <(find "\$bd" \\( \\
+    -name vitis_hls.log -o \\
+    -name build_dataflow.log -o \\
+    -path '*/project_*/sol1/impl/ip/vivado.log' -o \\
+    -path '*/finn_zynqbuild_*/vivado.log' -o \\
+    -path '*/vitis_proj/_x/logs/*.log' \\
+  \\) -exec grep -l 'ERROR:' {} + 2>/dev/null)
+
+if [ "\${#failed[@]}" = "0" ]; then
+  echo "\$tag no logs with ERROR: markers found"
+  exit 0
+fi
+
+echo "\$tag \${#failed[@]} log file(s) with ERROR: markers"
+for f in "\${failed[@]}"; do
+  rel="\${f#\$bd/}"
+  echo ""
+  echo "=== FAIL: \$rel (tail ${tailLines}) ==="
+  tail -n ${tailLines} "\$f"
+done
+"""
+  }
+}
+
+// One tarball per failed shard, keyed on stashName so multiple failed
+// shards never collide in the controller's archive. Filtered to logs a
+// maintainer would open, not the HLS compiler intermediates.
+void archiveFailureLogs(String buildDir, String stashName) {
+  catchError(buildResult: null, stageResult: null,
+             message: "archiveFailureLogs(${stashName}) failed; non-fatal") {
+    String tarball = "failure_logs/${stashName}.tar.gz"
+    sh """#!/bin/bash
+set +e
+bd='${buildDir}'
+tarball='${env.WORKSPACE}/${tarball}'
+mkdir -p "\$(dirname "\$tarball")"
+if [ ! -d "\$bd" ]; then exit 0; fi
+cd "\$bd" && find . -type f \\( \\
+    -name vitis_hls.log -o \\
+    -name build_dataflow.log -o \\
+    -path '*/project_*/sol1/impl/ip/vivado.log' -o \\
+    -path '*/finn_zynqbuild_*/vivado.log' -o \\
+    -path '*/vitis_proj/_x/logs/*.log' \\
+  \\) -print0 | tar --null --create --gzip --file "\$tarball" --files-from - 2>/dev/null || true
+"""
+    archiveArtifacts artifacts: tarball, allowEmptyArchive: true
   }
 }
 
