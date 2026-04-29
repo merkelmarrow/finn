@@ -46,7 +46,7 @@ pipeline {
     booleanParam(name: 'sanity',       defaultValue: true,  description: 'Run sanity hardware and unit tests')
     booleanParam(name: 'end2end',      defaultValue: false, description: 'Run end2end tests')
     booleanParam(name: 'local_setup',  defaultValue: false,
-                 description: 'PR #1574 smoke test for the docker-less install path. Runs ./setup-local.sh + ./scripts/quicktest-local.sh vivado on the finn-v80 agent (Ubuntu 22.04 + python3.10).')
+                 description: 'PR #1574 test for the docker-less install path. Runs ./setup-local.sh + ./scripts/quicktest-local.sh vivado on the finn-v80 agent (Ubuntu 22.04 + python3.10).')
     string(name: 'STAGES', defaultValue: '',
            description: 'Substring filter on stage name (empty = all). Use to run one row for debugging.')
   }
@@ -148,9 +148,9 @@ Map<String, Closure> buildParallelStageMap() {
     String stash = shardStashName(row, id)
     branches[stage] = { runShard(row, id, stage, stash) }
   }
-  // PR #1574 smoke test sits alongside the pytest shards rather than as a
+  // PR #1574 test sits alongside the pytest shards rather than as a
   // top-level stage so it runs concurrently with them on a different agent
-  // class. Off by default; only landed when local_setup=true.
+  // class. Off by default, only landed when local_setup=true.
   if (paramBool('local_setup')) {
     branches['Local Setup (non-Docker) with Vivado'] = { runLocalSetupTest() }
   }
@@ -359,10 +359,31 @@ void runLocalSetupTest() {
         String perBuildRoot = finnCiPerBuildRoot()
         String buildDir = "${perBuildRoot}/local_setup"
         echo "[stage-map] build=${env.BUILD_NUMBER} stage='Local Setup (non-Docker) with Vivado' stash=local_setup shard=1/1 node=${env.NODE_NAME} workspace=${env.WORKSPACE} build_dir=${buildDir}"
-        withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
-          sh "mkdir -p '${perBuildRoot}'"
+        // pip cache key tracks the inputs that drive what gets installed, so any
+        // dep change forces a fresh download. Stays under /scratch (local SSD)
+        // because /home/cse-jenkins on this host has a per-user NFS quota that
+        // pip wheels overflow within one cold install.
+        String pipCacheKey = sh(
+          returnStdout: true,
+          script: 'sha256sum requirements.txt setup.py setup.cfg pyproject.toml 2>/dev/null | sha256sum | cut -c1-16'
+        ).trim()
+        if (!pipCacheKey) { pipCacheKey = "build-${env.BUILD_NUMBER}" }
+        String pipCacheRoot = '/scratch/jenkins/.pip-cache'
+        String pipCacheDir  = "${pipCacheRoot}/${pipCacheKey}"
+        String xdgCacheDir  = '/scratch/jenkins/.xdg-cache'
+        withEnv([
+          "FINN_HOST_BUILD_DIR=${buildDir}",
+          "PIP_CACHE_DIR=${pipCacheDir}",
+          "XDG_CACHE_HOME=${xdgCacheDir}",
+        ]) {
+          sh """
+mkdir -p '${perBuildRoot}' '${pipCacheDir}' '${xdgCacheDir}'
+find '${pipCacheRoot}' -mindepth 1 -maxdepth 1 -type d -mtime +14 -not -path '${pipCacheDir}' \\
+  -exec rm -rf {} + 2>/dev/null || true
+"""
           cleanPreviousBuildFiles(buildDir)
           catchError(stageResult: 'FAILURE') {
+            sh "echo \"[local_setup] pip_cache_key=${pipCacheKey} python3=\$(python3 --version 2>&1) FINN_XILINX_PATH=\${FINN_XILINX_PATH:-<unset>}\""
             sh './setup-local.sh'
             sh '''#!/bin/bash
 set -eo pipefail
