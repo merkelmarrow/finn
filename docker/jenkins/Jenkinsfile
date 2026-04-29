@@ -196,16 +196,18 @@ String finnCiPerBuildRoot() {
   return "${ws}/tmp/ci_runs/${env.BUILD_NUMBER}"
 }
 
-// Bound disk usage on the shared NFS root once per build. No-op when local.
+// Bound disk usage across every agent's NFS subtree once per build, by
+// walking ${FINN_NFS_ROOT_BASE}/*/workspace/tmp/ci_runs/<job_key>/ from
+// whichever finn-build agent picked up Validate. No-op when the agent
+// has no NFS root resolved (purely local workspace).
 void rotateFinnCiBuildTmp() {
-  String root = env.FINN_AGENT_NFS_ROOT
-  if (!root) { return }
+  if (!env.FINN_AGENT_NFS_ROOT) { return }
   String jk = finnCiJobKey()
   String bn = env.BUILD_NUMBER
   String ws = env.WORKSPACE
   if (!ws) { echo "rotateFinnCiBuildTmp: WORKSPACE unset, skipping"; return }
   sh """
-    bash "${ws}/scripts/rotate_finn_ci_tmp.sh" "${root}" "${jk}" "${bn}" ${FINN_CI_TMP_RETAIN_BUILDS} ${FINN_CI_TMP_MAX_AGE_DAYS}
+    bash "${ws}/scripts/rotate_finn_ci_tmp.sh" "${FINN_NFS_ROOT_BASE}" "${jk}" "${bn}" ${FINN_CI_TMP_RETAIN_BUILDS} ${FINN_CI_TMP_MAX_AGE_DAYS}
   """
 }
 

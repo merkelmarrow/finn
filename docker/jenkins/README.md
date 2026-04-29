@@ -23,12 +23,16 @@ are unchanged.
 
 The Validate stage runs
 [`scripts/rotate_finn_ci_tmp.sh`](../../scripts/rotate_finn_ci_tmp.sh)
-once per build. It keeps the largest N numeric build directories under
-`…/ci_runs/<jobKey>/`, always keeps the current `BUILD_NUMBER`, and
-removes directories older than M days. Tuning constants live at the top
-of `Jenkinsfile`: `FINN_CI_TMP_RETAIN_BUILDS` (default 5) and
-`FINN_CI_TMP_MAX_AGE_DAYS` (default 14). Pass `--dry-run` to the script
-to preview deletions.
+once per build. It walks every per-agent subtree under
+`${FINN_NFS_ROOT_BASE}/<NODE_NAME>/workspace/tmp/ci_runs/<jobKey>/` so
+the multi-agent fan-out is rotated by a single invocation regardless of
+which agent picked up Validate. Per tree it keeps the largest N numeric
+build directories, always keeps the current `BUILD_NUMBER`, and removes
+older directories whose mtime exceeds M days. Top-N protection wins
+over the mtime gate so an idle job does not lose its recent history.
+Tuning constants live at the top of `Jenkinsfile`:
+`FINN_CI_TMP_RETAIN_BUILDS` (default 5) and `FINN_CI_TMP_MAX_AGE_DAYS`
+(default 14). Pass `--dry-run` to the script to preview deletions.
 
 ## How do I …
 
