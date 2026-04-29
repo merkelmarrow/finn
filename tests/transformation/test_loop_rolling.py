@@ -125,6 +125,12 @@ def check_tensor_shape(model_wrapper, name, expected_shape):
 @pytest.mark.parametrize("input_size", [20, 30, 40])
 # num_layers
 @pytest.mark.parametrize("num_layers", [6, 12, 24])
+# Brevitas dynamo export (bo.export_qonnx(..., dynamo=True)) caches compiled
+# graphs under $HOME/.cache; concurrent xdist workers running adjacent
+# parametrizations of this test race on that cache and produce body subgraphs
+# whose tensor shapes were taken from a different parametrization. Pin all
+# variants to one worker to serialize them.
+@pytest.mark.xdist_group(name="loop_rolling")
 @pytest.mark.transform
 def test_finn_loop(input_size, num_layers):
     hidden_size = input_size
