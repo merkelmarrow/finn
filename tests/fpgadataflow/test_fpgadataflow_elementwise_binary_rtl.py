@@ -22,6 +22,9 @@ from finn.transformation.fpgadataflow.convert_to_hw_layers import (
 )
 from finn.transformation.fpgadataflow.create_stitched_ip import CreateStitchedIP
 from finn.transformation.fpgadataflow.hlssynth_ip import HLSSynthIP
+from finn.transformation.fpgadataflow.minimize_accumulator_width import (
+    MinimizeAccumulatorWidth,
+)
 from finn.transformation.fpgadataflow.prepare_ip import PrepareIP
 from finn.transformation.fpgadataflow.prepare_rtlsim import PrepareRTLSim
 from finn.transformation.fpgadataflow.set_exec_mode import SetExecMode
@@ -38,10 +41,16 @@ NUMPY_REFERENCES = {
 }
 
 
-def create_elementwise_model(op_type, lhs_dtype, rhs_dtype, out_dtype, lhs_shape, rhs_shape):
-    """Create an ONNX model with a single elementwise binary operation."""
+def create_elementwise_model(op_type, lhs_dtype, rhs_dtype, lhs_shape, rhs_shape, out_dtype=None):
+    """Create an ONNX model with a single elementwise binary operation.
+
+    If out_dtype is not specified, FLOAT32 is used as placeholder and
+    MinimizeAccumulatorWidth should be used to derive the correct output dtype.
+    """
     onnx_op_type = op_type[11:]  # Remove "Elementwise" prefix
     out_shape = np.broadcast_shapes(lhs_shape, rhs_shape)
+    if out_dtype is None:
+        out_dtype = "FLOAT32"
 
     node = oh.make_node(
         op_type=onnx_op_type,
@@ -70,18 +79,13 @@ def create_elementwise_model(op_type, lhs_dtype, rhs_dtype, out_dtype, lhs_shape
 
 @pytest.mark.parametrize("op_type", ["ElementwiseAdd", "ElementwiseMul"])
 @pytest.mark.parametrize(
-    "lhs_dtype,rhs_dtype,out_dtype",
+    "lhs_dtype,rhs_dtype",
     [
-        # Float
-        ("FLOAT32", "FLOAT32", "FLOAT32"),
-        # Signed integer
-        ("INT8", "INT8", "INT9"),
-        # Unsigned integer
-        ("UINT8", "UINT8", "UINT9"),
-        # Wider integer
-        ("INT16", "INT16", "INT17"),
-        # Mixed int/float
-        ("INT8", "FLOAT32", "FLOAT32"),
+        ("FLOAT32", "FLOAT32"),
+        ("INT8", "INT8"),
+        ("UINT8", "UINT8"),
+        ("INT16", "INT16"),
+        ("INT8", "FLOAT32"),
     ],
 )
 @pytest.mark.parametrize(
@@ -102,19 +106,8 @@ def create_elementwise_model(op_type, lhs_dtype, rhs_dtype, out_dtype, lhs_shape
 @pytest.mark.fpgadataflow
 @pytest.mark.slow
 @pytest.mark.vivado
-def test_elementwise_rtl(
-    op_type, lhs_dtype, rhs_dtype, out_dtype, lhs_shape, rhs_shape, rhs_is_const, pe
-):
+def test_elementwise_rtl(op_type, lhs_dtype, rhs_dtype, lhs_shape, rhs_shape, rhs_is_const, pe):
     """Test RTL elementwise operations across various configurations."""
-
-    # MUL has different output width (2x input width)
-    if op_type == "ElementwiseMul":
-        if lhs_dtype == "INT8" and rhs_dtype == "INT8":
-            out_dtype = "INT16"
-        elif lhs_dtype == "UINT8" and rhs_dtype == "UINT8":
-            out_dtype = "UINT16"
-        elif lhs_dtype == "INT16" and rhs_dtype == "INT16":
-            out_dtype = "INT32"
 
     # Check PE divides last dimension
     if lhs_shape[-1] % pe != 0:
@@ -128,7 +121,7 @@ def test_elementwise_rtl(
     if not rhs_is_const and lhs_dtype != rhs_dtype:
         pytest.skip("input/input mode requires matching dtypes")
 
-    model = create_elementwise_model(op_type, lhs_dtype, rhs_dtype, out_dtype, lhs_shape, rhs_shape)
+    model = create_elementwise_model(op_type, lhs_dtype, rhs_dtype, lhs_shape, rhs_shape)
 
     lhs_data = gen_finn_dt_tensor(DataType[lhs_dtype], lhs_shape)
     rhs_data = gen_finn_dt_tensor(DataType[rhs_dtype], rhs_shape)
@@ -146,13 +139,13 @@ def test_elementwise_rtl(
 
     node_inst = getCustomOp(model.graph.node[0])
     node_inst.set_nodeattr("PE", pe)
-    # Set explicit output dtype for integer ops
-    if not out_dtype.startswith("FLOAT"):
-        node_inst.set_nodeattr("out_dtype", out_dtype)
 
     model = model.transform(InferDataTypes())
     model = model.transform(InferShapes())
     model = model.transform(SpecializeLayers(VERSAL_PART))
+
+    # Derive output dtype
+    model = model.transform(MinimizeAccumulatorWidth())
 
     # Verify RTL backend was selected
     assert len(model.graph.node) == 1
@@ -176,7 +169,8 @@ def test_elementwise_rtl(
     o_expected = NUMPY_REFERENCES[op_type](lhs_ref, rhs_data)
 
     # Compare results
-    if out_dtype == "FLOAT32":
+    out_dtype = model.get_tensor_datatype("out")
+    if out_dtype == DataType["FLOAT32"]:
         assert np.allclose(o_produced, o_expected, rtol=1e-5, atol=1e-6)
     else:
         assert np.all(o_produced == o_expected)
