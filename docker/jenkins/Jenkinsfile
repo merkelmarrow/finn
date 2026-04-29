@@ -45,6 +45,8 @@ pipeline {
     booleanParam(name: 'fpgadataflow', defaultValue: false, description: 'Run fpgadataflow tests')
     booleanParam(name: 'sanity',       defaultValue: true,  description: 'Run sanity hardware and unit tests')
     booleanParam(name: 'end2end',      defaultValue: false, description: 'Run end2end tests')
+    booleanParam(name: 'local_setup',  defaultValue: false,
+                 description: 'PR #1574 smoke test for the docker-less install path. Runs ./setup-local.sh + ./scripts/quicktest-local.sh vivado on the finn-v80 agent (Ubuntu 22.04 + python3.10).')
     string(name: 'STAGES', defaultValue: '',
            description: 'Substring filter on stage name (empty = all). Use to run one row for debugging.')
   }
@@ -145,6 +147,12 @@ Map<String, Closure> buildParallelStageMap() {
     String stage = shardStageName(row, id)
     String stash = shardStashName(row, id)
     branches[stage] = { runShard(row, id, stage, stash) }
+  }
+  // PR #1574 smoke test sits alongside the pytest shards rather than as a
+  // top-level stage so it runs concurrently with them on a different agent
+  // class. Off by default; only landed when local_setup=true.
+  if (paramBool('local_setup')) {
+    branches['Local Setup (non-Docker) with Vivado'] = { runLocalSetupTest() }
   }
   return branches
 }
@@ -323,6 +331,47 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
         }
       }
     }
+    }
+  }
+}
+
+// PR #1574 docker-less install smoke test. Runs only on the finn-v80 agent
+// because finn-build hosts are RHEL 9.1 and miss the apt/python3.10/
+// pybind11-dev/libboost-dev prerequisites that setup-local.sh assumes. The
+// V80 host needs scripts/install-system-deps.sh applied once out of band
+// (separate from this Jenkinsfile, since that step needs sudo). NFS-aware
+// via withAgentNfsEnv: when the V80 host does not see FINN_NFS_ROOT_BASE,
+// resolveAgentNfsRoot() returns null and we fall back to a workspace-local
+// build dir, which is the right behaviour for an isolated smoke test.
+//
+// The .venv at ${FINN_ROOT}/.venv is removed by wipeStaleWorkspace's
+// `git clean -ffdx`, so every run pays the cold pip-install + finn_xsi
+// compile cost (~10-15 min). That is the conservative default for a CI
+// smoke test; if the cost matters we can switch to `git clean -ffdx -e
+// .venv` for this stage only and let setup-local.sh's "Reusing existing
+// environment" branch kick in.
+void runLocalSetupTest() {
+  node('finn-v80') {
+    withAgentNfsEnv {
+      stage('Local Setup (non-Docker) with Vivado') {
+        checkout scm
+        wipeStaleWorkspace()
+        String perBuildRoot = finnCiPerBuildRoot()
+        String buildDir = "${perBuildRoot}/local_setup"
+        echo "[stage-map] build=${env.BUILD_NUMBER} stage='Local Setup (non-Docker) with Vivado' stash=local_setup shard=1/1 node=${env.NODE_NAME} workspace=${env.WORKSPACE} build_dir=${buildDir}"
+        withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
+          sh "mkdir -p '${perBuildRoot}'"
+          cleanPreviousBuildFiles(buildDir)
+          catchError(stageResult: 'FAILURE') {
+            sh './setup-local.sh'
+            sh '''#!/bin/bash
+set -eo pipefail
+source scripts/finn-env.sh
+./scripts/quicktest-local.sh vivado
+'''
+          }
+        }
+      }
     }
   }
 }
