@@ -16,6 +16,14 @@ int FINN_CI_TMP_RETAIN_BUILDS = 5
 @Field
 int FINN_CI_TMP_MAX_AGE_DAYS = 14
 
+// One-stop config for "where do finn-build agents put their NFS workspace
+// + caches?". Every agent that mounts this base inherits its per-host
+// subtree as ${FINN_NFS_ROOT_BASE}/${NODE_NAME}/, auto-created by
+// withAgentNfsEnv on first use. Setting FINN_AGENT_NFS_ROOT in
+// jenkins_slaves.yml still wins as a per-host override.
+@Field
+String FINN_NFS_ROOT_BASE = '/group/cdc_ir/members_noer/cse_jenkins/jenkins_workspaces'
+
 void loadStageConfig() {
   String json = sh(returnStdout: true, script:
     "python3 -c 'import json, sys; sys.path.insert(0, \"tests\"); " +
@@ -207,19 +215,51 @@ void rotateFinnCiBuildTmp() {
 // finn_dev_<user> hostname fails LSF submission with "Error 0", and that
 // is independent of whether the agent has FINN_AGENT_NFS_ROOT set.
 void withAgentNfsEnv(Closure body) {
-  String agentNfsRoot = env.FINN_AGENT_NFS_ROOT
+  String agentNfsRoot = resolveAgentNfsRoot()
   String dockerExtra = "${env.FINN_DOCKER_EXTRA ?: ''} --hostname ${env.NODE_NAME}"
   if (!agentNfsRoot) {
     withEnv(["FINN_DOCKER_EXTRA=${dockerExtra}"]) { body() }
     return
   }
+  ensureNfsWorkspaceTree(agentNfsRoot)
   withEnv([
+    "FINN_AGENT_NFS_ROOT=${agentNfsRoot}",
     "FINN_HOST_BUILD_DIR=${agentNfsRoot}/workspace/tmp",
     "FINN_XRT_PATH=${agentNfsRoot}/caches/xrt",
     "FINN_DOCKER_CACHE_DIR=${agentNfsRoot}/caches/finn_cache",
     "FINN_DOCKER_EXTRA=${dockerExtra} " +
       "-v ${agentNfsRoot}/caches/vivado_ip_cache:/tmp/vivado_ip_cache",
   ]) { body() }
+}
+
+// Returns the agent-side NFS root, or null when this agent should run
+// with a workspace-local build dir. Order: (1) explicit per-agent override
+// from jenkins_slaves.yml env_vars, (2) ${FINN_NFS_ROOT_BASE}/${NODE_NAME}
+// when the base is mounted, (3) null (no NFS).
+String resolveAgentNfsRoot() {
+  String explicit = env.FINN_AGENT_NFS_ROOT
+  if (explicit) { return explicit }
+  String node = env.NODE_NAME
+  if (!node) { return null }
+  if (!fileExists(FINN_NFS_ROOT_BASE)) {
+    echo "withAgentNfsEnv: ${FINN_NFS_ROOT_BASE} not visible on ${node}; falling back to local workspace"
+    return null
+  }
+  return "${FINN_NFS_ROOT_BASE}/${node}"
+}
+
+// Auto-provisioning of the per-agent subtree. Runs as the agent's own
+// user (cse-jenkins on FINN-build hosts) so directory ownership matches
+// existing trees without any setuid dance. Idempotent; first build on a
+// new agent pays for the mkdirs, subsequent builds find them in place.
+void ensureNfsWorkspaceTree(String root) {
+  sh """
+mkdir -p \\
+  '${root}/workspace/tmp' \\
+  '${root}/caches/xrt' \\
+  '${root}/caches/finn_cache' \\
+  '${root}/caches/vivado_ip_cache'
+"""
 }
 
 // Cold start every shard so stale outputs cannot mask ordering bugs or
@@ -270,6 +310,7 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
               printLsfSummary(buildDir, stashName)
             } catch (Exception e) {
               printLsfSummary(buildDir, stashName)
+              printPytestFailures(stashName, 50, 20)
               printFailureTails(buildDir, stashName, 150)
               archiveFailureLogs(buildDir, stashName)
               throw e
@@ -351,6 +392,78 @@ else
 fi
 top=\$(echo "\$buckets" | head -5 | awk '{printf "%s(%d) ", \$2, \$1}')
 echo "                          top: \$top"
+"""
+  }
+}
+
+// Per-test failure summary lifted from the pytest JUnit XML. Closes the
+// gap that printFailureTails leaves when a shard fails without producing
+// a tool log (notebook execution timeouts, plain assertion errors,
+// fixture-level failures). Prints each failed test name plus the last
+// linesPerFailure lines of its traceback to the console.
+void printPytestFailures(String stashName, int linesPerFailure, int maxFailures) {
+  catchError(buildResult: null, stageResult: null,
+             message: "printPytestFailures(${stashName}) failed; non-fatal") {
+    String xml = "${stashName}.xml"
+    if (!fileExists(xml)) {
+      echo "[pytest-failures ${stashName}] no JUnit XML at ${xml}"
+      return
+    }
+    sh """#!/bin/bash
+set +e
+python3 - '${xml}' '${stashName}' ${linesPerFailure} ${maxFailures} <<'PYEOF'
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+xml_path, stash, lines_per, max_fails = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+tag = f"[pytest-failures {stash}]"
+try:
+    root = ET.parse(xml_path).getroot()
+except Exception as exc:
+    print(f"{tag} failed to parse {xml_path}: {exc}")
+    sys.exit(0)
+
+ansi = re.compile(r'\\x1b\\[[0-9;]*m')
+fails = []
+for tc in root.iter('testcase'):
+    classname = tc.get('classname', '?')
+    name = tc.get('name', '?')
+    for kind in ('failure', 'error'):
+        node = tc.find(kind)
+        if node is None:
+            continue
+        msg = node.get('message') or ''
+        body = node.text or ''
+        fails.append((kind, classname, name, msg, body))
+        break
+
+if not fails:
+    print(f"{tag} no test failures recorded in {xml_path}")
+    sys.exit(0)
+
+print(f"{tag} {len(fails)} test failure(s):")
+shown = 0
+for kind, classname, name, msg, body in fails:
+    if shown >= max_fails:
+        print()
+        print(f"... and {len(fails) - shown} more failure(s) elided; see {stash}.xml in artifacts.")
+        break
+    shown += 1
+    print()
+    print(f"=== {kind.upper()}: {classname}::{name}")
+    if msg:
+        msg_lines = msg.splitlines()
+        if msg_lines:
+            print(f"  {msg_lines[0]}")
+    body_text = ansi.sub('', body).rstrip()
+    body_lines = body_text.splitlines()
+    if len(body_lines) > lines_per:
+        omitted = len(body_lines) - lines_per
+        body_lines = [f"... ({omitted} earlier lines elided; see {stash}.xml in artifacts)"] + body_lines[-lines_per:]
+    for ln in body_lines:
+        print(f"  {ln}")
+PYEOF
 """
   }
 }
