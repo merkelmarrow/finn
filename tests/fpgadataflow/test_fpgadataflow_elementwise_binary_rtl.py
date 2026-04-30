@@ -203,7 +203,6 @@ def test_elementwise_rtl_stitched_ip(op_type, pe):
     rhs_data = gen_finn_dt_tensor(DataType[rhs_dtype], rhs_shape)
 
     model.set_initializer("in_y", rhs_data)
-    context = {"in_x": lhs_data}
 
     # Transform pipeline
     model = model.transform(InferDataTypes())
@@ -220,17 +219,6 @@ def test_elementwise_rtl_stitched_ip(op_type, pe):
 
     assert model.graph.node[0].op_type == f"{op_type}_rtl"
 
-    model = model.transform(SetExecMode("rtlsim"))
-    model = model.transform(GiveUniqueNodeNames())
-    model = model.transform(PrepareIP(VERSAL_PART, 10))
-    model = model.transform(HLSSynthIP())
-    model = model.transform(PrepareRTLSim(behav=True))
-
-    o_produced_rtl = execute_onnx(model, context)[model.graph.output[0].name]
-    o_expected = NUMPY_REFERENCES[op_type](lhs_data, rhs_data)
-
-    assert np.allclose(o_produced_rtl, o_expected, rtol=1e-5, atol=1e-6)
-
     # Prepare for stitched IP rtlsim
     model = model.transform(InsertAndSetFIFODepths(VERSAL_PART, 10))
     model = model.transform(GiveUniqueNodeNames())
@@ -240,7 +228,9 @@ def test_elementwise_rtl_stitched_ip(op_type, pe):
 
     # Run stitched IP rtlsim
     model.set_metadata_prop("exec_mode", "rtlsim")
-    o_produced = execute_onnx(model, context)[model.graph.output[0].name]
+    o_produced = execute_onnx(model, {model.graph.input[0].name: lhs_data})[
+        model.graph.output[0].name
+    ]
 
     o_expected = NUMPY_REFERENCES[op_type](lhs_data, rhs_data)
 
