@@ -16,11 +16,8 @@ int FINN_CI_TMP_RETAIN_BUILDS = 5
 @Field
 int FINN_CI_TMP_MAX_AGE_DAYS = 14
 
-// One-stop config for "where do finn-build agents put their NFS workspace
-// + caches?". Every agent that mounts this base inherits its per-host
-// subtree as ${FINN_NFS_ROOT_BASE}/${NODE_NAME}/, auto-created by
-// withAgentNfsEnv on first use. Setting FINN_AGENT_NFS_ROOT in
-// jenkins_slaves.yml still wins as a per-host override.
+// Per-host subtree auto-created at ${base}/${NODE_NAME}/. FINN_AGENT_NFS_ROOT
+// from jenkins_slaves.yml overrides per agent.
 @Field
 String FINN_NFS_ROOT_BASE = '/group/cdc_ir/members_noer/cse_jenkins/jenkins_workspaces'
 
@@ -45,8 +42,6 @@ pipeline {
     booleanParam(name: 'fpgadataflow', defaultValue: false, description: 'Run fpgadataflow tests')
     booleanParam(name: 'sanity',       defaultValue: true,  description: 'Run sanity hardware and unit tests')
     booleanParam(name: 'end2end',      defaultValue: false, description: 'Run end2end tests')
-    booleanParam(name: 'local_setup',  defaultValue: false,
-                 description: 'PR #1574 test for the docker-less install path. Runs ./setup-local.sh + ./scripts/quicktest-local.sh vivado on the finn-v80 agent (Ubuntu 22.04 + python3.10).')
     string(name: 'STAGES', defaultValue: '',
            description: 'Substring filter on stage name (empty = all). Use to run one row for debugging.')
   }
@@ -85,8 +80,7 @@ String paramString(String name) {
   return v == null ? '' : v.toString()
 }
 
-// Marker violations are hard errors. Over-subscribing executors only warns
-// because queueing is recoverable, just slow.
+// Marker errors are fatal. Executor over-subscription only warns (queueing recovers).
 void validateShards() {
   if (!PARALLEL_SHARDS) {
     error "PARALLEL_SHARDS is empty; loadStageConfig() must run before validateShards()"
@@ -148,12 +142,6 @@ Map<String, Closure> buildParallelStageMap() {
     String stash = shardStashName(row, id)
     branches[stage] = { runShard(row, id, stage, stash) }
   }
-  // PR #1574 test sits alongside the pytest shards rather than as a
-  // top-level stage so it runs concurrently with them on a different agent
-  // class. Off by default, only landed when local_setup=true.
-  if (paramBool('local_setup')) {
-    branches['Local Setup (non-Docker) with Vivado'] = { runLocalSetupTest() }
-  }
   return branches
 }
 
@@ -190,9 +178,8 @@ String finnCiJobKey() {
   return jn.replaceAll('[^A-Za-z0-9._-]+', '_')
 }
 
-// Build trees are keyed on job/build so concurrent runs do not stomp on each
-// other. The shared NFS root makes them visible across agents when set,
-// otherwise the path is workspace-local but still build-keyed.
+// Keyed on job/build so concurrent runs don't stomp. NFS-shared when set,
+// workspace-local otherwise.
 String finnCiPerBuildRoot() {
   if (!env.BUILD_NUMBER) { error "BUILD_NUMBER is unset" }
   String r = env.FINN_AGENT_NFS_ROOT
@@ -204,10 +191,8 @@ String finnCiPerBuildRoot() {
   return "${ws}/tmp/ci_runs/${env.BUILD_NUMBER}"
 }
 
-// Bound disk usage across every agent's NFS subtree once per build, by
-// walking ${FINN_NFS_ROOT_BASE}/*/workspace/tmp/ci_runs/<job_key>/ from
-// whichever finn-build agent picked up Validate. No-op when the agent
-// has no NFS root resolved (purely local workspace).
+// Walks ${FINN_NFS_ROOT_BASE}/*/workspace/tmp/ci_runs/<job_key>/ to bound
+// disk across all agents from whichever picked up Validate. No-op without NFS.
 void rotateFinnCiBuildTmp() {
   if (!env.FINN_AGENT_NFS_ROOT) { return }
   String jk = finnCiJobKey()
@@ -219,11 +204,9 @@ void rotateFinnCiBuildTmp() {
   """
 }
 
-// Must run after node binding because ${NODE_NAME} resolves in Groovy and
-// run-docker.sh does not re-expand vars embedded in FINN_DOCKER_EXTRA. The
-// hostname pin is unconditional: bsub's gethostbyname() on the default
-// finn_dev_<user> hostname fails LSF submission with "Error 0", and that
-// is independent of whether the agent has FINN_AGENT_NFS_ROOT set.
+// Must run after node binding so ${NODE_NAME} resolves before
+// FINN_DOCKER_EXTRA is interpolated. Hostname pin is unconditional:
+// bsub's gethostbyname() on the default finn_dev_<user> fails with "Error 0".
 void withAgentNfsEnv(Closure body) {
   String agentNfsRoot = resolveAgentNfsRoot()
   String dockerExtra = "${env.FINN_DOCKER_EXTRA ?: ''} --hostname ${env.NODE_NAME}"
@@ -242,10 +225,8 @@ void withAgentNfsEnv(Closure body) {
   ]) { body() }
 }
 
-// Returns the agent-side NFS root, or null when this agent should run
-// with a workspace-local build dir. Order: (1) explicit per-agent override
-// from jenkins_slaves.yml env_vars, (2) ${FINN_NFS_ROOT_BASE}/${NODE_NAME}
-// when the base is mounted, (3) null (no NFS).
+// Order: explicit FINN_AGENT_NFS_ROOT > ${FINN_NFS_ROOT_BASE}/${NODE_NAME}
+// (if mounted) > null (workspace-local).
 String resolveAgentNfsRoot() {
   String explicit = env.FINN_AGENT_NFS_ROOT
   if (explicit) { return explicit }
@@ -258,10 +239,7 @@ String resolveAgentNfsRoot() {
   return "${FINN_NFS_ROOT_BASE}/${node}"
 }
 
-// Auto-provisioning of the per-agent subtree. Runs as the agent's own
-// user (cse-jenkins on FINN-build hosts) so directory ownership matches
-// existing trees without any setuid dance. Idempotent; first build on a
-// new agent pays for the mkdirs, subsequent builds find them in place.
+// Idempotent. Runs as the agent user so ownership matches existing trees.
 void ensureNfsWorkspaceTree(String root) {
   sh """
 mkdir -p \\
@@ -272,8 +250,7 @@ mkdir -p \\
 """
 }
 
-// Cold start every shard so stale outputs cannot mask ordering bugs or
-// dep regressions in a reused workspace.
+// Cold start so stale outputs don't mask ordering bugs in a reused workspace.
 void wipeStaleWorkspace() {
   sh 'git clean -ffdx'
 }
@@ -297,9 +274,8 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
         cleanPreviousBuildFiles(buildDir)
         try {
           catchError(stageResult: 'FAILURE') {
-            // Inner try/catch surfaces tool logs to console and tarballs
-            // them for Blue Ocean before letting catchError mark the stage
-            // red, so failures triage from the GUI without NFS access.
+            // Inner try/catch surfaces tool logs + tarballs them for
+            // Blue Ocean triage before catchError marks the stage red.
             try {
               Map opts = [
                   marker: row.marker,
@@ -335,68 +311,6 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
   }
 }
 
-// PR #1574 docker-less install smoke test. Runs only on the finn-v80 agent
-// because finn-build hosts are RHEL 9.1 and miss the apt/python3.10/
-// pybind11-dev/libboost-dev prerequisites that setup-local.sh assumes. The
-// V80 host needs scripts/install-system-deps.sh applied once out of band
-// (separate from this Jenkinsfile, since that step needs sudo). NFS-aware
-// via withAgentNfsEnv: when the V80 host does not see FINN_NFS_ROOT_BASE,
-// resolveAgentNfsRoot() returns null and we fall back to a workspace-local
-// build dir, which is the right behaviour for an isolated smoke test.
-//
-// The .venv at ${FINN_ROOT}/.venv is removed by wipeStaleWorkspace's
-// `git clean -ffdx`, so every run pays the cold pip-install + finn_xsi
-// compile cost (~10-15 min). That is the conservative default for a CI
-// smoke test; if the cost matters we can switch to `git clean -ffdx -e
-// .venv` for this stage only and let setup-local.sh's "Reusing existing
-// environment" branch kick in.
-void runLocalSetupTest() {
-  node('finn-v80') {
-    withAgentNfsEnv {
-      stage('Local Setup (non-Docker) with Vivado') {
-        checkout scm
-        wipeStaleWorkspace()
-        String perBuildRoot = finnCiPerBuildRoot()
-        String buildDir = "${perBuildRoot}/local_setup"
-        echo "[stage-map] build=${env.BUILD_NUMBER} stage='Local Setup (non-Docker) with Vivado' stash=local_setup shard=1/1 node=${env.NODE_NAME} workspace=${env.WORKSPACE} build_dir=${buildDir}"
-        // pip cache key tracks the inputs that drive what gets installed, so any
-        // dep change forces a fresh download. Stays under /scratch (local SSD)
-        // because /home/cse-jenkins on this host has a per-user NFS quota that
-        // pip wheels overflow within one cold install.
-        String pipCacheKey = sh(
-          returnStdout: true,
-          script: 'sha256sum requirements.txt setup.py setup.cfg pyproject.toml 2>/dev/null | sha256sum | cut -c1-16'
-        ).trim()
-        if (!pipCacheKey) { pipCacheKey = "build-${env.BUILD_NUMBER}" }
-        String pipCacheRoot = '/scratch/jenkins/.pip-cache'
-        String pipCacheDir  = "${pipCacheRoot}/${pipCacheKey}"
-        String xdgCacheDir  = '/scratch/jenkins/.xdg-cache'
-        withEnv([
-          "FINN_HOST_BUILD_DIR=${buildDir}",
-          "PIP_CACHE_DIR=${pipCacheDir}",
-          "XDG_CACHE_HOME=${xdgCacheDir}",
-        ]) {
-          sh """
-mkdir -p '${perBuildRoot}' '${pipCacheDir}' '${xdgCacheDir}'
-find '${pipCacheRoot}' -mindepth 1 -maxdepth 1 -type d -mtime +14 -not -path '${pipCacheDir}' \\
-  -exec rm -rf {} + 2>/dev/null || true
-"""
-          cleanPreviousBuildFiles(buildDir)
-          catchError(stageResult: 'FAILURE') {
-            sh "echo \"[local_setup] pip_cache_key=${pipCacheKey} python3=\$(python3 --version 2>&1) FINN_XILINX_PATH=\${FINN_XILINX_PATH:-<unset>}\""
-            sh './setup-local.sh'
-            sh '''#!/bin/bash
-set -eo pipefail
-source scripts/finn-env.sh
-./scripts/quicktest-local.sh vivado
-'''
-          }
-        }
-      }
-    }
-  }
-}
-
 // catchError keeps a stash hiccup from masking pytest's own pass/fail.
 void safeStashReport(String stashName) {
   catchError(buildResult: null, stageResult: null,
@@ -423,10 +337,8 @@ void archiveStageFolder(String folder) {
   }
 }
 
-// Counts per-tool runs and the hosts they ran on so a Blue Ocean consumer
-// can confirm LSF fan-out without GUI access. Pulls from each tool's own
-// log because the wrapper writes its diagnostics to stderr which pytest
-// captures into a buffer the test runner does not flush per-step.
+// Per-tool run counts + hosts so Blue Ocean shows LSF fan-out. Reads tool
+// logs directly because pytest captures the wrapper's stderr diagnostics.
 void printLsfSummary(String buildDir, String stashName) {
   catchError(buildResult: null, stageResult: null,
              message: "printLsfSummary(${stashName}) failed; non-fatal") {
@@ -438,9 +350,8 @@ agent='${agent}'
 tag='[lsf-summary ${stashName}]'
 if [ ! -d "\$bd" ]; then echo "\$tag no build dir"; exit 0; fi
 
-# vitis_hls prints "INFO: [HLS 200-10] ... on host '<host>'" once per run.
-# vivado prints "# Running On: <host>," at file head. Both markers land in
-# files vitis_hls itself or vivado itself create, never via shell redirect.
+# vitis_hls writes "INFO: [HLS 200-10] ... on host '<host>'" and vivado writes
+# "# Running On: <host>," at log head. Both are tool-emitted, never shell.
 hls_hosts=\$(find "\$bd" -name vitis_hls.log -exec grep -h "INFO: \\[HLS 200-10\\] .* on host '" {} + 2>/dev/null \\
   | awk -F"on host '" '{print \$2}' | awk -F"'" '{print \$1}')
 viv_hosts=\$(find "\$bd" -name vivado.log -exec grep -h '^# Running On:' {} + 2>/dev/null \\
@@ -468,11 +379,8 @@ echo "                          top: \$top"
   }
 }
 
-// Per-test failure summary lifted from the pytest JUnit XML. Closes the
-// gap that printFailureTails leaves when a shard fails without producing
-// a tool log (notebook execution timeouts, plain assertion errors,
-// fixture-level failures). Prints each failed test name plus the last
-// linesPerFailure lines of its traceback to the console.
+// Per-test failure summary from JUnit XML. Covers cases printFailureTails
+// misses when no tool log exists (notebook timeouts, asserts, fixture errors).
 void printPytestFailures(String stashName, int linesPerFailure, int maxFailures) {
   catchError(buildResult: null, stageResult: null,
              message: "printPytestFailures(${stashName}) failed; non-fatal") {
@@ -540,11 +448,8 @@ PYEOF
   }
 }
 
-// Dumps the tail of every tool log carrying an ERROR: marker. Lets a
-// maintainer see the actual error in the Jenkins console without
-// downloading the artifact tarball. Wrapper-side bsub failures arrive
-// via pytest's captured stderr which Jenkins already prints on test
-// failure, so this layer focuses on tool-resident errors.
+// Tail every tool log with an ERROR: marker so the Jenkins console shows
+// the actual error without downloading the artifact tarball.
 void printFailureTails(String buildDir, String stashName, int tailLines) {
   catchError(buildResult: null, stageResult: null,
              message: "printFailureTails(${stashName}) failed; non-fatal") {
@@ -578,9 +483,8 @@ done
   }
 }
 
-// One tarball per failed shard, keyed on stashName so multiple failed
-// shards never collide in the controller's archive. Filtered to logs a
-// maintainer would open, not the HLS compiler intermediates.
+// One tarball per failed shard, keyed on stashName to avoid archive
+// collisions. Excludes HLS compiler intermediates.
 void archiveFailureLogs(String buildDir, String stashName) {
   catchError(buildResult: null, stageResult: null,
              message: "archiveFailureLogs(${stashName}) failed; non-fatal") {
@@ -603,9 +507,8 @@ cd "\$bd" && find . -type f \\( \\
   }
 }
 
-// junit first because it is workspace-local and never flakes. The merge and
-// archive steps come after because agent-to-controller tar transfer can
-// flake on large globs and we still want JUnit reported.
+// junit first (workspace-local, never flakes). html merge/archive after,
+// because agent-to-controller tar transfer can flake on large globs.
 void aggregateReports() {
   sh 'mkdir -p reports'
   cleanPreviousBuildFiles('reports')
@@ -686,9 +589,8 @@ List<String> expectedStashes() {
   return stashes
 }
 
-// Pre-create buildDir as the unprivileged user. Otherwise docker's -v mount
-// auto-creates the bind parent as root:root and the in-container user cannot
-// write to it. Hard-fail on root-owned residue so an operator can sudo rm it.
+// Pre-create as the unprivileged user. Docker's -v auto-creates as root
+// otherwise. Hard-fail on root-owned residue so an admin can sudo rm.
 void cleanPreviousBuildFiles(String buildDir) {
   if (!buildDir || buildDir.empty) { return }
   sh """
@@ -724,10 +626,9 @@ df -BG "\$d" | awk 'NR==2 {print \$4}' | tr -d 'G'
   }
 }
 
-// Marker travels via env var so a malformed value cannot escape into the
-// shell, and the wrapper script keeps run-docker.sh from re-tokenising the
-// -m "..." argv. Exit 5 (no tests collected) maps to success because the
-// conftest plugin already loud-fails empty collection separately.
+// Marker via env var to prevent shell injection. Wrapper script stops
+// run-docker.sh re-tokenising the -m argv. Exit 5 (no tests) -> success
+// because the conftest plugin loud-fails empty collection separately.
 void runPytest(Map opts) {
   def parts = ["python -m pytest -m \"\$FINN_CI_MARKER\""]
   if (opts.workers) {
@@ -746,17 +647,16 @@ void runPytest(Map opts) {
   sh './run-docker.sh ./run-tests.sh'
 }
 
-// Silent no-op when the board's hw_deployment_* dir is absent because under
-// hash sharding only one shard runs cnv-w2a2. assertZipBoardsEmitted is the
-// safety net for the case where no shard produced it at all.
+// Silent no-op when hw_deployment_* is absent. Under hash sharding only
+// one shard runs cnv-w2a2. assertZipBoardsEmitted catches total absence.
 void findCopyZip(String board, String findDir, String copyDir) {
   if (!fileExists("${findDir}")) { return }
   def found = sh(returnStdout: true, script:
       "find ${findDir} -maxdepth 2 -type d -name '${board}' -path '*/hw_deployment_*/*' | head -1"
   ).trim()
   if (!found) { return }
-  // Reused workspaces can leave a stale ${copyDir}/${board} from an earlier
-  // build whose read-only .git/objects/pack/ blocks both rm and cp -r.
+  // Reused workspaces can leave stale read-only .git/objects/pack/ that
+  // blocks both rm and cp -r.
   sh """
     mkdir -p '${copyDir}'
     if [ -e '${copyDir}/${board}' ]; then

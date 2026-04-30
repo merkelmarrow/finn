@@ -1,9 +1,7 @@
-// HW-tethered pipeline. One row per board in HW_SHARDS, mirroring the
-// PARALLEL_SHARDS pattern in docker/jenkins/Jenkinsfile.
-//
-// Shared helpers (safeStashReport, aggregateReports, unstashIfPresent,
-// cleanPreviousBuildFiles) are duplicated from Jenkinsfile because Jenkins
-// declarative pipelines have no shared-library hook here. Keep in sync.
+// HW-tethered pipeline. HW_SHARDS row-per-board mirrors PARALLEL_SHARDS in
+// docker/jenkins/Jenkinsfile. Shared helpers (safeStashReport, aggregateReports,
+// unstashIfPresent, cleanPreviousBuildFiles) are duplicated — declarative
+// pipelines have no shared-library hook here. Keep in sync.
 
 import groovy.transform.Field
 
@@ -22,8 +20,7 @@ List<Map> HW_SHARDS = [
 @Field
 List<String> HW_TEST_TYPES = ['bnn_build_sanity', 'bnn_build_full']
 
-// Populated by refreshNodeOnlineFlags() and read by isOnline(). Keyed by
-// agentLabel so HW_SHARDS rows are the single source of truth.
+// Keyed by agentLabel so HW_SHARDS rows are the single source of truth.
 @Field
 Map<String, Boolean> NODE_ONLINE = [:]
 
@@ -72,8 +69,7 @@ boolean isOnline(String agentLabel) {
   return v != null && v
 }
 
-// One parallel reboot per board with restartPrep=true. Offline boards
-// are skipped inside runReboot().
+// One reboot per restartPrep=true board. runReboot() skips offline ones.
 Map<String, Closure> buildRebootMap() {
   def branches = [:]
   HW_SHARDS.each { row ->
@@ -118,8 +114,7 @@ Map<String, Closure> buildHwStageMap(String testType) {
   return branches
 }
 
-// Mirrors runShard() in Jenkinsfile. safeStashReport in `finally` so failed
-// stages still publish their junit XML.
+// Mirrors Jenkinsfile.runShard(). finally{} ensures junit XML on failure.
 void runHwShard(Map row, String testType, String stageName) {
   if (!isOnline(row.agentLabel as String)) {
     echo "${stageName} skipped: agent ${row.agentLabel} offline"
@@ -144,7 +139,7 @@ void runHwShard(Map row, String testType, String stageName) {
   }
 }
 
-// Boards with credentialsId get a withCredentials wrapper -- alveo has none.
+// Boards with credentialsId get a withCredentials wrapper. Alveo has none.
 void withHwCredentials(Map row, Closure body) {
   if (!row.credentialsId) {
     body.call()
@@ -178,8 +173,7 @@ void runHwTest(Map row, String testType) {
   }
 }
 
-// Marker is passed via env var (not interpolated) so shell metachars
-// in a malformed marker can't escape.
+// Marker via env var (not interpolated) to prevent shell injection.
 void createTestScript(Map row, String testResultsFilename) {
   String setup = (row.setupScript == 'alveo')
       ? '. /opt/xilinx/xrt/setup.sh\n. ${VENV_ACTIVATE}'
@@ -198,9 +192,8 @@ String hwStashName(String testType, String board) {
   return "${testType}_${board}"
 }
 
-// Find the newest <board>.zip across the legacy fixed path, the
-// sanity-build single-dir, and the per-shard full-build dirs. Returns ""
-// when no zip is found, in which case the caller logs and skips that shard.
+// Newest <board>.zip across legacy path, sanity single-dir, and per-shard
+// full-build dirs. Returns "" if absent (caller logs + skips the shard).
 String findBoardZip(String testType, String board) {
   String legacy = "${env.ARTIFACT_DIR}/${testType}/${board}.zip"
   if (fileExists(legacy)) { return legacy }
@@ -233,8 +226,7 @@ void stashBuildArtifacts(String testType) {
   }
 }
 
-// Filtered by agentLabel so offline boards don't appear in the expected
-// stash set (avoids spurious unstash warnings).
+// Skip offline boards to avoid spurious unstash warnings.
 List<String> expectedStashes() {
   def stashes = []
   HW_TEST_TYPES.each { testType ->
@@ -247,7 +239,6 @@ List<String> expectedStashes() {
   return stashes
 }
 
-// Used for offline-agent gating and for filtering expectedStashes.
 def isNodeOnline(String labelName) {
   Label label = Jenkins.instance.getLabel(labelName)
   def agentOnline = false

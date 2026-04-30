@@ -367,10 +367,9 @@ def deploy_based_on_board(model, model_title, topology, wbits, abits, board):
         model.set_metadata_prop("cpp_deploy_dir", deployment_dir)
 
 
-# Each scenario carries the single marker for the shard that should run it,
-# so pytest's own `-m <marker>` filter does the selection. Sanity scenarios
-# are a fixed 4-tuple (one per board) so `-m sanity_bnn` stays a single
-# build per board, separate from the 12-scenario `-m bnn_<board>` matrix.
+# Each scenario carries one marker so pytest -m <marker> picks the shard.
+# Sanity is a fixed 4-tuple (one per board). -m bnn_<board> selects the
+# 12-scenario matrix per-board.
 _SANITY_BNN_CONFIGS = [
     (1, 1, "lfc", "Pynq-Z1"),
     (1, 2, "cnv", "KV260_SOM"),

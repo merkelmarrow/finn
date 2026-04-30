@@ -68,12 +68,8 @@ class CallHLS:
         self.code_gen_dir = code_gen_dir
         self.ipgen_script = str(self.code_gen_dir) + "/ipgen.sh"
         working_dir = os.environ["PWD"]
-        # Per-call private TMPDIR. Concurrent vitis_hls processes spawned by
-        # a NodeLocalTransformation otherwise share /tmp, which (a) opens a
-        # cross-process collision surface the tool was never designed to
-        # handle and (b) makes flake forensics impossible because temp files
-        # from different layers intermix. HOME stays shared so persistent
-        # tool state (license cache, XDG configs) keeps working.
+        # Per-call private TMPDIR so concurrent vitis_hls processes don't
+        # share /tmp. HOME stays shared so license/XDG caches keep working.
         priv_tmp = os.path.join(code_gen_dir, ".vitis_tmp")
         os.makedirs(priv_tmp, exist_ok=True)
         f = open(self.ipgen_script, "w")

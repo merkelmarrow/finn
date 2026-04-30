@@ -192,19 +192,8 @@ class HLSBackend(ABC):
         return []
 
     def ipgen_singlenode_code(self, fpgapart=None):
-        """Builds the bash script for IP generation using the CallHLS utility.
-
-        Vitis HLS export_design has a known intra-process race in
-        auto_generate's `file delete -force .verilog/.vhdl/.pcore` that
-        surfaces under heavy local concurrency: the IP package step (pack.sh)
-        is silently skipped, leaving sol1/impl/ip without component.xml. The
-        downstream Vivado bd_cell creation then fails with BD 5-390 ("IP
-        definition not found"), and CreateStitchedIP raises with no wrapper
-        HDL. We detect that exact missing-component.xml signature and retry
-        the build from a clean project tree before declaring failure, since
-        the race is transient and the per-attempt cost is bounded by the
-        same vitis_hls runtime that already succeeded for sibling layers.
-        """
+        """Build IP via CallHLS, retrying when vitis_hls export_design's
+        auto_generate race silently skips pack.sh (no component.xml)."""
         node = self.onnx_node
         code_gen_dir = self.get_nodeattr("code_gen_dir_ipgen")
         ipgen_path = code_gen_dir + "/project_{}".format(node.name)
@@ -235,9 +224,8 @@ class HLSBackend(ABC):
                         node.name, attempt, max_attempts, last_diag
                     )
                 )
-                # The .verilog/.vhdl/.pcore tempdirs and partial pack
-                # state inside project_* must be gone before retry,
-                # otherwise the next vitis_hls run trips the same delete.
+                # Project tree must be gone before retry or the next run
+                # trips the same .verilog/.vhdl/.pcore delete.
                 if os.path.isdir(ipgen_path):
                     shutil.rmtree(ipgen_path, ignore_errors=True)
         if last_diag is not None:

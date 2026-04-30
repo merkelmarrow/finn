@@ -1,4 +1,4 @@
-# FINN Jenkins CI — maintainer guide
+# FINN Jenkins CI maintainer guide
 
 Every parallel stage is defined by **one row** of `STAGES` in
 [`tests/ci_shards.py`](../../tests/ci_shards.py). The
