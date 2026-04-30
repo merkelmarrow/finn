@@ -65,11 +65,7 @@ import finn.transformation.streamline.absorb as absorb
 from finn.analysis.fpgadataflow.dataflow_performance import dataflow_performance
 from finn.core.onnx_exec import execute_onnx
 from finn.core.throughput_test import throughput_test_rtlsim
-from finn.transformation.fpgadataflow.alveo_build import (
-    PrepareForLinking,
-    VitisLink,
-    VitisOptStrategy,
-)
+from finn.transformation.fpgadataflow.alveo_build import PrepareForLinking
 from finn.transformation.fpgadataflow.annotate_cycles import AnnotateCycles
 from finn.transformation.fpgadataflow.annotate_resources import AnnotateResources
 from finn.transformation.fpgadataflow.compile_cppsim import CompileCppSim
@@ -814,9 +810,10 @@ class TestEnd2End:
         build_data = get_build_env(board, target_clk_ns)
         prev_chkpt_name = get_checkpoint_name(board, topology, wbits, abits, "fifodepth")
         model = load_test_checkpoint_or_skip(prev_chkpt_name)
-        model = model.transform(
-            PrepareForLinking(build_data["part"], target_clk_ns, build_data["toolchain"])
-        )
+        if build_data["toolchain"] == "vitis-xrt":
+            model = model.transform(
+                PrepareForLinking(build_data["part"], target_clk_ns, build_data["toolchain"])
+            )
         model.save(get_checkpoint_name(board, topology, wbits, abits, "prepare_linking"))
 
     @pytest.mark.slow
@@ -828,11 +825,7 @@ class TestEnd2End:
             pytest.skip("VITIS_PATH not set")
         prev_chkpt_name = get_checkpoint_name(board, topology, wbits, abits, "prepare_linking")
         model = load_test_checkpoint_or_skip(prev_chkpt_name)
-        if build_data["toolchain"] == "vitis-xrt":
-            link_transformation = VitisLink(
-                build_data["vitis_platform"], target_clk_ns, strategy=VitisOptStrategy.BUILD_SPEED
-            )
-        model = model.transform(link_transformation)
+        model = model.transform(build_data["build_fxn"])
         model.save(get_checkpoint_name(board, topology, wbits, abits, "linking"))
 
     def test_annotate_resources(self, topology, wbits, abits, board):

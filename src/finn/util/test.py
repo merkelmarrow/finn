@@ -41,6 +41,7 @@ from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.custom_op.registry import getCustomOp
 
 from finn.core.onnx_exec import execute_onnx
+from finn.transformation.fpgadataflow.alveo_build import VitisLink, VitisOptStrategy
 from finn.transformation.fpgadataflow.make_zynq_proj import ZynqBuild
 from finn.util.basic import pynq_part_map, vitis_default_platform, vitis_part_map
 
@@ -117,6 +118,9 @@ def get_build_env(board, target_clk_ns):
         ret["toolchain"] = "vitis-xrt"
         ret["part"] = vitis_part_map[board]
         ret["vitis_platform"] = vitis_default_platform[board]
+        ret["build_fxn"] = VitisLink(
+            vitis_default_platform[board], target_clk_ns, strategy=VitisOptStrategy.BUILD_SPEED
+        )
     else:
         raise Exception("Unknown board specified")
     return ret
