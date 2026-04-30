@@ -40,7 +40,7 @@ recho() {
 # Script configuration
 SCRIPT=$(readlink -f "$0")
 SCRIPTPATH=$(dirname "$SCRIPT")
-FINN_ROOT="$SCRIPTPATH"
+export FINN_ROOT="$SCRIPTPATH"
 
 # Default values
 CI_MODE=0
