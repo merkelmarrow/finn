@@ -30,6 +30,7 @@ import glob
 import numpy as np
 import os
 import re
+import shutil
 import subprocess
 import warnings
 from abc import ABC, abstractmethod
@@ -191,21 +192,60 @@ class HLSBackend(ABC):
         return []
 
     def ipgen_singlenode_code(self, fpgapart=None):
-        """Builds the bash script for IP generation using the CallHLS utility."""
+        """Builds the bash script for IP generation using the CallHLS utility.
+
+        Vitis HLS export_design has a known intra-process race in
+        auto_generate's `file delete -force .verilog/.vhdl/.pcore` that
+        surfaces under heavy local concurrency: the IP package step (pack.sh)
+        is silently skipped, leaving sol1/impl/ip without component.xml. The
+        downstream Vivado bd_cell creation then fails with BD 5-390 ("IP
+        definition not found"), and CreateStitchedIP raises with no wrapper
+        HDL. We detect that exact missing-component.xml signature and retry
+        the build from a clean project tree before declaring failure, since
+        the race is transient and the per-attempt cost is bounded by the
+        same vitis_hls runtime that already succeeded for sibling layers.
+        """
         node = self.onnx_node
         code_gen_dir = self.get_nodeattr("code_gen_dir_ipgen")
-        builder = CallHLS()
-        builder.append_tcl(code_gen_dir + "/hls_syn_{}.tcl".format(node.name))
-        builder.set_ipgen_path(code_gen_dir + "/project_{}".format(node.name))
-        builder.build(code_gen_dir)
-        ipgen_path = builder.ipgen_path
-        assert os.path.isdir(ipgen_path), "IPGen failed: %s not found" % (ipgen_path)
-        self.set_nodeattr("ipgen_path", ipgen_path)
+        ipgen_path = code_gen_dir + "/project_{}".format(node.name)
         ip_path = ipgen_path + "/sol1/impl/ip"
-        assert os.path.isdir(ip_path), "IPGen failed: %s not found. Check log under %s" % (
-            ip_path,
-            code_gen_dir,
-        )
+        component_xml = ip_path + "/component.xml"
+        max_attempts = max(1, int(os.environ.get("FINN_HLS_IPGEN_MAX_ATTEMPTS", "2")))
+        last_diag = None
+        for attempt in range(1, max_attempts + 1):
+            builder = CallHLS()
+            builder.append_tcl(code_gen_dir + "/hls_syn_{}.tcl".format(node.name))
+            builder.set_ipgen_path(ipgen_path)
+            builder.build(code_gen_dir)
+            if os.path.isdir(ipgen_path) and os.path.isfile(component_xml):
+                last_diag = None
+                break
+            if not os.path.isdir(ipgen_path):
+                last_diag = "project dir {} not produced".format(ipgen_path)
+            else:
+                last_diag = (
+                    "vitis_hls export_design completed but pack.sh did not "
+                    "produce {} (likely auto_generate .verilog race in "
+                    "export_design)".format(component_xml)
+                )
+            if attempt < max_attempts:
+                warnings.warn(
+                    "[ipgen_retry] node={} attempt {}/{} failed: {}. "
+                    "Wiping project tree and retrying.".format(
+                        node.name, attempt, max_attempts, last_diag
+                    )
+                )
+                # The .verilog/.vhdl/.pcore tempdirs and partial pack
+                # state inside project_* must be gone before retry,
+                # otherwise the next vitis_hls run trips the same delete.
+                if os.path.isdir(ipgen_path):
+                    shutil.rmtree(ipgen_path, ignore_errors=True)
+        if last_diag is not None:
+            raise RuntimeError(
+                "IPGen failed for node {} after {} attempt(s): {}. "
+                "Check log under {}.".format(node.name, max_attempts, last_diag, code_gen_dir)
+            )
+        self.set_nodeattr("ipgen_path", ipgen_path)
         self.set_nodeattr("ip_path", ip_path)
         vlnv = "xilinx.com:hls:%s:1.0" % node.name
         self.set_nodeattr("ip_vlnv", vlnv)
