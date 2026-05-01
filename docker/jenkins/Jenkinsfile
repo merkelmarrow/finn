@@ -484,7 +484,9 @@ done
 }
 
 // One tarball per failed shard, keyed on stashName to avoid archive
-// collisions. Excludes HLS compiler intermediates.
+// collisions. Excludes HLS compiler intermediates. LSF staging logs live
+// outside the build dir (FINN_LSF_NFS_STAGING) so they need a separate
+// find rooted there, scoped to dirs touched since the shard started.
 void archiveFailureLogs(String buildDir, String stashName) {
   catchError(buildResult: null, stageResult: null,
              message: "archiveFailureLogs(${stashName}) failed; non-fatal") {
@@ -493,15 +495,25 @@ void archiveFailureLogs(String buildDir, String stashName) {
 set +e
 bd='${buildDir}'
 tarball='${env.WORKSPACE}/${tarball}'
+lsf_staging="\${FINN_LSF_NFS_STAGING:-/group/cdc_ir/members_noer/cse_jenkins/lsf_vivado_staging}"
 mkdir -p "\$(dirname "\$tarball")"
 if [ ! -d "\$bd" ]; then exit 0; fi
-cd "\$bd" && find . -type f \\( \\
-    -name vitis_hls.log -o \\
-    -name build_dataflow.log -o \\
-    -path '*/project_*/sol1/impl/ip/vivado.log' -o \\
-    -path '*/finn_zynqbuild_*/vivado.log' -o \\
-    -path '*/vitis_proj/_x/logs/*.log' \\
-  \\) -print0 | tar --null --create --gzip --file "\$tarball" --files-from - 2>/dev/null || true
+{
+    cd "\$bd" && find . -type f \\( \\
+        -name vitis_hls.log -o \\
+        -name build_dataflow.log -o \\
+        -path '*/project_*/sol1/impl/ip/vivado.log' -o \\
+        -path '*/finn_zynqbuild_*/vivado.log' -o \\
+        -path '*/vitis_proj/_x/logs/*.log' \\
+      \\) -print0 2>/dev/null
+    if [ -d "\$lsf_staging" ]; then
+        find "\$lsf_staging" -mindepth 2 -maxdepth 3 -type f -newer "\$bd" \\( \\
+            -name 'lsf.stdout' -o \\
+            -name 'lsf.stderr' -o \\
+            -name 'remote_runner.sh' \\
+          \\) -print0 2>/dev/null
+    fi
+} | tar --null --create --gzip --file "\$tarball" --files-from - 2>/dev/null || true
 """
     archiveArtifacts artifacts: tarball, allowEmptyArchive: true
   }
