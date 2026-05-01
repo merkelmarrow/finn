@@ -1966,17 +1966,17 @@
     "tests/util/test_modelwrapper.py::test_get_first_global_in_out[test_input-test_output]": 0.001
   },
   "sources": [
-    "../../cse_jenkins/jenkins_workspaces/xircseeng01/workspace/workspace/finn_ci_speedup/reports/bnn_kv260_1.timings.json",
-    "../../cse_jenkins/jenkins_workspaces/xircseeng01/workspace/workspace/finn_ci_speedup/reports/bnn_kv260_2.timings.json",
-    "../../cse_jenkins/jenkins_workspaces/xircseeng01/workspace/workspace/finn_ci_speedup/reports/bnn_pynq_z1_1.timings.json",
-    "../../cse_jenkins/jenkins_workspaces/xircseeng01/workspace/workspace/finn_ci_speedup/reports/bnn_pynq_z1_2.timings.json",
-    "../../cse_jenkins/jenkins_workspaces/xircseeng01/workspace/workspace/finn_ci_speedup/reports/bnn_pynq_z1_3.timings.json",
-    "../../cse_jenkins/jenkins_workspaces/xircseeng01/workspace/workspace/finn_ci_speedup/reports/bnn_u250_1.timings.json",
-    "../../cse_jenkins/jenkins_workspaces/xircseeng01/workspace/workspace/finn_ci_speedup/reports/bnn_u250_2.timings.json",
-    "../../cse_jenkins/jenkins_workspaces/xircseeng01/workspace/workspace/finn_ci_speedup/reports/bnn_zcu104_1.timings.json",
-    "../../cse_jenkins/jenkins_workspaces/xircseeng01/workspace/workspace/finn_ci_speedup/reports/bnn_zcu104_2.timings.json",
-    "../../cse_jenkins/jenkins_workspaces/xircseeng01/workspace/workspace/finn_ci_speedup/reports/end2end_1.timings.json",
-    "../../cse_jenkins/jenkins_workspaces/xircseeng01/workspace/workspace/finn_ci_speedup/reports/end2end_2.timings.json",
-    "../../cse_jenkins/jenkins_workspaces/xircseeng01/workspace/workspace/finn_ci_speedup/reports/sanity_unit_tests.timings.json"
+    "bnn_kv260_1.timings.json",
+    "bnn_kv260_2.timings.json",
+    "bnn_pynq_z1_1.timings.json",
+    "bnn_pynq_z1_2.timings.json",
+    "bnn_pynq_z1_3.timings.json",
+    "bnn_u250_1.timings.json",
+    "bnn_u250_2.timings.json",
+    "bnn_zcu104_1.timings.json",
+    "bnn_zcu104_2.timings.json",
+    "end2end_1.timings.json",
+    "end2end_2.timings.json",
+    "sanity_unit_tests.timings.json"
   ]
 }

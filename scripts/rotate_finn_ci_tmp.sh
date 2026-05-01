@@ -4,9 +4,9 @@
 #   <nfs_root_base>/<NODE_NAME>/workspace/tmp/ci_runs/<job_key>/<BUILD_NUMBER>/
 #
 # Invoked once per build from docker/jenkins/Jenkinsfile (Validate). Walks
-# every <nfs_root_base>/*/workspace/tmp/ci_runs/<job_key>/ on disk so the
-# multi-agent fan-out (xircseeng01 + xirdcglab*) is rotated by a single
-# call regardless of which agent picked up Validate.
+# every <nfs_root_base>/*/workspace/tmp/ci_runs/<job_key>/ on disk so a
+# multi-agent fan-out is rotated by a single call regardless of which
+# agent picked up Validate.
 #
 # Per-tree policy:
 #   - Always keep <current_build>.

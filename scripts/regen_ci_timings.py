@@ -62,7 +62,7 @@ def main(argv):
     payload = {
         "_comment": "Per-group wall seconds; regenerate with "
                     "scripts/regen_ci_timings.py against latest CI reports.",
-        "sources": [os.path.relpath(p, REPO_ROOT) for p in files],
+        "sources": sorted({os.path.basename(p) for p in files}),
         "groups": {k: round(v, 3) for k, v in sorted(groups.items())},
     }
     with open(DEFAULT_OUT, "w") as f:

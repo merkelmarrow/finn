@@ -16,10 +16,11 @@ int FINN_CI_TMP_RETAIN_BUILDS = 5
 @Field
 int FINN_CI_TMP_MAX_AGE_DAYS = 14
 
-// Per-host subtree auto-created at ${base}/${NODE_NAME}/. FINN_AGENT_NFS_ROOT
-// from jenkins_slaves.yml overrides per agent.
+// Per-host subtree auto-created at ${base}/${NODE_NAME}/. Operators set
+// FINN_NFS_ROOT_BASE on the controller (or per-agent FINN_AGENT_NFS_ROOT
+// in jenkins_slaves.yml). Empty falls back to workspace-local execution.
 @Field
-String FINN_NFS_ROOT_BASE = '/group/cdc_ir/members_noer/cse_jenkins/jenkins_workspaces'
+String FINN_NFS_ROOT_BASE = (env.FINN_NFS_ROOT_BASE ?: '').trim()
 
 void loadStageConfig() {
   String json = sh(returnStdout: true, script:
@@ -195,6 +196,7 @@ String finnCiPerBuildRoot() {
 // disk across all agents from whichever picked up Validate. No-op without NFS.
 void rotateFinnCiBuildTmp() {
   if (!env.FINN_AGENT_NFS_ROOT) { return }
+  if (!FINN_NFS_ROOT_BASE) { return }
   String jk = finnCiJobKey()
   String bn = env.BUILD_NUMBER
   String ws = env.WORKSPACE
@@ -232,6 +234,7 @@ String resolveAgentNfsRoot() {
   if (explicit) { return explicit }
   String node = env.NODE_NAME
   if (!node) { return null }
+  if (!FINN_NFS_ROOT_BASE) { return null }
   if (!fileExists(FINN_NFS_ROOT_BASE)) {
     echo "withAgentNfsEnv: ${FINN_NFS_ROOT_BASE} not visible on ${node}; falling back to local workspace"
     return null
@@ -495,7 +498,7 @@ void archiveFailureLogs(String buildDir, String stashName) {
 set +e
 bd='${buildDir}'
 tarball='${env.WORKSPACE}/${tarball}'
-lsf_staging="\${FINN_LSF_NFS_STAGING:-/group/cdc_ir/members_noer/cse_jenkins/lsf_vivado_staging}"
+lsf_staging="\${FINN_LSF_NFS_STAGING:-}"
 mkdir -p "\$(dirname "\$tarball")"
 if [ ! -d "\$bd" ]; then exit 0; fi
 {
