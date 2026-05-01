@@ -43,6 +43,7 @@ pipeline {
     booleanParam(name: 'fpgadataflow', defaultValue: false, description: 'Run fpgadataflow tests')
     booleanParam(name: 'sanity',       defaultValue: true,  description: 'Run sanity hardware and unit tests')
     booleanParam(name: 'end2end',      defaultValue: false, description: 'Run end2end tests')
+    booleanParam(name: 'local_setup',  defaultValue: false, description: 'Run the docker-less local setup smoke test (PR #1574)')
     string(name: 'STAGES', defaultValue: '',
            description: 'Substring filter on stage name (empty = all). Use to run one row for debugging.')
   }
@@ -142,6 +143,9 @@ Map<String, Closure> buildParallelStageMap() {
     String stage = shardStageName(row, id)
     String stash = shardStashName(row, id)
     branches[stage] = { runShard(row, id, stage, stash) }
+  }
+  if (paramBool('local_setup')) {
+    branches['Local Setup (non-Docker) with Vivado'] = { runLocalSetupTest() }
   }
   return branches
 }
@@ -310,6 +314,35 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
         }
       }
     }
+    }
+  }
+}
+
+// Pinned to finn-v80 because finn-build hosts (RHEL 9.1) lack the
+// apt/python3.10 prerequisites that setup-local.sh expects. Run
+// scripts/install-system-deps.sh on the agent once before enabling.
+void runLocalSetupTest() {
+  node('finn-v80') {
+    withAgentNfsEnv {
+      stage('Local Setup (non-Docker) with Vivado') {
+        checkout scm
+        wipeStaleWorkspace()
+        String perBuildRoot = finnCiPerBuildRoot()
+        String buildDir = "${perBuildRoot}/local_setup"
+        echo "[stage-map] build=${env.BUILD_NUMBER} stage='Local Setup (non-Docker) with Vivado' stash=local_setup shard=1/1 node=${env.NODE_NAME} workspace=${env.WORKSPACE} build_dir=${buildDir}"
+        withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
+          sh "mkdir -p '${perBuildRoot}'"
+          cleanPreviousBuildFiles(buildDir)
+          catchError(stageResult: 'FAILURE') {
+            sh './setup-local.sh'
+            sh '''#!/bin/bash
+set -eo pipefail
+source scripts/finn-env.sh
+./scripts/quicktest-local.sh vivado
+'''
+          }
+        }
+      }
     }
   }
 }
