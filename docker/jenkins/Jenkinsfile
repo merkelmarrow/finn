@@ -19,8 +19,8 @@ int FINN_CI_TMP_MAX_AGE_DAYS = 14
 // Per-host subtree auto-created at ${base}/${NODE_NAME}/. Operators set
 // FINN_NFS_ROOT_BASE on the controller (or per-agent FINN_AGENT_NFS_ROOT
 // in jenkins_slaves.yml). Empty falls back to workspace-local execution.
-@Field
-String FINN_NFS_ROOT_BASE = (env.FINN_NFS_ROOT_BASE ?: '').trim()
+// `env` is unavailable at script-init scope, so resolve lazily.
+String finnNfsRootBase() { return (env.FINN_NFS_ROOT_BASE ?: '').trim() }
 
 void loadStageConfig() {
   String json = sh(returnStdout: true, script:
@@ -200,13 +200,14 @@ String finnCiPerBuildRoot() {
 // disk across all agents from whichever picked up Validate. No-op without NFS.
 void rotateFinnCiBuildTmp() {
   if (!env.FINN_AGENT_NFS_ROOT) { return }
-  if (!FINN_NFS_ROOT_BASE) { return }
+  String base = finnNfsRootBase()
+  if (!base) { return }
   String jk = finnCiJobKey()
   String bn = env.BUILD_NUMBER
   String ws = env.WORKSPACE
   if (!ws) { echo "rotateFinnCiBuildTmp: WORKSPACE unset, skipping"; return }
   sh """
-    bash "${ws}/scripts/rotate_finn_ci_tmp.sh" "${FINN_NFS_ROOT_BASE}" "${jk}" "${bn}" ${FINN_CI_TMP_RETAIN_BUILDS} ${FINN_CI_TMP_MAX_AGE_DAYS}
+    bash "${ws}/scripts/rotate_finn_ci_tmp.sh" "${base}" "${jk}" "${bn}" ${FINN_CI_TMP_RETAIN_BUILDS} ${FINN_CI_TMP_MAX_AGE_DAYS}
   """
 }
 
@@ -238,12 +239,13 @@ String resolveAgentNfsRoot() {
   if (explicit) { return explicit }
   String node = env.NODE_NAME
   if (!node) { return null }
-  if (!FINN_NFS_ROOT_BASE) { return null }
-  if (!fileExists(FINN_NFS_ROOT_BASE)) {
-    echo "withAgentNfsEnv: ${FINN_NFS_ROOT_BASE} not visible on ${node}; falling back to local workspace"
+  String base = finnNfsRootBase()
+  if (!base) { return null }
+  if (!fileExists(base)) {
+    echo "withAgentNfsEnv: ${base} not visible on ${node}; falling back to local workspace"
     return null
   }
-  return "${FINN_NFS_ROOT_BASE}/${node}"
+  return "${base}/${node}"
 }
 
 // Idempotent. Runs as the agent user so ownership matches existing trees.
