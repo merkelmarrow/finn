@@ -323,6 +323,8 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
 // Pinned to finn-v80 because finn-build hosts (RHEL 9.1) lack the
 // apt/python3.10 prerequisites that setup-local.sh expects. Run
 // scripts/install-system-deps.sh on the agent once before enabling.
+// pip and XDG caches go to /scratch/jenkins because /home/cse-jenkins is
+// quota-bound and a cold pip install overflows it.
 void runLocalSetupTest() {
   node('finn-v80') {
     withAgentNfsEnv {
@@ -332,8 +334,25 @@ void runLocalSetupTest() {
         String perBuildRoot = finnCiPerBuildRoot()
         String buildDir = "${perBuildRoot}/local_setup"
         echo "[stage-map] build=${env.BUILD_NUMBER} stage='Local Setup (non-Docker) with Vivado' stash=local_setup shard=1/1 node=${env.NODE_NAME} workspace=${env.WORKSPACE} build_dir=${buildDir}"
-        withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
-          sh "mkdir -p '${perBuildRoot}'"
+        // Cache key tracks the dep inputs so changes force a fresh download.
+        String pipCacheKey = sh(
+          returnStdout: true,
+          script: 'sha256sum requirements.txt setup.py setup.cfg pyproject.toml 2>/dev/null | sha256sum | cut -c1-16'
+        ).trim()
+        if (!pipCacheKey) { pipCacheKey = "build-${env.BUILD_NUMBER}" }
+        String pipCacheRoot = '/scratch/jenkins/.pip-cache'
+        String pipCacheDir  = "${pipCacheRoot}/${pipCacheKey}"
+        String xdgCacheDir  = '/scratch/jenkins/.xdg-cache'
+        withEnv([
+          "FINN_HOST_BUILD_DIR=${buildDir}",
+          "PIP_CACHE_DIR=${pipCacheDir}",
+          "XDG_CACHE_HOME=${xdgCacheDir}",
+        ]) {
+          sh """
+mkdir -p '${perBuildRoot}' '${pipCacheDir}' '${xdgCacheDir}'
+find '${pipCacheRoot}' -mindepth 1 -maxdepth 1 -type d -mtime +14 -not -path '${pipCacheDir}' \\
+  -exec rm -rf {} + 2>/dev/null || true
+"""
           cleanPreviousBuildFiles(buildDir)
           catchError(stageResult: 'FAILURE') {
             sh './setup-local.sh'
