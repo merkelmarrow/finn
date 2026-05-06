@@ -250,7 +250,8 @@ def run_all_config_checks(cfg: DataflowBuildConfig) -> Report:
                     Severity.ERROR,
                     False,
                     f"VITIS_ALVEO flow requires environment variables: {', '.join(missing)}",
-                    "Source the Vitis and XRT setup scripts before running the build",
+                    "VITIS_PATH and XILINX_XRT are set by the Docker container (ensure "
+                    "SKIP_XRT is not set). PLATFORM_REPO_PATHS must be set by the user",
                 )
             )
 
