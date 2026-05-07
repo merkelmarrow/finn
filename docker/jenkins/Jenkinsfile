@@ -43,7 +43,7 @@ pipeline {
     booleanParam(name: 'fpgadataflow', defaultValue: false, description: 'Run fpgadataflow tests')
     booleanParam(name: 'sanity',       defaultValue: true,  description: 'Run sanity hardware and unit tests')
     booleanParam(name: 'end2end',      defaultValue: false, description: 'Run end2end tests')
-    booleanParam(name: 'local_setup',  defaultValue: false, description: 'Run the docker-less local setup smoke test (PR #1574)')
+    booleanParam(name: 'local_setup',  defaultValue: false, description: 'Run local (non-Docker) setup test with Vivado')
     string(name: 'STAGES', defaultValue: '',
            description: 'Substring filter on stage name (empty = all). Use to run one row for debugging.')
   }
