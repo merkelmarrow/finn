@@ -390,68 +390,42 @@ def test_elementwise_binary_operation_stitched_ip(
 
 
 @pytest.mark.fpgadataflow
-def test_elementwise_binary_operation_embedded_uram_prepare_ip_rejects_old_vivado(
-    monkeypatch,
-):
-    monkeypatch.setenv("XILINX_VIVADO", "/tools/Vivado/2022.2")
-    part = "xcvc1902-vsva2197-2MP-e-S"
-    op_type = "ElementwiseAdd"
-    lhs_dtype = "INT8"
-    rhs_dtype = "INT8"
-    out_dtype = "INT9"
-    lhs_shape = [1, 32]
-    rhs_shape = [1, 32]
-    model = create_elementwise_binary_operation_onnx(
-        op_type, lhs_dtype, rhs_dtype, out_dtype, lhs_shape, rhs_shape
-    )
-    model.set_initializer("in_y", gen_finn_dt_tensor(DataType[rhs_dtype], rhs_shape))
-
-    model = model.transform(InferDataTypes())
-    model = model.transform(InferShapes())
-    model = model.transform(InferElementwiseBinaryOperation())
-    inst = getCustomOp(model.graph.node[0])
-    inst.set_nodeattr("ram_style", "ultra")
-    inst.set_nodeattr("preferred_impl_style", "hls")
-    model = model.transform(SpecializeLayers(part))
-    model = model.transform(GiveUniqueNodeNames())
-    with pytest.raises(AssertionError, match="Vivado/Vitis HLS 2024.2"):
-        model.transform(PrepareIP(part, 10))
-
-
-@pytest.mark.fpgadataflow
-def test_elementwise_binary_operation_embedded_uram_prepare_ip_rejects_non_versal(
-    monkeypatch,
-):
-    monkeypatch.setenv("XILINX_VIVADO", "/tools/Vivado/2024.2")
-    part = "xczu7ev-ffvc1156-2-e"
-    op_type = "ElementwiseAdd"
-    lhs_dtype = "INT8"
-    rhs_dtype = "INT8"
-    out_dtype = "INT9"
-    lhs_shape = [1, 32]
-    rhs_shape = [1, 32]
-    model = create_elementwise_binary_operation_onnx(
-        op_type, lhs_dtype, rhs_dtype, out_dtype, lhs_shape, rhs_shape
-    )
-    model.set_initializer("in_y", gen_finn_dt_tensor(DataType[rhs_dtype], rhs_shape))
-
-    model = model.transform(InferDataTypes())
-    model = model.transform(InferShapes())
-    model = model.transform(InferElementwiseBinaryOperation())
-    inst = getCustomOp(model.graph.node[0])
-    inst.set_nodeattr("ram_style", "ultra")
-    inst.set_nodeattr("preferred_impl_style", "hls")
-    model = model.transform(SpecializeLayers(part))
-    model = model.transform(GiveUniqueNodeNames())
-    with pytest.raises(AssertionError, match="requires a Versal target"):
-        model.transform(PrepareIP(part, 10))
-
-
-@pytest.mark.fpgadataflow
 @pytest.mark.slow
 @pytest.mark.vivado
-def test_elementwise_binary_operation_uram_stitched_ip():
-    part = "xcvc1902-vsva2197-2MP-e-S"
+@pytest.mark.parametrize(
+    "mem_mode, ram_style, part, vivado_path, expected_prepare_ip_error",
+    [
+        pytest.param(
+            "internal_decoupled",
+            "ultra",
+            "xcvc1902-vsva2197-2MP-e-S",
+            None,
+            None,
+            id="versal-decoupled-uram",
+        ),
+        pytest.param(
+            "internal_embedded",
+            "ultra",
+            "xcvc1902-vsva2197-2MP-e-S",
+            "/tools/Vivado/2022.2",
+            "Vivado/Vitis HLS 2024.2",
+            id="versal-embedded-uram-vivado-2022-2",
+        ),
+        pytest.param(
+            "internal_embedded",
+            "ultra",
+            "xczu7ev-ffvc1156-2-e",
+            None,
+            "requires a Versal target",
+            id="non-versal-embedded-uram",
+        ),
+    ],
+)
+def test_elementwise_binary_operation_uram_stitched_ip(
+    monkeypatch, mem_mode, ram_style, part, vivado_path, expected_prepare_ip_error
+):
+    if vivado_path is not None:
+        monkeypatch.setenv("XILINX_VIVADO", vivado_path)
     op_type = "ElementwiseAdd"
     lhs_dtype = "INT8"
     rhs_dtype = "INT8"
@@ -474,8 +448,8 @@ def test_elementwise_binary_operation_uram_stitched_ip():
     model = model.transform(InferElementwiseBinaryOperation())
     inst = getCustomOp(model.graph.node[0])
     inst.set_nodeattr("PE", pe)
-    inst.set_nodeattr("mem_mode", "internal_decoupled")
-    inst.set_nodeattr("ram_style", "ultra")
+    inst.set_nodeattr("mem_mode", mem_mode)
+    inst.set_nodeattr("ram_style", ram_style)
     inst.set_nodeattr("preferred_impl_style", "hls")
 
     model = model.transform(SpecializeLayers(part))
@@ -486,16 +460,22 @@ def test_elementwise_binary_operation_uram_stitched_ip():
     model = model.transform(MinimizeAccumulatorWidth())
     model = model.transform(SetExecMode("rtlsim"))
     model = model.transform(GiveUniqueNodeNames())
+    if expected_prepare_ip_error is not None:
+        with pytest.raises(AssertionError, match=expected_prepare_ip_error):
+            model.transform(PrepareIP(part, 10))
+        return
+
     model = model.transform(PrepareIP(part, 10))
 
-    node = model.get_nodes_by_op_type(f"{op_type}_hls")[0]
-    inst = getCustomOp(node)
-    memstream_wrapper = os.path.join(
-        inst.get_nodeattr("code_gen_dir_ipgen"),
-        node.name + "_memstream_wrapper.v",
-    )
-    with open(memstream_wrapper, "r") as f:
-        assert 'parameter  RAM_STYLE = "ultra"' in f.read()
+    if mem_mode == "internal_decoupled":
+        node = model.get_nodes_by_op_type(f"{op_type}_hls")[0]
+        inst = getCustomOp(node)
+        memstream_wrapper = os.path.join(
+            inst.get_nodeattr("code_gen_dir_ipgen"),
+            node.name + "_memstream_wrapper.v",
+        )
+        with open(memstream_wrapper, "r") as f:
+            assert f'parameter  RAM_STYLE = "{ram_style}"' in f.read()
 
     model = model.transform(HLSSynthIP())
     model = model.transform(PrepareRTLSim())

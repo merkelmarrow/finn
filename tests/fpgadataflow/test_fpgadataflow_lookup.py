@@ -152,9 +152,38 @@ def test_fpgadataflow_lookup(edt, embedding_cfg, exec_mode):
 @pytest.mark.fpgadataflow
 @pytest.mark.vivado
 @pytest.mark.slow
-def test_fpgadataflow_lookup_uram_rtlsim():
+@pytest.mark.parametrize(
+    "fpga_part, ram_style, vivado_path, expected_prepare_ip_error",
+    [
+        pytest.param(
+            "xcvc1902-vsva2197-2MP-e-S",
+            "ultra",
+            None,
+            None,
+            id="versal-uram",
+        ),
+        pytest.param(
+            "xcvc1902-vsva2197-2MP-e-S",
+            "ultra",
+            "/tools/Vivado/2022.2",
+            "Vivado/Vitis HLS 2024.2",
+            id="versal-uram-vivado-2022-2",
+        ),
+        pytest.param(
+            "xczu3eg-sbva484-1-e",
+            "ultra",
+            None,
+            "requires a Versal target",
+            id="non-versal-uram",
+        ),
+    ],
+)
+def test_fpgadataflow_lookup_uram_rtlsim(
+    monkeypatch, fpga_part, ram_style, vivado_path, expected_prepare_ip_error
+):
+    if vivado_path is not None:
+        monkeypatch.setenv("XILINX_VIVADO", vivado_path)
     vivado_version = get_vivado_version()
-    fpga_part = "xcvc1902-vsva2197-2MP-e-S"
     edt = DataType["INT8"]
     num_embeddings = 4096
     idt = DataType["UINT16"]
@@ -172,12 +201,19 @@ def test_fpgadataflow_lookup_uram_rtlsim():
     model = model.transform(SpecializeLayers(fpga_part))
     assert model.graph.node[0].op_type == "Lookup_hls"
     inst = getCustomOp(model.graph.node[0])
-    inst.set_nodeattr("ram_style", "ultra")
+    inst.set_nodeattr("ram_style", ram_style)
     assert inst.uram_estimation() > 0
 
     model = model.transform(GiveUniqueNodeNames())
-    if vivado_version is not None and vivado_version < (2024, 2):
-        with pytest.raises(AssertionError, match="Vivado/Vitis HLS 2024.2"):
+    if (
+        expected_prepare_ip_error is None
+        and vivado_version is not None
+        and vivado_version < (2024, 2)
+    ):
+        expected_prepare_ip_error = "Vivado/Vitis HLS 2024.2"
+
+    if expected_prepare_ip_error is not None:
+        with pytest.raises(AssertionError, match=expected_prepare_ip_error):
             model.transform(PrepareIP(fpga_part, 10))
         return
 
@@ -187,50 +223,6 @@ def test_fpgadataflow_lookup_uram_rtlsim():
     model = model.transform(PrepareRTLSim())
     ret_sim = execute_onnx(model, {iname: itensor})
     assert (exp_out == ret_sim[oname]).all()
-
-
-@pytest.mark.fpgadataflow
-def test_fpgadataflow_lookup_uram_prepare_ip_rejects_old_vivado(monkeypatch):
-    monkeypatch.setenv("XILINX_VIVADO", "/tools/Vivado/2022.2")
-    fpga_part = "xcvc1902-vsva2197-2MP-e-S"
-    edt = DataType["INT8"]
-    num_embeddings = 4096
-    idt = DataType["UINT16"]
-    embedding_dim = 8
-    ishape = (1, 4)
-    eshape = (num_embeddings, embedding_dim)
-    embeddings = gen_finn_dt_tensor(edt, eshape)
-    model = make_lookup_model(embeddings, ishape, idt, edt)
-
-    model = model.transform(InferLookupLayer())
-    model = model.transform(SpecializeLayers(fpga_part))
-    inst = getCustomOp(model.graph.node[0])
-    inst.set_nodeattr("ram_style", "ultra")
-    model = model.transform(GiveUniqueNodeNames())
-    with pytest.raises(AssertionError, match="Vivado/Vitis HLS 2024.2"):
-        model.transform(PrepareIP(fpga_part, 10))
-
-
-@pytest.mark.fpgadataflow
-def test_fpgadataflow_lookup_uram_prepare_ip_rejects_non_versal(monkeypatch):
-    monkeypatch.setenv("XILINX_VIVADO", "/tools/Vivado/2024.2")
-    fpga_part = "xczu3eg-sbva484-1-e"
-    edt = DataType["INT8"]
-    num_embeddings = 4096
-    idt = DataType["UINT16"]
-    embedding_dim = 8
-    ishape = (1, 4)
-    eshape = (num_embeddings, embedding_dim)
-    embeddings = gen_finn_dt_tensor(edt, eshape)
-    model = make_lookup_model(embeddings, ishape, idt, edt)
-
-    model = model.transform(InferLookupLayer())
-    model = model.transform(SpecializeLayers(fpga_part))
-    inst = getCustomOp(model.graph.node[0])
-    inst.set_nodeattr("ram_style", "ultra")
-    model = model.transform(GiveUniqueNodeNames())
-    with pytest.raises(AssertionError, match="requires a Versal target"):
-        model.transform(PrepareIP(fpga_part, 10))
 
 
 @pytest.mark.fpgadataflow
