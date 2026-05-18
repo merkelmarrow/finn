@@ -97,10 +97,26 @@ def make_lookup_model(embeddings, ishape, idt, edt):
 )
 # execution mode
 @pytest.mark.parametrize("exec_mode", ["cppsim", "rtlsim"])
+# fpga part and ram style combinations
+@pytest.mark.parametrize(
+    "fpga_part, ram_style",
+    [
+        ("xczu3eg-sbva484-1-e", "auto"),
+        ("xczu3eg-sbva484-1-e", "block"),
+        ("xczu3eg-sbva484-1-e", "distributed"),
+        ("xcvc1902-vsva2197-2MP-e-S", "ultra"),  # URAM requires Versal
+    ],
+)
 @pytest.mark.fpgadataflow
 @pytest.mark.vivado
 @pytest.mark.slow
-def test_fpgadataflow_lookup(edt, embedding_cfg, exec_mode):
+def test_fpgadataflow_lookup(edt, embedding_cfg, exec_mode, fpga_part, ram_style):
+    # Skip URAM on old Vivado versions
+    if ram_style == "ultra":
+        vivado_version = get_vivado_version()
+        if vivado_version is not None and vivado_version < (2024, 2):
+            pytest.skip("URAM lookup requires Vivado 2024.2+")
+
     ishape = (1, 10)
     num_embeddings, idt, embedding_dim = embedding_cfg
     eshape = (num_embeddings, embedding_dim)
@@ -132,8 +148,10 @@ def test_fpgadataflow_lookup(edt, embedding_cfg, exec_mode):
     ret_hw = execute_onnx(model, {iname: itensor})
     assert (exp_out == ret_hw[oname]).all()
     # call transformation to convert abstraction layer into HLS layer
-    model = model.transform(SpecializeLayers("xczu3eg-sbva484-1-e"))
+    model = model.transform(SpecializeLayers(fpga_part))
     assert model.graph.node[0].op_type == "Lookup_hls"
+    # set the ram_style attribute
+    getCustomOp(model.graph.node[0]).set_nodeattr("ram_style", ram_style)
     if exec_mode == "cppsim":
         model = model.transform(GiveUniqueNodeNames())
         model = model.transform(PrepareCppSim())
@@ -141,86 +159,10 @@ def test_fpgadataflow_lookup(edt, embedding_cfg, exec_mode):
         model = model.transform(SetExecMode("cppsim"))
     elif exec_mode == "rtlsim":
         model = model.transform(GiveUniqueNodeNames())
-        model = model.transform(PrepareIP("xczu3eg-sbva484-1-e", 10))
+        model = model.transform(PrepareIP(fpga_part, 10))
         model = model.transform(HLSSynthIP())
         model = model.transform(SetExecMode("rtlsim"))
         model = model.transform(PrepareRTLSim())
-    ret_sim = execute_onnx(model, {iname: itensor})
-    assert (exp_out == ret_sim[oname]).all()
-
-
-@pytest.mark.fpgadataflow
-@pytest.mark.vivado
-@pytest.mark.slow
-@pytest.mark.parametrize(
-    "fpga_part, ram_style, vivado_path, expected_prepare_ip_error",
-    [
-        pytest.param(
-            "xcvc1902-vsva2197-2MP-e-S",
-            "ultra",
-            None,
-            None,
-            id="versal-uram",
-        ),
-        pytest.param(
-            "xcvc1902-vsva2197-2MP-e-S",
-            "ultra",
-            "/tools/Vivado/2022.2",
-            "Vivado/Vitis HLS 2024.2",
-            id="versal-uram-vivado-2022-2",
-        ),
-        pytest.param(
-            "xczu3eg-sbva484-1-e",
-            "ultra",
-            None,
-            "requires a Versal target",
-            id="non-versal-uram",
-        ),
-    ],
-)
-def test_fpgadataflow_lookup_uram_rtlsim(
-    monkeypatch, fpga_part, ram_style, vivado_path, expected_prepare_ip_error
-):
-    if vivado_path is not None:
-        monkeypatch.setenv("XILINX_VIVADO", vivado_path)
-    vivado_version = get_vivado_version()
-    edt = DataType["INT8"]
-    num_embeddings = 4096
-    idt = DataType["UINT16"]
-    embedding_dim = 8
-    ishape = (1, 4)
-    eshape = (num_embeddings, embedding_dim)
-    embeddings = gen_finn_dt_tensor(edt, eshape)
-    model = make_lookup_model(embeddings, ishape, idt, edt)
-    iname = model.get_first_global_in()
-    oname = model.get_first_global_out()
-    itensor = np.asarray([[0, 1, num_embeddings - 2, num_embeddings - 1]], dtype=np.int64)
-    exp_out = np.take(embeddings, itensor, axis=0)
-
-    model = model.transform(InferLookupLayer())
-    model = model.transform(SpecializeLayers(fpga_part))
-    assert model.graph.node[0].op_type == "Lookup_hls"
-    inst = getCustomOp(model.graph.node[0])
-    inst.set_nodeattr("ram_style", ram_style)
-    assert inst.uram_estimation() > 0
-
-    model = model.transform(GiveUniqueNodeNames())
-    if (
-        expected_prepare_ip_error is None
-        and vivado_version is not None
-        and vivado_version < (2024, 2)
-    ):
-        expected_prepare_ip_error = "Vivado/Vitis HLS 2024.2"
-
-    if expected_prepare_ip_error is not None:
-        with pytest.raises(AssertionError, match=expected_prepare_ip_error):
-            model.transform(PrepareIP(fpga_part, 10))
-        return
-
-    model = model.transform(PrepareIP(fpga_part, 10))
-    model = model.transform(HLSSynthIP())
-    model = model.transform(SetExecMode("rtlsim"))
-    model = model.transform(PrepareRTLSim())
     ret_sim = execute_onnx(model, {iname: itensor})
     assert (exp_out == ret_sim[oname]).all()
 
