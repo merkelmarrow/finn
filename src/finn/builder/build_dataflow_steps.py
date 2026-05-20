@@ -141,6 +141,7 @@ from finn.util.config import (
 from finn.util.fpgadataflow import warn_hls_rtl_dsp_conflict
 from finn.util.mlo_sim import is_mlo, mlo_prehook_func_factory
 from finn.util.test import execute_parent
+from finn.util.vivado import parse_ooc_synth_results
 
 
 def verify_step(
@@ -272,7 +273,6 @@ def prepare_for_stitched_ip_rtlsim(verify_model, cfg):
                 CreateStitchedIP(
                     cfg._resolve_fpga_part(),
                     cfg.synth_clk_period_ns,
-                    vitis=False,
                 )
             )
     else:
@@ -332,7 +332,6 @@ def prepare_loop_ops_ipgen(node, cfg):
         CreateStitchedIP(
             cfg._resolve_fpga_part(),
             cfg.synth_clk_period_ns,
-            vitis=False,
         )
     )
     node_inst.set_nodeattr("body", loop_model.graph)
@@ -1061,14 +1060,29 @@ def step_create_stitched_ip(model: ModelWrapper, cfg: DataflowBuildConfig):
 
     if DataflowOutputType.STITCHED_IP in cfg.generate_outputs:
         stitched_ip_dir = cfg.output_dir + "/stitched_ip"
+        # If OOC_SYNTH is also requested, run P&R to extract metrics
+        run_pnr = DataflowOutputType.OOC_SYNTH in cfg.generate_outputs
         model = model.transform(
             CreateStitchedIP(
                 cfg._resolve_fpga_part(),
                 cfg.synth_clk_period_ns,
-                vitis=cfg.stitched_ip_gen_dcp,
+                run_synth=cfg.stitched_ip_gen_dcp or run_pnr,
+                run_pnr=run_pnr,
                 signature=cfg.signature,
             )
         )
+        # If P&R was run, parse the OOC results and store in model metadata + write report
+        if run_pnr:
+            vivado_stitch_proj = model.get_metadata_prop("vivado_stitch_proj")
+            ooc_res_dict = parse_ooc_synth_results(vivado_stitch_proj)
+            if ooc_res_dict is not None:
+                model.set_metadata_prop("res_total_ooc_synth_pnr", str(ooc_res_dict))
+                # Write results to report directory
+                report_dir = cfg.output_dir + "/report"
+                os.makedirs(report_dir, exist_ok=True)
+                with open(report_dir + "/ooc_synth_and_timing_pnr.json", "w") as f:
+                    json.dump(ooc_res_dict, f, indent=2)
+
         # TODO copy all ip sources into output dir? as zip?
         shutil.copytree(
             model.get_metadata_prop("vivado_stitch_proj"), stitched_ip_dir, dirs_exist_ok=True
