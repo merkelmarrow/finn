@@ -320,13 +320,13 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
   }
 }
 
-// Pinned to finn-v80 because finn-build hosts (RHEL 9.1) lack the
-// apt/python3.10 prerequisites that setup-local.sh expects. Run
+// Pinned to a local-build host because finn-build hosts are not
+// guaranteed to have the apt/python3.10 prerequisites that setup-local.sh expects. Run
 // scripts/install-system-deps.sh on the agent once before enabling.
 // pip and XDG caches go to /scratch/jenkins because /home/cse-jenkins is
-// quota-bound and a cold pip install overflows it.
+// small and a cold pip install overflows it.
 void runLocalSetupTest() {
-  node('finn-v80') {
+  node('finn-local-build') {
     withAgentNfsEnv {
       stage('Local Setup (non-Docker) with Vivado') {
         checkout scm
