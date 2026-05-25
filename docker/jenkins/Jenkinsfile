@@ -1,10 +1,15 @@
-// Shard config in tests/ci_shards.py is the single source of truth shared
-// with pytest. See docker/jenkins/README.md.
+// Jenkins-only sharding config and timing helpers live in docker/jenkins/ci_sharding.py.
 
 import groovy.transform.Field
 
 @Field
 List<Map> PARALLEL_SHARDS = []
+
+@Field
+String FINN_CI_TIMINGS_MASTER = ''
+
+@Field
+String FINN_CI_TIMINGS_SNAPSHOT = ''
 
 // Sized for ~2 concurrent build trees per agent (~60-80 GB each) plus headroom.
 @Field
@@ -24,8 +29,7 @@ String finnNfsRootBase() { return (env.FINN_NFS_ROOT_BASE ?: '').trim() }
 
 void loadStageConfig() {
   String json = sh(returnStdout: true, script:
-    "python3 -c 'import json, sys; sys.path.insert(0, \"tests\"); " +
-    "from ci_shards import STAGES; print(json.dumps(STAGES))'"
+    "python3 docker/jenkins/ci_sharding.py stages-json"
   ).trim()
   PARALLEL_SHARDS = readJSON(text: json).collect { it as Map }
 }
@@ -52,7 +56,7 @@ pipeline {
     // host is a jenkins_slaves.yml edit only, never a Jenkinsfile edit.
     stage('Validate') {
       agent { label 'finn-build' }
-      steps { script { wipeStaleWorkspace(); withAgentNfsEnv { loadStageConfig(); validateShards(); rotateFinnCiBuildTmp() } } }
+      steps { script { wipeStaleWorkspace(); withAgentNfsEnv { loadStageConfig(); prepareTimingState(); validateShards(); rotateFinnCiBuildTmp() } } }
     }
     stage('Build Docker Image') {
       agent { label 'finn-build' }
@@ -80,6 +84,10 @@ boolean paramBool(String name) {
 String paramString(String name) {
   def v = params.get(name)
   return v == null ? '' : v.toString()
+}
+
+String shellQuote(String s) {
+  return "'" + (s ?: '').replace("'", "'\"'\"'") + "'"
 }
 
 // Marker errors are fatal. Executor over-subscription only warns (queueing recovers).
@@ -183,6 +191,38 @@ String finnCiJobKey() {
   return jn.replaceAll('[^A-Za-z0-9._-]+', '_')
 }
 
+String finnCiTimingStateDir() {
+  String base = finnNfsRootBase()
+  if (!base) { return '' }
+  if (!fileExists(base)) {
+    echo "prepareTimingState: ${base} not visible on ${env.NODE_NAME}; sharding will use fallback assignment"
+    return ''
+  }
+  return "${base}/_ci_state/${finnCiJobKey()}"
+}
+
+void prepareTimingState() {
+  FINN_CI_TIMINGS_MASTER = ''
+  FINN_CI_TIMINGS_SNAPSHOT = ''
+  String stateDir = finnCiTimingStateDir()
+  if (!stateDir) {
+    echo "prepareTimingState: no shared timing state directory; sharding will use fallback assignment"
+    return
+  }
+  String master = "${stateDir}/ci_timings_master.json"
+  String snapshot = "${stateDir}/build_${env.BUILD_NUMBER}_timings_input.json"
+  catchError(buildResult: null, stageResult: null,
+             message: 'prepareTimingState failed; sharding will use fallback assignment') {
+    sh """
+      mkdir -p '${stateDir}'
+      python3 docker/jenkins/ci_sharding.py prepare --master '${master}' --snapshot '${snapshot}'
+    """
+    FINN_CI_TIMINGS_MASTER = master
+    FINN_CI_TIMINGS_SNAPSHOT = snapshot
+    echo "prepareTimingState: using ${snapshot}"
+  }
+}
+
 // Keyed on job/build so concurrent runs don't stomp. NFS-shared when set,
 // workspace-local otherwise.
 String finnCiPerBuildRoot() {
@@ -207,7 +247,7 @@ void rotateFinnCiBuildTmp() {
   String ws = env.WORKSPACE
   if (!ws) { echo "rotateFinnCiBuildTmp: WORKSPACE unset, skipping"; return }
   sh """
-    bash "${ws}/scripts/rotate_finn_ci_tmp.sh" "${base}" "${jk}" "${bn}" ${FINN_CI_TMP_RETAIN_BUILDS} ${FINN_CI_TMP_MAX_AGE_DAYS}
+    python3 "${ws}/docker/jenkins/ci_sharding.py" prune-tmp "${base}" "${jk}" "${bn}" ${FINN_CI_TMP_RETAIN_BUILDS} ${FINN_CI_TMP_MAX_AGE_DAYS}
   """
 }
 
@@ -288,6 +328,7 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
             try {
               Map opts = [
                   marker: row.marker,
+                  stage: stageName,
                   stash: stashName,
                   workers: row.workers as int,
                   distMode: row.distMode,
@@ -373,7 +414,7 @@ void safeStashReport(String stashName) {
   catchError(buildResult: null, stageResult: null,
              message: "safeStashReport(${stashName}) failed; aggregation may be partial") {
     stash name: stashName,
-          includes: "${stashName}.xml,${stashName}.html,${stashName}.timings.json,${stashName}.stagemap",
+          includes: "${stashName}.xml,${stashName}.html,${stashName}.timings.json,${stashName}.shardmap.txt,${stashName}.shardmap.json,${stashName}.stagemap",
           allowEmpty: true
   }
 }
@@ -585,7 +626,9 @@ void aggregateReports() {
     expectedStashes().each { name -> unstashIfPresent(name) }
   }
   junit allowEmptyResults: true, testResults: 'reports/*.xml'
+  mergeShardMaps()
   echoShardTimings()
+  updateTimingState()
   publishStageMap()
   assertZipBoardsEmitted()
   catchError(buildResult: null, stageResult: 'UNSTABLE',
@@ -601,8 +644,9 @@ void aggregateReports() {
     archiveArtifacts artifacts: 'reports/*.html', allowEmptyArchive: true
   }
   catchError(buildResult: null, stageResult: 'UNSTABLE',
-             message: 'archiveArtifacts (timings.json) failed') {
-    archiveArtifacts artifacts: 'reports/*.timings.json', allowEmptyArchive: true
+             message: 'archiveArtifacts (timings and shard maps) failed') {
+    archiveArtifacts artifacts: 'reports/*.timings.json,reports/*shardmap.*,reports/shard_map.*,reports/ci_timings_master.json',
+                     allowEmptyArchive: true
   }
 }
 
@@ -625,7 +669,24 @@ void echoShardTimings() {
   catchError(buildResult: null, stageResult: null,
              message: 'echoShardTimings failed; non-fatal') {
     if (!fileExists('reports')) { return }
-    sh "python3 scripts/summarize_ci_timings.py reports/"
+    sh "python3 docker/jenkins/ci_sharding.py summarize reports/"
+  }
+}
+
+void mergeShardMaps() {
+  catchError(buildResult: null, stageResult: null,
+             message: 'mergeShardMaps failed; non-fatal') {
+    if (!fileExists('reports')) { return }
+    sh "python3 docker/jenkins/ci_sharding.py merge-maps reports/"
+  }
+}
+
+void updateTimingState() {
+  catchError(buildResult: null, stageResult: null,
+             message: 'updateTimingState failed; non-fatal') {
+    if (!fileExists('reports')) { return }
+    String masterArg = FINN_CI_TIMINGS_MASTER ? "--master '${FINN_CI_TIMINGS_MASTER}'" : ''
+    sh "python3 docker/jenkins/ci_sharding.py update --reports reports ${masterArg} --out reports/ci_timings_master.json"
   }
 }
 
@@ -710,8 +771,25 @@ void runPytest(Map opts) {
   if (opts.extraArgs) { parts << opts.extraArgs }
   def cmd = parts.join(' ')
   echo "runPytest[${opts.stash}]: FINN_CI_MARKER='${opts.marker}'; ${cmd}"
+  String timingsFile = 'docker/jenkins/ci_timings_seed.json'
+  if (FINN_CI_TIMINGS_SNAPSHOT) {
+    if (fileExists(FINN_CI_TIMINGS_SNAPSHOT)) {
+      timingsFile = "${opts.stash}.timings_input.json"
+      sh "cp ${shellQuote(FINN_CI_TIMINGS_SNAPSHOT)} ${shellQuote(timingsFile)}"
+    } else {
+      echo "runPytest[${opts.stash}]: ${FINN_CI_TIMINGS_SNAPSHOT} is not visible on ${env.NODE_NAME}; using seed timings"
+    }
+  }
+  def envLines = [
+      "export FINN_CI_MARKER=${shellQuote(opts.marker as String)}",
+      "export FINN_CI_STAGE=${shellQuote(opts.stage as String)}",
+      "export FINN_CI_STASH=${shellQuote(opts.stash as String)}",
+      "export FINN_CI_JOB_NAME=${shellQuote(env.JOB_NAME ?: '')}",
+      "export FINN_CI_BUILD_NUMBER=${shellQuote(env.BUILD_NUMBER ?: '')}",
+      "export FINN_CI_TIMINGS_FILE=${shellQuote(timingsFile)}",
+  ]
   writeFile file: 'run-tests.sh', text:
-      "#!/bin/bash\nset -o pipefail\nexport FINN_CI_MARKER='${opts.marker}'\n${cmd}\nec=\$?\n[ \$ec -eq 5 ] && exit 0 || exit \$ec\n"
+      "#!/bin/bash\nset -o pipefail\n${envLines.join('\n')}\n${cmd}\nec=\$?\n[ \$ec -eq 5 ] && exit 0 || exit \$ec\n"
   sh 'chmod 777 run-tests.sh'
   sh './run-docker.sh ./run-tests.sh'
 }

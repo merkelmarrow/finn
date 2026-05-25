@@ -28,9 +28,9 @@
 """Sharding and timing-observability plugin for FINN CI.
 
 Each Jenkins stage runs ``pytest -m <marker> --num-shards N --shard-id I``.
-This module deterministically assigns groups to shards using checked-in
-per-group seconds from ``tests/ci_timings.json`` (LPT-greedy bin packing,
-falls back to round-robin when the file is absent or has no signal).
+This module deterministically assigns groups to shards using the timing state
+pointed at by ``FINN_CI_TIMINGS_FILE``. If the file is absent or has no signal,
+assignment falls back to deterministic round-robin.
 
 Items sharing an ``@pytest.mark.xdist_group(name=X)`` always land in the
 same shard so chained ``load_test_checkpoint_or_skip`` steps don't break.
@@ -40,30 +40,53 @@ Items without an explicit group are grouped by nodeid.
 prints the shard table and exits. ``--which-shard QUERY`` prints which
 Jenkins shard a given nodeid would run on. A ``<stash>.timings.json``
 sidecar is emitted next to the junit XML so aggregation can flag outliers
-and so timings can be regenerated (see ``scripts/regen_ci_timings.py``).
+and update the Jenkins-managed timing state.
 """
-import json
-import os
-import time
-
 import pytest
 
+import json
+import os
+import sys
+import time
+
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(THIS_DIR)
+JENKINS_DIR = os.path.join(REPO_ROOT, "docker", "jenkins")
+if JENKINS_DIR not in sys.path:
+    sys.path.insert(0, JENKINS_DIR)
+
+import ci_sharding  # noqa: E402
 
 SHARD_MARKER_NAME = "shard"
-TIMINGS_FILE = os.path.join(os.path.dirname(__file__), "ci_timings.json")
 
 
 def pytest_addoption(parser):
     group = parser.getgroup("finn-ci-sharding")
-    group.addoption("--num-shards", type=int, default=0,
-                    help="Split the collected test set into N deterministic shards.")
-    group.addoption("--shard-id", type=int, default=0,
-                    help="Which shard (0-indexed) to run. Requires --num-shards.")
-    group.addoption("--dry-run-shards", action="store_true", default=False,
-                    help="Print shard assignment table and exit without running tests.")
-    group.addoption("--which-shard", default=None, metavar="QUERY",
-                    help="Print which Jenkins shard each ci_shards.STAGES row "
-                         "would run a matching test on; use with --collect-only.")
+    group.addoption(
+        "--num-shards",
+        type=int,
+        default=0,
+        help="Split the collected test set into N deterministic shards.",
+    )
+    group.addoption(
+        "--shard-id",
+        type=int,
+        default=0,
+        help="Which shard (0-indexed) to run. Requires --num-shards.",
+    )
+    group.addoption(
+        "--dry-run-shards",
+        action="store_true",
+        default=False,
+        help="Print shard assignment table and exit without running tests.",
+    )
+    group.addoption(
+        "--which-shard",
+        default=None,
+        metavar="QUERY",
+        help="Print which Jenkins shard each ci_sharding.STAGES row "
+        "would run a matching test on; use with --collect-only.",
+    )
 
 
 def pytest_configure(config):
@@ -91,8 +114,7 @@ def _pinned_shard(item, num_shards):
         pinned = mark.args[0]
         if not isinstance(pinned, int):
             raise pytest.UsageError(
-                "@pytest.mark.shard expects an int arg; got %r on %s"
-                % (pinned, item.nodeid)
+                "@pytest.mark.shard expects an int arg; got %r on %s" % (pinned, item.nodeid)
             )
         if not 0 <= pinned < num_shards:
             raise pytest.UsageError(
@@ -104,16 +126,8 @@ def _pinned_shard(item, num_shards):
 
 
 def _load_group_weights():
-    """Return ``{group_name: seconds}`` from TIMINGS_FILE, or {} if absent."""
-    try:
-        with open(TIMINGS_FILE) as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return {}
-    weights = data.get("groups") if isinstance(data, dict) else None
-    if not isinstance(weights, dict):
-        return {}
-    return {str(k): float(v) for k, v in weights.items() if v}
+    """Return ``{group_name: seconds}`` from ``FINN_CI_TIMINGS_FILE``."""
+    return ci_sharding.load_group_weights(os.environ.get("FINN_CI_TIMINGS_FILE"))
 
 
 def _weights_with_fallback():
@@ -123,48 +137,42 @@ def _weights_with_fallback():
     or has no positive entries) and is used for groups not yet timed.
     """
     weights_table = _load_group_weights()
-    known = sorted(w for w in weights_table.values() if w > 0)
-    fallback = known[len(known) // 2] if known else 1.0
+    fallback = ci_sharding.weights_with_fallback(weights_table)
     return weights_table, fallback
+
+
+def _assignment_details(groups, num_shards):
+    pins = {}
+    for key, members in groups.items():
+        group_pins = {_pinned_shard(it, num_shards) for it in members}
+        group_pins.discard(None)
+        if len(group_pins) > 1:
+            raise pytest.UsageError(
+                "conflicting @pytest.mark.shard pins within xdist_group %r: %r"
+                % (key, sorted(group_pins))
+            )
+        if group_pins:
+            pins[key] = group_pins.pop()
+    weights_table, fallback = _weights_with_fallback()
+    assignment, source, shard_load, fallback = ci_sharding.assign_groups_to_shards(
+        groups.keys(), num_shards, weights_table, pins
+    )
+    return assignment, source, shard_load, weights_table, fallback
 
 
 def _assign_groups_to_shards(groups, num_shards):
     """Map ``{group_key: [items]}`` to ``{group_key: shard_id}``.
 
     Honours @pytest.mark.shard(N) pins, then LPT-greedy assigns the
-    remaining groups by descending weight from ``ci_timings.json`` (groups
-    without a recorded weight get the median, falling back to 1.0).
+    remaining groups by descending timing weight (groups without a recorded
+    weight get the median, falling back to 1.0).
     Ties are broken by sorted group key for reproducibility.
     """
-    assignment = {}
-    for key, members in groups.items():
-        pins = {_pinned_shard(it, num_shards) for it in members}
-        pins.discard(None)
-        if len(pins) > 1:
-            raise pytest.UsageError(
-                "conflicting @pytest.mark.shard pins within xdist_group %r: %r"
-                % (key, sorted(pins))
-            )
-        if pins:
-            assignment[key] = pins.pop()
-    if num_shards <= 1:
-        for key in groups:
-            assignment.setdefault(key, 0)
-        return assignment
-    weights_table, fallback = _weights_with_fallback()
-    unpinned = [k for k in groups if k not in assignment]
-    unpinned.sort(key=lambda k: (-weights_table.get(k, fallback), k))
-    shard_load = [0.0] * num_shards
-    for key in unpinned:
-        weight = weights_table.get(key, fallback)
-        target = min(range(num_shards), key=lambda s: (shard_load[s], s))
-        assignment[key] = target
-        shard_load[target] += weight
-    return assignment
+    return _assignment_details(groups, num_shards)[0]
 
 
 def _marker_tokens(marker_expr):
-    """Split a ci_shards marker expression into individual marker names."""
+    """Split a ci_sharding marker expression into individual marker names."""
     return [t for t in marker_expr.split() if t != "or"]
 
 
@@ -174,11 +182,9 @@ def _item_matches_marker_expr(item, marker_expr):
 
 
 def _run_which_shard(config, items, query):
-    from ci_shards import STAGES, stash_name
     rows = []
-    for stage in STAGES:
-        matching = [it for it in items
-                    if _item_matches_marker_expr(it, stage["marker"])]
+    for stage in ci_sharding.STAGES:
+        matching = [it for it in items if _item_matches_marker_expr(it, stage["marker"])]
         if not matching:
             continue
         groups = {}
@@ -189,17 +195,21 @@ def _run_which_shard(config, items, query):
             if query not in it.nodeid:
                 continue
             shard_id = assignment[_group_key(it)]
-            rows.append((
-                stage["stage"], stage["marker"], int(stage["shards"]),
-                shard_id, stash_name(stage["stage"], int(stage["shards"]), shard_id),
-                it.nodeid,
-            ))
+            rows.append(
+                (
+                    stage["stage"],
+                    stage["marker"],
+                    int(stage["shards"]),
+                    shard_id,
+                    ci_sharding.stash_name(stage["stage"], int(stage["shards"]), shard_id),
+                    it.nodeid,
+                )
+            )
     if not rows:
         print("[finn-sharding] --which-shard: no test matched %r in any stage" % query)
     else:
         header = ("stage", "marker", "shards", "shard", "stash", "nodeid")
-        widths = [max(len(str(c)) for c in col)
-                  for col in zip(header, *rows)]
+        widths = [max(len(str(c)) for c in col) for col in zip(header, *rows)]
         fmt = "  ".join("%%-%ds" % w for w in widths)
         print(fmt % header)
         print(fmt % tuple("-" * w for w in widths))
@@ -207,6 +217,65 @@ def _run_which_shard(config, items, query):
             print(fmt % tuple(str(c) for c in r))
     config.hook.pytest_deselected(items=list(items))
     items[:] = []
+
+
+def _junit_output_info(config):
+    junitxml = config.getoption("--junitxml") or ""
+    if not junitxml:
+        return None, None, None
+    out_dir = os.path.dirname(junitxml) or "."
+    stash = os.path.splitext(os.path.basename(junitxml))[0]
+    return out_dir, stash, junitxml
+
+
+def _stage_name_from_env():
+    return os.environ.get("FINN_CI_STAGE", "")
+
+
+def _write_shard_map(config, kept, groups, assignment, source, weights_table, fallback):
+    out_dir, stash, _ = _junit_output_info(config)
+    if not out_dir or not stash:
+        return
+    num_shards = int(config.getoption("--num-shards"))
+    shard_id = int(config.getoption("--shard-id"))
+    rows = []
+    lines = []
+    for item in sorted(kept, key=lambda it: it.nodeid):
+        group = _group_key(item)
+        weight = weights_table.get(group, fallback)
+        row = {
+            "nodeid": item.nodeid,
+            "stage": _stage_name_from_env(),
+            "stash": stash,
+            "shard_id": shard_id,
+            "num_shards": num_shards,
+            "group": group,
+            "weight_s": round(float(weight), 3),
+            "source": source.get(group, "unknown"),
+        }
+        rows.append(row)
+        lines.append(
+            "nodeid={nodeid} stage={stage} shard={shard_num}/{shard_count} "
+            "stash={stash} group={group} weight_s={weight_s:.3f} source={source}".format(
+                nodeid=row["nodeid"],
+                stage=row["stage"],
+                shard_num=shard_id + 1,
+                shard_count=num_shards,
+                stash=stash,
+                group=group,
+                weight_s=row["weight_s"],
+                source=row["source"],
+            )
+        )
+    try:
+        with open(os.path.join(out_dir, stash + ".shardmap.json"), "w") as f:
+            json.dump(rows, f, indent=2, sort_keys=True)
+            f.write("\n")
+        with open(os.path.join(out_dir, stash + ".shardmap.txt"), "w") as f:
+            for line in lines:
+                f.write(line + "\n")
+    except OSError:
+        pass
 
 
 @pytest.hookimpl(trylast=True)
@@ -236,35 +305,40 @@ def pytest_collection_modifyitems(config, items):
     groups = {}
     for item in items:
         groups.setdefault(_group_key(item), []).append(item)
-    assignment = _assign_groups_to_shards(groups, num_shards)
+    assignment, source, _shard_load, weights_table, fallback = _assignment_details(
+        groups, num_shards
+    )
 
     if dry_run:
-        weights_table, fallback = _weights_with_fallback()
-        per_shard = {i: {"items": 0, "groups": [], "seconds": 0.0}
-                     for i in range(num_shards)}
+        per_shard = {i: {"items": 0, "groups": [], "seconds": 0.0} for i in range(num_shards)}
         for key, members in groups.items():
             s = assignment[key]
             per_shard[s]["items"] += len(members)
             per_shard[s]["groups"].append(key)
             per_shard[s]["seconds"] += weights_table.get(key, fallback)
-        print("\n--- dry-run-shards (num_shards=%d, groups=%d, items=%d) ---"
-              % (num_shards, len(groups), len(items)))
-        print("%-8s %-8s %-8s %-10s %s"
-              % ("shard", "items", "groups", "weight_s", "sample_group"))
+        print(
+            "\n--- dry-run-shards (num_shards=%d, groups=%d, items=%d) ---"
+            % (num_shards, len(groups), len(items))
+        )
+        print("%-8s %-8s %-8s %-10s %s" % ("shard", "items", "groups", "weight_s", "sample_group"))
         for i in range(num_shards):
             gs = sorted(per_shard[i]["groups"])
             sample = gs[0] if gs else "(empty)"
-            print("%-8d %-8d %-8d %-10.1f %s"
-                  % (i, per_shard[i]["items"], len(gs),
-                     per_shard[i]["seconds"], sample))
+            print(
+                "%-8d %-8d %-8d %-10.1f %s"
+                % (i, per_shard[i]["items"], len(gs), per_shard[i]["seconds"], sample)
+            )
         config.hook.pytest_deselected(items=list(items))
         items[:] = []
         return
 
     kept = [it for it in items if assignment[_group_key(it)] == shard_id]
+    _write_shard_map(config, kept, groups, assignment, source, weights_table, fallback)
     my_groups = sorted(k for k, s in assignment.items() if s == shard_id)
-    print("[finn-sharding] shard %d/%d: %d item(s) across %d group(s)"
-          % (shard_id, num_shards, len(kept), len(my_groups)))
+    print(
+        "[finn-sharding] shard %d/%d: %d item(s) across %d group(s)"
+        % (shard_id, num_shards, len(kept), len(my_groups))
+    )
     if my_groups:
         sample = my_groups[:5]
         ellipsis = " ..." if len(my_groups) > 5 else ""
@@ -274,7 +348,7 @@ def pytest_collection_modifyitems(config, items):
 
 # Per-shard timing observability: emit <stash>.timings.json next to the
 # junit XML when --num-shards is set, so aggregation can flag outliers
-# and operators can regenerate ci_timings.json from a recent run.
+# and operators can update the Jenkins timing state from a recent run.
 
 # Set on the controller in pytest_sessionstart, left None on xdist workers
 # so log-reports don't double-count.
@@ -325,13 +399,15 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    if exitstatus == 5 and (
+        session.config.getoption("--dry-run-shards") or session.config.getoption("--which-shard")
+    ):
+        session.exitstatus = 0
     if _TIMINGS is None:
         return
-    junitxml = session.config.getoption("--junitxml") or ""
+    out_dir, stash, junitxml = _junit_output_info(session.config)
     if not junitxml:
         return
-    out_dir = os.path.dirname(junitxml) or "."
-    stash = os.path.splitext(os.path.basename(junitxml))[0]
     out_path = os.path.join(out_dir, stash + ".timings.json")
     groups = {}
     for nodeid, duration in _TIMINGS["per_test_seconds"].items():
@@ -344,6 +420,12 @@ def pytest_sessionfinish(session, exitstatus):
         "shard": {
             "num": session.config.getoption("--num-shards"),
             "id": session.config.getoption("--shard-id"),
+        },
+        "metadata": {
+            "job": os.environ.get("FINN_CI_JOB_NAME"),
+            "build": os.environ.get("FINN_CI_BUILD_NUMBER"),
+            "stage": os.environ.get("FINN_CI_STAGE"),
+            "timings_file": os.environ.get("FINN_CI_TIMINGS_FILE"),
         },
         "wall_seconds": time.monotonic() - _TIMINGS["start_monotonic"],
         "total_test_seconds": sum(_TIMINGS["per_test_seconds"].values()),
