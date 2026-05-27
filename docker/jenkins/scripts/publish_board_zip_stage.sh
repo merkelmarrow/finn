@@ -1,0 +1,39 @@
+#!/bin/bash
+# publish_board_zip_stage.sh <src_root> <work_board> <board> <test_type>
+#
+# Stages per-shard board deployments into a single work_board directory ahead
+# of zipping. Errors out on duplicate model names across shards (a real
+# conflict, not a transient race). Touches <work_board>/.NO_DEPLOYMENTS when
+# nothing was found so the Groovy caller can short-circuit cleanly without
+# distinguishing "empty" from "missing source".
+set -euo pipefail
+
+if [ "$#" -ne 4 ]; then
+  echo "Usage: publish_board_zip_stage.sh <src_root> <work_board> <board> <test_type>" >&2
+  exit 2
+fi
+
+src_root=$1
+work_board=$2
+board=$3
+test_type=$4
+tag="publishBoardZip(${test_type}/${board})"
+
+found=0
+while IFS= read -r -d '' board_dir; do
+  found=1
+  while IFS= read -r -d '' model_dir; do
+    name=$(basename "$model_dir")
+    if [ -e "$work_board/$name" ]; then
+      echo "$tag: duplicate deployment $name under $src_root"
+      exit 1
+    fi
+    cp -a "$model_dir" "$work_board/"
+  done < <(find "$board_dir" -mindepth 1 -maxdepth 1 -type d -print0)
+done < <(find "$src_root" -mindepth 2 -maxdepth 2 -type d -name "$board" -print0)
+
+if [ "$found" = "0" ] || [ -z "$(find "$work_board" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]; then
+  echo "$tag: no deployment directories found under $src_root"
+  touch "$work_board/.NO_DEPLOYMENTS"
+  exit 0
+fi

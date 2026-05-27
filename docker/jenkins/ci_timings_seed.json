@@ -1,5 +1,5 @@
 {
-  "_comment": "Seed per-group wall seconds for Jenkins CI; refreshed dynamically from archived *.timings.json reports.",
+  "_comment": "Seed per-group wall seconds for Jenkins CI, refreshed dynamically from archived *.timings.json reports.",
   "groups": {
     "bnn_kv260_group_0": 566.797,
     "bnn_kv260_group_1": 480.663,

@@ -1,36 +1,68 @@
-// HW-tethered pipeline. HW_SHARDS row-per-board mirrors PARALLEL_SHARDS in
-// docker/jenkins/Jenkinsfile. Shared helpers (safeStashReport, aggregateReports,
-// unstashIfPresent, cleanPreviousBuildFiles) are duplicated — declarative
-// pipelines have no shared-library hook here. Keep in sync.
+// HW-tethered pipeline. The HW_SHARDS row-per-board table is loaded from
+// docker/jenkins/ci_sharding.py BOARDS during the Get-node-status stage so
+// the BOARDS dict is the single source of truth shared with the SW pipeline.
+// Shared Groovy helpers (paramString, shellQuote, safeStashReport,
+// unstashIfPresent, cleanPreviousBuildFiles) come from
+// docker/jenkins/_common.groovy.
 
 import groovy.transform.Field
 
 @Field
-List<Map> HW_SHARDS = [
-    [board: 'U250',      agentLabel: 'finn-u250',  credentialsId: null,
-     restartPrep: false, setupScript: 'alveo',  marker: 'U250'],
-    [board: 'Pynq-Z1',   agentLabel: 'finn-pynq',  credentialsId: 'pynq-z1-credentials',
-     restartPrep: true,  setupScript: 'pynq',   marker: 'Pynq'],
-    [board: 'ZCU104',    agentLabel: 'finn-zcu104', credentialsId: 'pynq-z1-credentials',
-     restartPrep: true,  setupScript: 'pynq',   marker: 'ZCU104'],
-    [board: 'KV260_SOM', agentLabel: 'finn-kv260', credentialsId: 'user-ubuntu-credentials',
-     restartPrep: true,  setupScript: 'pynq',   marker: 'KV260_SOM'],
-]
+def _common = null
+
+// load() needs an active workspace, but several wrappers are called later
+// from no-agent orchestration code. Cache the stateless helper script after
+// Get node status so those calls do not depend on a node allocation.
+private def loadCommonOnce() {
+  if (_common == null) { _common = load 'docker/jenkins/_common.groovy' }
+  return _common
+}
+
+@Field
+List<Map> HW_SHARDS = []
 
 @Field
 List<String> HW_TEST_TYPES = ['bnn_build_sanity', 'bnn_build_full']
+
+// BOARDS keys in ci_sharding.py match the field names the Groovy callers
+// already use (``board``, ``agentLabel``, ``credentialsId``, ``restartPrep``,
+// ``setupScript``, ``marker``) so the rows from hw-shards-json are usable
+// as-is, no translation step needed.
+void loadHwShards() {
+  String json = sh(returnStdout: true, script:
+    "python3 docker/jenkins/ci_sharding.py hw-shards-json"
+  ).trim()
+  HW_SHARDS = readJSON(text: json).collect { it as Map }
+}
 
 // Keyed by agentLabel so HW_SHARDS rows are the single source of truth.
 @Field
 Map<String, Boolean> NODE_ONLINE = [:]
 
+// Resolved once by collectBuildArtifacts. Keyed by "${testType}_${board}",
+// value is ``[zip: <absolute zip>, swBuildDir: <absolute build dir>]`` for
+// resolved boards, or ``[:]`` for boards with no READY zip on disk.
+// Storing the swBuildDir explicitly avoids substring-parsing the zip path
+// for callers that need it (archiveBuildInfo). Per-board resolution means a
+// failing U250 build does not block fresh Pynq-Z1 testing, each board
+// independently picks the newest SW build that produced a READY.
+@Field
+Map<String, Map> SW_BOARD_ZIP_PATHS = [:]
+
 pipeline {
   agent none
+  parameters {
+    string(name: 'sw_job_name', defaultValue: 'finn',
+           description: 'Software CI Jenkins job feeding this HW build. Scans the SW job\'s ci_runs tree on shared NFS for per-board READY zips.')
+    string(name: 'sw_build_dir', defaultValue: '',
+           description: 'Optional explicit path to a single SW build directory. Overrides sw_job_name auto-discovery and forces every board to be read from this one directory. Use for off-Jenkins recovery or pinning a specific build.')
+    booleanParam(name: 'allow_fallback', defaultValue: false,
+                 description: 'Allow a board to test an older READY SW build when the newest SW build did not produce that board zip. Default false marks the HW build unstable if fallback is used.')
+  }
   stages {
     stage('Get node status') {
-      options { skipDefaultCheckout() }
       agent { label 'finn-build' }
-      steps { script { refreshNodeOnlineFlags() } }
+      steps { script { loadHwShards(); refreshNodeOnlineFlags() } }
     }
     stage('Reboot Zynq platforms') {
       steps { script { parallel(buildRebootMap()) } }
@@ -40,22 +72,31 @@ pipeline {
       agent { label 'finn-build' }
       steps { sleep(time: "${env.REBOOT_SLEEP}", unit: 'MINUTES') }
     }
+    // Default checkout is required here so docker/jenkins/test_bnn_hw_pytest.py
+    // is in the workspace for the bnn_test_files stash. Do not add
+    // skipDefaultCheckout() back without restoring the source another way.
     stage('Collect build information for HW testing') {
-      options { skipDefaultCheckout() }
       agent { label 'finn-build' }
       steps { script { collectBuildArtifacts() } }
     }
     stage('Sanity - Run Hardware Tests') {
-      steps { script { parallel(buildHwStageMap('bnn_build_sanity')) } }
+      steps { script { runHwParallelStage('bnn_build_sanity') } }
     }
     stage('End2end - Run Hardware Tests') {
-      steps { script { parallel(buildHwStageMap('bnn_build_full')) } }
+      steps { script { runHwParallelStage('bnn_build_full') } }
     }
     stage('Check Stage Results') {
       agent { label 'finn-build' }
       steps { script { aggregateReports() } }
     }
   }
+}
+
+boolean allowFallback() {
+  def v = params.get('allow_fallback')
+  if (v == null) { return false }
+  if (v instanceof Boolean) { return v }
+  return v.toString().toBoolean()
 }
 
 void refreshNodeOnlineFlags() {
@@ -98,27 +139,112 @@ void runReboot(Map row, String stageName) {
 
 void collectBuildArtifacts() {
   refreshNodeOnlineFlags()
+  resolveSwBoardZipPaths()
+  archiveBuildInfo()
   dir('docker/jenkins') {
     stash name: 'bnn_test_files', includes: 'test_bnn_hw_pytest.py'
   }
   HW_TEST_TYPES.each { testType -> stashBuildArtifacts(testType) }
 }
 
+// Populates SW_BOARD_ZIP_PATHS. Runs inside the Collect stage's node so it
+// is the single place where the workspace filesystem is consulted, every
+// later helper just reads the precomputed map. Issues exactly one shellout
+// to ci_sharding.py resolve-sw-zips which walks the per-job ci_runs tree
+// once in Python instead of fanning out 2*N_BOARDS per-pair find pipelines.
+void resolveSwBoardZipPaths() {
+  SW_BOARD_ZIP_PATHS = [:]
+  String rawJob = paramString('sw_job_name').trim() ?: 'finn'
+  String jobKey = sh(returnStdout: true, script:
+    "python3 docker/jenkins/ci_sharding.py job-key ${shellQuote(rawJob)}"
+  ).trim()
+  String override = paramString('sw_build_dir').trim()
+  String artifactDir = loadCommonOnce().finnArtifactDir()
+  if (!artifactDir && !override) {
+    error "resolveSwBoardZipPaths: neither FINN_CI_NFS_ROOT nor ARTIFACT_DIR is set, " +
+          "and no explicit sw_build_dir override was provided. Cannot auto-discover SW builds."
+  }
+  String tests = HW_TEST_TYPES.join(',')
+  String boards = HW_SHARDS.collect { it.board }.join(',')
+  String cmd = "python3 docker/jenkins/ci_sharding.py resolve-sw-zips " +
+               "--artifact-dir ${shellQuote(artifactDir)} --job-key ${shellQuote(jobKey)} " +
+               "--tests ${shellQuote(tests)} --boards ${shellQuote(boards)} " +
+               "--sw-build-dir ${shellQuote(override)}"
+  Map resolved = readJSON(text: sh(returnStdout: true, script: cmd).trim()) as Map
+  def fallbackMessages = []
+  HW_TEST_TYPES.each { testType ->
+    HW_SHARDS.each { row ->
+      String board = row.board as String
+      String key = "${testType}_${board}"
+      Map entry = ((resolved[testType] ?: [:])[board] ?: [:]) as Map
+      SW_BOARD_ZIP_PATHS[key] = entry
+      if (entry.zip) {
+        String fallback = entry.fallback ? " fallback_from=${entry.swBuild} latest=${entry.latestSwBuild}" : ""
+        echo "resolveSwBoardZipPaths: ${key} -> ${entry.zip}${fallback}"
+        if (entry.fallback) {
+          fallbackMessages << "${key} uses SW build ${entry.swBuild}, latest available for ${testType} is ${entry.latestSwBuild}"
+        }
+      } else if (override) {
+        echo "resolveSwBoardZipPaths: ${key} not READY under explicit sw_build_dir=${override}, this board will be skipped"
+      } else {
+        echo "resolveSwBoardZipPaths: ${key} has no READY zip, HW will skip this board"
+      }
+    }
+  }
+  if (!fallbackMessages.isEmpty() && !allowFallback()) {
+    unstable "HW fallback used without allow_fallback=true:\n  - " + fallbackMessages.join('\n  - ')
+  }
+}
+
+// Pure map lookup, no fileExists. Runs from the no-agent parallel-orchestrator
+// stages where workspace steps are unavailable, the only state it touches is
+// the precomputed SW_BOARD_ZIP_PATHS field.
 Map<String, Closure> buildHwStageMap(String testType) {
   String label = testType == 'bnn_build_sanity' ? 'Sanity' : 'end2end'
   def branches = [:]
+  def offlineWithZip = []
   HW_SHARDS.each { row ->
-    String stage = "BNN ${label} - ${row.board}"
+    String board = row.board as String
+    if (!swBoardZip(testType, board)) {
+      echo "buildHwStageMap[${testType}]: no READY zip for ${board}, skipping"
+      return
+    }
+    if (!isOnline(row.agentLabel as String)) {
+      offlineWithZip << "${board} (${row.agentLabel})"
+      echo "buildHwStageMap[${testType}]: READY zip exists for ${board}, but agent ${row.agentLabel} is offline"
+      return
+    }
+    String stage = "BNN ${label} - ${board}"
     branches[stage] = { runHwShard(row, testType, stage) }
   }
+  if (!offlineWithZip.isEmpty()) {
+    unstable "Offline HW agent(s) with READY zips for ${testType}: " + offlineWithZip.join(', ')
+  }
   return branches
+}
+
+void runHwParallelStage(String testType) {
+  Map<String, Closure> branches = buildHwStageMap(testType)
+  if (!branches) {
+    unstable "No READY zips resolved for ${testType}, no hardware shards will run"
+    echo "runHwParallelStage[${testType}]: no branches"
+    return
+  }
+  parallel(branches)
+}
+
+// Tiny accessor so callers stay free of map-shape knowledge. archiveBuildInfo
+// also reads SW_BOARD_ZIP_PATHS but iterates over the whole map so it has no
+// (testType, board) lookup to delegate.
+String swBoardZip(String testType, String board) {
+  Map entry = SW_BOARD_ZIP_PATHS["${testType}_${board}"] as Map
+  return entry?.zip ?: ''
 }
 
 // Mirrors Jenkinsfile.runShard(). finally{} ensures junit XML on failure.
 void runHwShard(Map row, String testType, String stageName) {
   if (!isOnline(row.agentLabel as String)) {
-    echo "${stageName} skipped: agent ${row.agentLabel} offline"
-    return
+    error "${stageName} cannot run: agent ${row.agentLabel} is offline"
   }
   node(row.agentLabel) {
     stage(stageName) {
@@ -156,11 +282,15 @@ void withHwCredentials(Map row, Closure body) {
 }
 
 void runHwTest(Map row, String testType) {
-  sh "mkdir -p ${testType}"
+  sh "mkdir -p ${shellQuote(testType)}"
   dir("${testType}") {
-    cleanPreviousBuildFiles("${row.board}*")
-    unstash name: "${testType}_${row.board}_zip"
-    sh "unzip -o ${row.board}.zip"
+    // Only the credentialed boards swept sibling residue (e.g. KV260_SOM.zip
+    // next to the KV260_SOM/ tree) pre-refactor, U250 cleaned just the dir.
+    // Gate on USER_CREDENTIALS to preserve that contract exactly.
+    cleanPreviousBuildFiles(row.board as String, env.USER_CREDENTIALS != null)
+    String zipName = "${row.board}.zip"
+    unstash name: hwZipStashName(testType, row.board as String)
+    sh "unzip -o ${shellQuote(zipName)}"
     dir("${row.board}") {
       unstash name: 'bnn_test_files'
       createTestScript(row, "${testType}_hw_${row.board}")
@@ -180,32 +310,78 @@ void createTestScript(Map row, String testResultsFilename) {
       : '. /etc/profile.d/pynq_venv.sh\n. /etc/profile.d/xrt_setup.sh'
   String script =
       "#!/bin/bash\n${setup}\n" +
-      "export FINN_CI_MARKER='${row.marker}'\n" +
+      "export FINN_CI_MARKER=${shellQuote(row.marker as String)}\n" +
       "python -m pytest -m \"\$FINN_CI_MARKER\" " +
       "--junitxml=${testResultsFilename}.xml --html=${testResultsFilename}.html " +
       "--self-contained-html\n"
   writeFile file: 'run-tests.sh', text: script
-  sh 'chmod 777 run-tests.sh'
+  sh 'chmod 755 run-tests.sh'
 }
 
 String hwStashName(String testType, String board) {
   return "${testType}_${board}"
 }
 
-// Newest <board>.zip across legacy path, sanity single-dir, and per-shard
-// full-build dirs. Returns "" if absent (caller logs + skips the shard).
-String findBoardZip(String testType, String board) {
-  String legacy = "${env.ARTIFACT_DIR}/${testType}/${board}.zip"
-  if (fileExists(legacy)) { return legacy }
-  String glob = (testType == 'bnn_build_sanity')
-      ? "${env.ARTIFACT_DIR}/sanity_build_hardware/${board}.zip"
-      : "${env.ARTIFACT_DIR}/bnn_*/${board}.zip"
-  def hit = sh(returnStdout: true, script:
-      "ls -1t ${glob} 2>/dev/null | head -1 || true"
-  ).trim()
-  return hit
+String hwZipStashName(String testType, String board) {
+  return "${testType}_${board}_zip"
 }
 
+// Per-pair resolution lives in ci_sharding.resolve_sw_zips and is driven
+// once from resolveSwBoardZipPaths above. The auto-discovery contract is
+// preserved verbatim: scan ci_runs/<jobkey>/ for the highest-numbered build
+// whose zips/<testType>/<board>.zip.READY sibling is present. The handoff
+// layout itself is the contract, with no JSON schema, no version field, and
+// no symlink. The explicit ``sw_build_dir`` override is honoured per-board
+// (missing READY in the override is reported but not fatal so a
+// partially-READY explicit dir does not strand the rest of the matrix).
+
+// Archives every distinct SW build's BUILD_INFO.txt that this HW build is
+// reading from. Different boards may resolve to different SW builds when an
+// individual board's build has regressed but others are healthy, so there is
+// no single SW build to archive any more. Best effort, missing BUILD_INFO is
+// a warning rather than an error.
+// Sole writer of currentBuild.description on the HW pipeline. The SW pipeline
+// owns its own currentBuild.description via publishStageMap, the two never
+// share a build.
+void archiveBuildInfo() {
+  catchError(buildResult: null, stageResult: null,
+             message: 'archiveBuildInfo failed, non-fatal') {
+    // The HW pipeline does not git-clean between runs, so wipe last build's
+    // copies before laying down this build's.
+    sh 'rm -f sw_build_info_*.txt'
+    Set<String> swBuildDirs = new LinkedHashSet<>()
+    Map<String, String> boardToBuild = [:]
+    SW_BOARD_ZIP_PATHS.each { key, entry ->
+      // entry is always a Map (constructed by resolveSwBoardZipPaths);
+      // the empty map {} represents "no READY zip resolved" for this pair.
+      String dir = entry.swBuildDir as String
+      if (!dir) { return }
+      swBuildDirs.add(dir)
+      String fallback = entry.fallback ? " fallback=true latest=${entry.latestSwBuild}" : " fallback=false"
+      boardToBuild[key] = "${dir}${fallback}"
+    }
+    int n = 0
+    swBuildDirs.each { dir ->
+      String info = "${dir}/BUILD_INFO.txt"
+      if (!fileExists(info)) {
+        echo "archiveBuildInfo: ${info} not present, skipping"
+        return
+      }
+      String localName = "sw_build_info_${n}.txt"
+      sh "cp ${shellQuote(info)} ${shellQuote(localName)}"
+      archiveArtifacts artifacts: localName, allowEmptyArchive: true
+      n++
+    }
+    if (!boardToBuild.isEmpty()) {
+      List<String> lines = boardToBuild.collect { k, v -> "${k}=${v}" }.sort()
+      currentBuild.description = "SW per board:<br>" + lines.join('<br>')
+    }
+  }
+}
+
+// Copies each resolved board zip into the workspace and stashes it for the
+// board agent. Per-board skip when offline or no READY zip keeps the rest of
+// the matrix running.
 void stashBuildArtifacts(String testType) {
   HW_SHARDS.each { row ->
     String board = row.board as String
@@ -213,26 +389,28 @@ void stashBuildArtifacts(String testType) {
       echo "stashBuildArtifacts[${testType}]: ${board} agent offline, skipping"
       return
     }
-    String src = findBoardZip(testType, board)
+    String src = swBoardZip(testType, board)
     if (!src) {
-      echo "stashBuildArtifacts[${testType}]: no ${board}.zip under ${env.ARTIFACT_DIR}, HW shard for ${board}/${testType} will skip"
+      echo "stashBuildArtifacts[${testType}]: no READY zip for ${board}, HW shard will skip"
       return
     }
+    String zipName = "${board}.zip"
+    sh "cp ${shellQuote(src)} ${shellQuote(zipName)}"
     echo "stashBuildArtifacts[${testType}]: ${board} <- ${src}"
-    // stash is workspace-relative, so copy into workspace first.
-    sh "cp '${src}' '${board}.zip'"
-    stash name: "${testType}_${board}_zip", includes: "${board}.zip"
-    sh "rm -f '${board}.zip'"
+    stash name: hwZipStashName(testType, board), includes: zipName
+    sh "rm -f ${shellQuote(zipName)}"
   }
 }
 
-// Skip offline boards to avoid spurious unstash warnings.
+// Skip offline boards and boards with no READY zip to avoid spurious unstash
+// warnings. Pure map lookup, no filesystem stats.
 List<String> expectedStashes() {
   def stashes = []
   HW_TEST_TYPES.each { testType ->
     HW_SHARDS.each { row ->
-      if (isOnline(row.agentLabel as String)) {
-        stashes << hwStashName(testType, row.board as String)
+      String board = row.board as String
+      if (isOnline(row.agentLabel as String) && swBoardZip(testType, board)) {
+        stashes << hwStashName(testType, board)
       }
     }
   }
@@ -261,27 +439,23 @@ def isNodeOnline(String labelName) {
 }
 
 // --------------------------------------------------------------------------
-// Shared helpers — DUPLICATED from docker/jenkins/Jenkinsfile. Keep in sync.
+// Shared helpers thin-wrapped over docker/jenkins/_common.groovy.
+// safeStashReport on the HW side intentionally takes an explicit fileBase
+// because HW reports use a different basename pattern (testType_hw_board)
+// from the SW shard stash name (testType_board), and cleanPreviousBuildFiles
+// on the HW side takes an includeSiblings boolean plus a sudo prefix when
+// HW credentials are bound.
 // --------------------------------------------------------------------------
 
+String paramString(String name)         { return loadCommonOnce().paramString(name) }
+String shellQuote(String s)             { return loadCommonOnce().shellQuote(s) }
+void   runDockerCommand(String command) { loadCommonOnce().runDockerCommand(command) }
+
 void safeStashReport(String stashName, String fileBase) {
-  catchError(buildResult: null, stageResult: null,
-             message: "safeStashReport(${stashName}) failed; aggregation may be partial") {
-    if (fileExists("${fileBase}.xml")) {
-      stash name: stashName,
-            includes: "${fileBase}.xml,${fileBase}.html",
-            allowEmpty: false
-    }
-  }
+  loadCommonOnce().safeStashHwReport(stashName, fileBase)
 }
 
-void unstashIfPresent(String stashName) {
-  try {
-    unstash stashName
-  } catch (Exception ignored) {
-    echo "No stash '${stashName}' (board offline or stage failed before publishing)"
-  }
-}
+void unstashIfPresent(String stashName) { loadCommonOnce().unstashIfPresent(stashName) }
 
 // junit first (workspace-local, never flakes), then merge + archive.
 void aggregateReports() {
@@ -292,8 +466,8 @@ void aggregateReports() {
   }
   junit allowEmptyResults: true, testResults: 'reports/*.xml'
   catchError(buildResult: null, stageResult: 'UNSTABLE',
-             message: 'pytest_html_merger failed; per-stage HTMLs still archived') {
-    sh './run-docker.sh pytest_html_merger -i reports/ -o reports/test_report_hw_final.html'
+             message: 'pytest_html_merger failed, per-stage HTMLs still archived') {
+    runDockerCommand('./run-docker.sh pytest_html_merger -i reports/ -o reports/test_report_hw_final.html')
   }
   catchError(buildResult: null, stageResult: 'UNSTABLE',
              message: 'archiveArtifacts (xml) failed') {
@@ -305,14 +479,8 @@ void aggregateReports() {
   }
 }
 
-void cleanPreviousBuildFiles(String buildDir) {
-  if (buildDir && !buildDir.empty) {
-    if (env.USER_CREDENTIALS) {
-      sh "echo \$USER_CREDENTIALS_PSW | sudo -S rm -rf ${buildDir}*"
-    } else {
-      sh "rm -rf ${buildDir}"
-    }
-  }
+void cleanPreviousBuildFiles(String buildDir, boolean includeSiblings = false) {
+  loadCommonOnce().cleanPreviousBuildFilesHw(buildDir, includeSiblings)
 }
 
 void cleanUpWorkspaceOwnership() {

@@ -99,6 +99,7 @@ SCRIPTPATH=$(dirname "$SCRIPT")
 : ${FINN_SKIP_XRT_DOWNLOAD=""}
 : ${FINN_XRT_PATH=""}
 : ${FINN_DOCKER_NO_CACHE="0"}
+: ${FINN_DOCKER_ALLOW_PREBUILT_FALLBACK="0"}
 
 DOCKER_INTERACTIVE=""
 
@@ -181,27 +182,71 @@ if [ "$FINN_DOCKER_NO_CACHE" = "1" ]; then
   FINN_DOCKER_BUILD_EXTRA+="--no-cache "
 fi
 
-# If the image isn't available locally, try loading from shared storage.
-# Independent of FINN_DOCKER_PREBUILT — with PREBUILT=1 this provides the
-# image, with PREBUILT=0 it warms the layer cache.
-if [ ! -z "$FINN_DOCKER_SHARED_DIR" ] && \
-   ! docker image inspect "$FINN_DOCKER_TAG" > /dev/null 2>&1; then
-  SHARED_IMG="$FINN_DOCKER_SHARED_DIR/finn-docker-image.tar.gz"
-  SHARED_TAG_FILE="$FINN_DOCKER_SHARED_DIR/finn-docker-tag.txt"
-  if [ -f "$SHARED_IMG" ] && [ -f "$SHARED_TAG_FILE" ]; then
-    gecho "Loading Docker image from shared storage ($FINN_DOCKER_SHARED_DIR)..."
+# If the image isn't available locally, try loading from shared storage. In
+# prebuilt mode, always verify/load the build-scoped shared image instead of
+# trusting a same-tag local image left by an older build.
+if { [ -n "$FINN_DOCKER_SHARED_IMAGE_DIR" ] || [ -n "$FINN_DOCKER_SHARED_DIR" ]; } && \
+   { [ "$FINN_DOCKER_PREBUILT" = "1" ] || ! docker image inspect "$FINN_DOCKER_TAG" > /dev/null 2>&1; }; then
+  SHARED_DIR=""
+  SHARED_LOADED="0"
+  PROBED=""
+  if [ -n "$FINN_DOCKER_SHARED_IMAGE_DIR" ]; then
+    candidate_vars=(FINN_DOCKER_SHARED_IMAGE_DIR)
+  else
+    candidate_vars=(FINN_DOCKER_SHARED_DIR)
+  fi
+  for candidate_var in "${candidate_vars[@]}"; do
+    candidate="${!candidate_var:-}"
+    if [ -z "$candidate" ]; then continue; fi
+    PROBED="$PROBED $candidate_var=$candidate"
+    if [ -f "$candidate/finn-docker-image.tar.gz" ] && [ -f "$candidate/finn-docker-tag.txt" ]; then
+      SHARED_DIR="$candidate"
+      break
+    fi
+  done
+  if [ -n "$SHARED_DIR" ]; then
+    SHARED_IMG="$SHARED_DIR/finn-docker-image.tar.gz"
+    SHARED_TAG_FILE="$SHARED_DIR/finn-docker-tag.txt"
+    gecho "Loading Docker image from shared storage ($SHARED_DIR)..."
     SHARED_TAG=$(cat "$SHARED_TAG_FILE")
+    if [ "$FINN_DOCKER_PREBUILT" = "1" ] && [ "$SHARED_TAG" != "$FINN_DOCKER_TAG" ]; then
+      gecho "ERROR: Shared Docker tag $SHARED_TAG does not match requested tag $FINN_DOCKER_TAG"
+      exit 1
+    fi
     # /tmp lock serialises loads on the same host (do not move to NFS).
-    if flock /tmp/finn-docker-load.lock bash -c "set -o pipefail; gunzip -c '$SHARED_IMG' | docker load"; then
+    # Pass SHARED_IMG as $1 so the inner shell does not have to interpolate it.
+    if flock /tmp/finn-docker-load.lock \
+         bash -c 'set -o pipefail; gunzip -c "$1" | docker load' _ "$SHARED_IMG"; then
+      SHARED_LOADED="1"
       if [ "$SHARED_TAG" != "$FINN_DOCKER_TAG" ]; then
         gecho "Tagging $SHARED_TAG as $FINN_DOCKER_TAG"
         docker tag "$SHARED_TAG" "$FINN_DOCKER_TAG"
       fi
     else
-      gecho "WARNING: Failed to load Docker image from shared storage"
-      if [ "$FINN_DOCKER_PREBUILT" = "1" ]; then
-        gecho "Falling back to local Docker build"
+      gecho "WARNING: Failed to load Docker image from shared storage ($SHARED_DIR)"
+    fi
+  fi
+  if [ "$FINN_DOCKER_PREBUILT" = "1" ] && [ "$SHARED_LOADED" != "1" ]; then
+    gecho "No usable shared Docker image found. Probed:${PROBED:- (none set)}"
+    gecho "Each candidate must contain both finn-docker-image.tar.gz and finn-docker-tag.txt"
+    if [ "$FINN_DOCKER_ALLOW_PREBUILT_FALLBACK" = "1" ]; then
+      gecho "Falling back to local Docker build because FINN_DOCKER_ALLOW_PREBUILT_FALLBACK=1"
+      FINN_DOCKER_PREBUILT="0"
+    else
+      gecho "ERROR: FINN_DOCKER_PREBUILT=1 requires a usable shared Docker image"
+      exit 1
+    fi
+  fi
+  if ! docker image inspect "$FINN_DOCKER_TAG" > /dev/null 2>&1; then
+    gecho "No usable shared Docker image found. Probed:${PROBED:- (none set)}"
+    gecho "Each candidate must contain both finn-docker-image.tar.gz and finn-docker-tag.txt"
+    if [ "$FINN_DOCKER_PREBUILT" = "1" ]; then
+      if [ "$FINN_DOCKER_ALLOW_PREBUILT_FALLBACK" = "1" ]; then
+        gecho "Falling back to local Docker build because FINN_DOCKER_ALLOW_PREBUILT_FALLBACK=1"
         FINN_DOCKER_PREBUILT="0"
+      else
+        gecho "ERROR: FINN_DOCKER_PREBUILT=1 requires a usable shared Docker image"
+        exit 1
       fi
     fi
   fi

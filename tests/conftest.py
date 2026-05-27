@@ -25,22 +25,20 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Sharding and timing-observability plugin for FINN CI.
+"""Pytest plugin for Jenkins shard selection and timing observability.
 
 Each Jenkins stage runs ``pytest -m <marker> --num-shards N --shard-id I``.
-This module deterministically assigns groups to shards using the timing state
-pointed at by ``FINN_CI_TIMINGS_FILE``. If the file is absent or has no signal,
-assignment falls back to deterministic round-robin.
+Group assignment is deterministic and weighted by ``FINN_CI_TIMINGS_FILE``.
+If the file is absent or has no signal, assignment falls back to
+deterministic round-robin over sorted group keys. Items sharing an
+``@pytest.mark.xdist_group`` always land in the same shard so chained
+``load_test_checkpoint_or_skip`` steps don't break. Items without an
+explicit group are grouped by nodeid.
 
-Items sharing an ``@pytest.mark.xdist_group(name=X)`` always land in the
-same shard so chained ``load_test_checkpoint_or_skip`` steps don't break.
-Items without an explicit group are grouped by nodeid.
-
-``@pytest.mark.shard(N)`` pins a group to shard N. ``--dry-run-shards``
-prints the shard table and exits. ``--which-shard QUERY`` prints which
-Jenkins shard a given nodeid would run on. A ``<stash>.timings.json``
-sidecar is emitted next to the junit XML so aggregation can flag outliers
-and update the Jenkins-managed timing state.
+``@pytest.mark.shard(N)`` pins a group for flaky-test isolation.
+``--dry-run-shards`` prints the shard table and exits. ``--which-shard QUERY``
+prints which Jenkins shard a matching nodeid would run on. A
+``<stash>.timings.json`` sidecar is emitted next to the junit XML.
 """
 import pytest
 
@@ -85,7 +83,7 @@ def pytest_addoption(parser):
         default=None,
         metavar="QUERY",
         help="Print which Jenkins shard each ci_sharding.STAGES row "
-        "would run a matching test on; use with --collect-only.",
+        "would run a matching test on. Use with --collect-only.",
     )
 
 
@@ -114,7 +112,7 @@ def _pinned_shard(item, num_shards):
         pinned = mark.args[0]
         if not isinstance(pinned, int):
             raise pytest.UsageError(
-                "@pytest.mark.shard expects an int arg; got %r on %s" % (pinned, item.nodeid)
+                "@pytest.mark.shard expects an int arg, got %r on %s" % (pinned, item.nodeid)
             )
         if not 0 <= pinned < num_shards:
             raise pytest.UsageError(
@@ -126,22 +124,26 @@ def _pinned_shard(item, num_shards):
 
 
 def _load_group_weights():
-    """Return ``{group_name: seconds}`` from ``FINN_CI_TIMINGS_FILE``."""
     return ci_sharding.load_group_weights(os.environ.get("FINN_CI_TIMINGS_FILE"))
 
 
 def _weights_with_fallback():
-    """Return ``(weights_table, fallback)`` so callers don't recompute the median.
-
-    Fallback is the median of recorded weights (``1.0`` if the file is absent
-    or has no positive entries) and is used for groups not yet timed.
-    """
+    # Fallback is the median of recorded weights (1.0 if the file is absent or
+    # has no positive entries) and is used for groups not yet timed.
     weights_table = _load_group_weights()
     fallback = ci_sharding.weights_with_fallback(weights_table)
     return weights_table, fallback
 
 
 def _assignment_details(groups, num_shards):
+    """Resolve shard pins, then delegate to ``ci_sharding.assign_groups_to_shards``.
+
+    Each xdist_group must agree on a single ``@pytest.mark.shard(N)`` value,
+    otherwise sibling tests would split across shards and break chained
+    ``load_test_checkpoint_or_skip`` steps. Returns the tuple
+    ``(assignment, source, shard_load, weights_table, fallback)`` so callers
+    don't recompute the median weight.
+    """
     pins = {}
     for key, members in groups.items():
         group_pins = {_pinned_shard(it, num_shards) for it in members}
@@ -161,18 +163,12 @@ def _assignment_details(groups, num_shards):
 
 
 def _assign_groups_to_shards(groups, num_shards):
-    """Map ``{group_key: [items]}`` to ``{group_key: shard_id}``.
-
-    Honours @pytest.mark.shard(N) pins, then LPT-greedy assigns the
-    remaining groups by descending timing weight (groups without a recorded
-    weight get the median, falling back to 1.0).
-    Ties are broken by sorted group key for reproducibility.
-    """
+    """Map ``{group_key: [items]}`` to ``{group_key: shard_id}``."""
     return _assignment_details(groups, num_shards)[0]
 
 
 def _marker_tokens(marker_expr):
-    """Split a ci_sharding marker expression into individual marker names."""
+    # STAGES.marker is constrained to bare 'a or b ...' by MARKER_SAFE_PATTERN.
     return [t for t in marker_expr.split() if t != "or"]
 
 
@@ -213,8 +209,8 @@ def _run_which_shard(config, items, query):
         fmt = "  ".join("%%-%ds" % w for w in widths)
         print(fmt % header)
         print(fmt % tuple("-" * w for w in widths))
-        for r in rows:
-            print(fmt % tuple(str(c) for c in r))
+        for row in rows:
+            print(fmt % tuple(str(c) for c in row))
     config.hook.pytest_deselected(items=list(items))
     items[:] = []
 
@@ -298,7 +294,7 @@ def pytest_collection_modifyitems(config, items):
         # An empty selection under sharding is a silent-skip footgun (stale
         # marker, typo). Fail loudly instead.
         raise pytest.UsageError(
-            "no tests collected for this marker; CI shard configuration is "
+            "no tests collected for this marker. CI shard configuration is "
             "out of sync with the test markers"
         )
 
@@ -390,8 +386,8 @@ def pytest_collection_finish(session):
 def pytest_runtest_logreport(report):
     if _TIMINGS is None:
         return
-    # Accumulate setup+call+teardown per nodeid. xdist forwards worker
-    # reports here so summing covers the full session.
+    # Accumulate setup+call+teardown per nodeid. xdist forwards worker reports
+    # here so summing covers the full session.
     duration = float(getattr(report, "duration", 0.0) or 0.0)
     _TIMINGS["per_test_seconds"][report.nodeid] = (
         _TIMINGS["per_test_seconds"].get(report.nodeid, 0.0) + duration
@@ -399,9 +395,21 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_sessionfinish(session, exitstatus):
-    if exitstatus == 5 and (
-        session.config.getoption("--dry-run-shards") or session.config.getoption("--which-shard")
-    ):
+    # Exit 5 ("no tests collected") is success for every sharding-aware
+    # invocation: --dry-run-shards and --which-shard finish their work by
+    # deselecting everything, and a real sharded run can legitimately end
+    # up empty when a shard's slice of the test set happens to be all
+    # deselected upstream (the empty-collection footgun is caught by the
+    # UsageError raised earlier in pytest_collection_modifyitems, so by
+    # the time we reach here exitstatus 5 is benign). Mapping the exit
+    # code here keeps run-tests.sh (and any future caller) free of
+    # pytest-version-coupled shell knowledge.
+    sharded = (
+        session.config.getoption("--num-shards") > 0
+        or session.config.getoption("--dry-run-shards")
+        or session.config.getoption("--which-shard")
+    )
+    if exitstatus == 5 and sharded:
         session.exitstatus = 0
     if _TIMINGS is None:
         return
