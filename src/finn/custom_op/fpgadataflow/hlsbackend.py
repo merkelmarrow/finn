@@ -268,7 +268,7 @@ class HLSBackend(ABC):
         builder.append_includes("-I$FINN_ROOT/deps/finn-hlslib")
         builder.append_includes("-I$FINN_ROOT/custom_hls")
         builder.append_includes(f"-I{hls_path}/include")
-        builder.append_includes("--std=c++14")
+        builder.append_includes("--std=c++17")
         builder.append_includes("-O3")
         builder.append_sources(code_gen_dir + "/*.cpp")
         builder.append_sources("$FINN_ROOT/src/finn/qnn-data/cpp/cnpy.cpp")

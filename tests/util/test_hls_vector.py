@@ -96,7 +96,7 @@ def test_npy2vectorstream(test_shape, dtype):
     cmd_compile = """
 g++ -o test_npy2vectorstream test.cpp $FINN_ROOT/src/finn/qnn-data/cpp/cnpy.cpp \
 -I{}/include -I{}/include -I$FINN_ROOT/src/finn/qnn-data/cpp \
---std=c++14 -lz """.format(
+--std=c++17 -lz """.format(
         os.environ["HLS_PATH"], os.environ["VITIS_PATH"]
     )
     with open(test_dir + "/compile.sh", "w") as f:
