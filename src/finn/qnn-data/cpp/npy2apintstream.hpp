@@ -45,7 +45,7 @@ void npy2apintstream(char const *npy_path, hls::stream<PackedT> &out_stream, boo
 				NpyT const  loaded_elem_npyt = *loaded_data;
 				ElemT const  loaded_elem = (ElemT) loaded_elem_npyt;
 				DEBUG_NPY2APINTSTREAM("NpyT " << loaded_elem_npyt << " elem " << loaded_elem)
-				packed_elem((i+1)*ElemBits-1, i*ElemBits) = *reinterpret_cast<ap_uint<ElemBits>*>(&loaded_elem);
+				packed_elem((i+1)*ElemBits-1, i*ElemBits) = *reinterpret_cast<const ap_uint<ElemBits>*>(&loaded_elem);
 				loaded_data++;
 			}
 			DEBUG_NPY2APINTSTREAM("packed hls elem " << std::hex << packed_elem << std::dec)
@@ -74,7 +74,7 @@ void apintstream2npy(hls::stream<PackedT> &in_stream, std::vector<size_t> const 
 				for(size_t  ii = 0; ii < inner_dim_elems; ii++) {
 					size_t  i = ii_multi_pixel_out*inner_dim_elems;
 					i += reverse_inner ? inner_dim_elems-ii-1 : ii;
-					ap_uint<ElemBits> const  tmp_elem = packed_elem((i+1)*ElemBits-1, i*ElemBits);
+					ap_uint<ElemBits>  tmp_elem = packed_elem((i+1)*ElemBits-1, i*ElemBits);
 					// important: don't init elem = reinterpret_cast.. directly here
 					// this causes weird behavior for conversion to NpyT afterwards
 					ElemT  elem;
