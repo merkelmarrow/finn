@@ -433,7 +433,6 @@ class VVAU_hls(VVAU, HLSBackend):
         if dtype == DataType["BIPOLAR"]:
             # use binary for bipolar storage
             dtype = DataType["BINARY"]
-        elem_bits = dtype.bitwidth()
         packed_bits = self.get_outstream_width()
         packed_hls_type = "ap_uint<%d>" % packed_bits
         elem_hls_type = dtype.get_hls_datatype_str()
