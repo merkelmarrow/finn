@@ -40,13 +40,15 @@ void unstashIfPresent(String stashName) {
 }
 
 // Build pipeline stashes the full per-shard report sidecar set; some are missing
-// when a shard fails early, so allowEmpty is true.
+// when a shard fails early, so allowEmpty is true. The .coverage entry only
+// exists on rows that opted into coverage in STAGES.
 void safeStashShardReport(String stashName) {
   catchError(buildResult: null, stageResult: null,
              message: "safeStashReport(${stashName}) failed, aggregation may be partial") {
     stash name: stashName,
           includes: "${stashName}.xml,${stashName}.html,${stashName}.timings.json," +
-                    "${stashName}.shardmap.txt,${stashName}.shardmap.json,${stashName}.stagemap",
+                    "${stashName}.shardmap.txt,${stashName}.shardmap.json,${stashName}.stagemap," +
+                    "${stashName}.empty-shard,${stashName}.coverage",
           allowEmpty: true
   }
 }
@@ -64,29 +66,39 @@ void safeStashHwReport(String stashName, String fileBase) {
   }
 }
 
+// Hard-fail on root-owned residue. Factored out so the build and HW forms
+// below cannot diverge on the error message or detection logic.
+void _assertNoResidue(String caller, String q) {
+  sh """
+    if [ -d ${q} ]; then
+      echo "${caller}: ${q} still exists after rm. Likely root-owned residue. Ask an admin to 'sudo rm -rf' the directory on this agent."
+      ls -la ${q} | head -40
+      exit 1
+    fi
+  """
+}
+
 // Build pipeline form: tolerant rm, hard-fail on root-owned residue, then
 // pre-create as the unprivileged user so docker -v does not bind the mount as root.
 void cleanPreviousBuildFiles(String buildDir) {
   if (!buildDir || buildDir.empty) { return }
   String q = shellQuote(buildDir)
-  sh """
-    rm -rf ${q} 2>/dev/null || true
-    if [ -d ${q} ]; then
-      echo "cleanPreviousBuildFiles: ${q} still exists after rm. Likely root-owned residue. Ask an admin to 'sudo rm -rf' the directory on this agent."
-      ls -la ${q} | head -40
-      exit 1
-    fi
-    mkdir -p ${q}
-  """
+  sh "rm -rf ${q} 2>/dev/null || true"
+  _assertNoResidue('cleanPreviousBuildFiles', q)
+  sh "mkdir -p ${q}"
 }
 
 // HW form: always rm both the build dir and its sibling .zip. Every HW caller
 // wants both gone; sudo is added only when HW credentials are bound (the board
-// agents can leave root-owned residue behind).
+// agents can leave root-owned residue behind). Hard-fails on residue so a
+// silently surviving root-owned tree cannot pollute the next shard.
 void cleanPreviousBuildFilesHw(String buildDir) {
   if (!buildDir || buildDir.empty) { return }
   String prefix = env.USER_CREDENTIALS ? 'echo "$USER_CREDENTIALS_PSW" | sudo -S ' : ''
-  sh "${prefix}rm -rf ${shellQuote(buildDir)} ${shellQuote(buildDir + '.zip')}"
+  String q = shellQuote(buildDir)
+  String qZip = shellQuote(buildDir + '.zip')
+  sh "${prefix}rm -rf ${q} ${qZip}"
+  _assertNoResidue('cleanPreviousBuildFilesHw', q)
 }
 
 // All shared NFS subtrees derive from FINN_CI_NFS_ROOT. Returning '' from any
@@ -106,6 +118,7 @@ String finnAgentCachesDir(String node)    { return finnSubdir('agent_caches', no
 String finnDockerImagesRoot()             { return finnSubdir('docker_images') }
 String finnDockerImagesDir(String jobKey) { return finnSubdir('docker_images', jobKey) }
 String finnArtifactsRoot()                { return finnSubdir('artifacts') }
+String finnCiStateRoot()                  { return finnSubdir('_ci_state') }
 String finnCiStateDir(String jobKey)      { return finnSubdir('_ci_state', jobKey) }
 
 return this

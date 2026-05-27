@@ -79,7 +79,14 @@ SCRIPTPATH=$(dirname "$SCRIPT")
 : ${FINN_SKIP_XRT_DOWNLOAD=""}
 : ${FINN_XRT_PATH=""}
 : ${FINN_DOCKER_NO_CACHE="0"}
-: ${FINN_DOCKER_ALLOW_PREBUILT_FALLBACK="0"}
+
+# Deprecation warning: FINN_DOCKER_ALLOW_PREBUILT_FALLBACK was an opt-in to
+# silently fall back to a local build when the shared image was missing under
+# FINN_DOCKER_PREBUILT=1. The fallback now always errors so a missing shared
+# image cannot quietly poison a CI run. Drop the env var from your call sites.
+if [ -n "${FINN_DOCKER_ALLOW_PREBUILT_FALLBACK:-}" ]; then
+  echo "warn: FINN_DOCKER_ALLOW_PREBUILT_FALLBACK is deprecated and now ignored; shared image load failure is fatal" >&2
+fi
 
 DOCKER_INTERACTIVE=""
 
@@ -226,13 +233,8 @@ if [ -n "$FINN_DOCKER_SHARED_IMAGE_DIR" ] && \
   if [ "$FINN_DOCKER_PREBUILT" = "1" ] && [ "$SHARED_LOADED" != "1" ]; then
     gecho "No usable shared Docker image found at FINN_DOCKER_SHARED_IMAGE_DIR=$SHARED_DIR"
     gecho "Expected both finn-docker-image.tar.gz and finn-docker-tag.txt to be present"
-    if [ "$FINN_DOCKER_ALLOW_PREBUILT_FALLBACK" = "1" ]; then
-      gecho "Falling back to local Docker build because FINN_DOCKER_ALLOW_PREBUILT_FALLBACK=1"
-      FINN_DOCKER_PREBUILT="0"
-    else
-      gecho "ERROR: FINN_DOCKER_PREBUILT=1 requires a usable shared Docker image"
-      exit 1
-    fi
+    gecho "ERROR: FINN_DOCKER_PREBUILT=1 requires a usable shared Docker image"
+    exit 1
   fi
 fi
 

@@ -10,7 +10,7 @@ import os
 import re
 import sys
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 JENKINS_DIR = os.path.join(REPO_ROOT, "docker", "jenkins")
 if JENKINS_DIR not in sys.path:
     sys.path.insert(0, JENKINS_DIR)
@@ -98,7 +98,7 @@ def test_update_master_preserves_unseen_and_replaces_seen(tmp_path):
     write_json(
         master,
         {
-            "version": 1,
+            "schema_version": 1,
             "groups": {
                 "seen": {"samples": [1.0], "count": 1},
                 "unseen": {"samples": [7.0], "count": 2},
@@ -166,7 +166,7 @@ def test_prepare_timing_snapshot_empty_when_master_missing(tmp_path):
 def test_prepare_timing_snapshot_copies_master_when_present(tmp_path):
     master = tmp_path / "master.json"
     snapshot = tmp_path / "snapshot.json"
-    write_json(master, {"version": 1, "groups": {"slow": {"samples": [12.0]}}})
+    write_json(master, {"schema_version": 1, "groups": {"slow": {"samples": [12.0]}}})
 
     ci_sharding.prepare_timing_snapshot(str(master), str(snapshot))
 
@@ -386,6 +386,12 @@ def test_multi_shard_rows_use_loadgroup_dist_mode():
             ), "STAGES row %r has shards>1 but distMode=%r" % (row["stage"], row.get("distMode"))
 
 
+def test_validate_stage_row_rejects_multi_shard_without_loadgroup():
+    row = {"stage": "X", "marker": "x", "shards": 2, "workers": 1}
+    with pytest.raises(ValueError, match="must set distMode='loadgroup'"):
+        ci_sharding.validate_stage_row(row)
+
+
 def test_enabled_params_rejects_unknown_choice_loudly():
     with pytest.raises(ValueError, match="unknown STAGES choice"):
         ci_sharding.enabled_params_for_choice("notarealchoice")
@@ -422,13 +428,13 @@ def test_validate_config_single_invocation_returns_full_payload(capsys):
     assert set(payload) == {"stages", "enabled_params", "retention", "job_key"}
     assert isinstance(payload["stages"], list) and payload["stages"]
     assert payload["enabled_params"] == ["sanity"]
-    assert set(payload["retention"]) == {"image", "artifact"}
+    assert set(payload["retention"]) == {"image", "artifact", "snapshot"}
     # job-key sanitiser is shared with the standalone subcommand.
     assert payload["job_key"] == "finn.dev"
 
 
 def test_validate_config_rejects_orphan_zipartifact_board(monkeypatch):
-    # validate_boards() runs inside the subcommand so a STAGES row with
+    # validate_config() runs inside the subcommand so a STAGES row with
     # an orphan board fails Validate loudly, not three stages later when
     # the HW pipeline tries to look it up.
     bad_stages = list(ci_sharding.STAGES) + [
@@ -483,7 +489,7 @@ def test_update_master_raises_on_persistent_write_failure(tmp_path, monkeypatch)
     reports.mkdir()
     master = tmp_path / "master.json"
     out = reports / "ci_timings_master.json"
-    write_json(master, {"version": 1, "groups": {}})
+    write_json(master, {"schema_version": 1, "groups": {}})
     write_json(
         reports / "stage.timings.json",
         {
@@ -634,11 +640,73 @@ def test_prune_artifacts_validates_current_build_at_boundary(tmp_path):
 def test_boards_has_metadata_for_every_zip_artifact_board():
     # The HW pipeline derives HW_SHARDS from BOARDS via hw-shards-json, so a
     # STAGES row that mentions a board missing from BOARDS would yield a zip
-    # nobody can run. validate_boards() must reject that asymmetry.
-    ci_sharding.validate_boards()
+    # nobody can run. validate_config() must reject that asymmetry.
+    ci_sharding.validate_config()
 
 
-def test_validate_boards_rejects_orphan_zipartifact_board():
+@pytest.mark.parametrize(
+    "board,row,match",
+    [
+        ("B", {}, "missing required"),
+        (
+            "B",
+            {
+                "agentLabel": "",
+                "credentialsId": None,
+                "restartPrep": False,
+                "setupScript": "pynq",
+                "marker": "B",
+            },
+            "invalid agentLabel",
+        ),
+        (
+            "B",
+            {
+                "agentLabel": "finn-b",
+                "credentialsId": "",
+                "restartPrep": False,
+                "setupScript": "pynq",
+                "marker": "B",
+            },
+            "invalid credentialsId",
+        ),
+        (
+            "B",
+            {
+                "agentLabel": "finn-b",
+                "credentialsId": None,
+                "restartPrep": True,
+                "setupScript": "pynq",
+                "marker": "B",
+            },
+            "restartPrep=true but no credentialsId",
+        ),
+        (
+            "B",
+            {
+                "agentLabel": "finn-b",
+                "credentialsId": None,
+                "restartPrep": False,
+                "setupScript": "bogus",
+                "marker": "B",
+            },
+            "invalid setupScript",
+        ),
+    ],
+)
+def test_validate_board_row_rejects_bad_input(board, row, match):
+    with pytest.raises(ValueError, match=match):
+        ci_sharding.validate_board_row(board, row)
+
+
+def test_validate_boards_is_alias_for_validate_config():
+    # validate_boards stays as a compatibility shim for any out-of-tree
+    # caller that still imports the old name; both should run the same
+    # checks against the live STAGES/BOARDS tables.
+    assert ci_sharding.validate_boards is ci_sharding.validate_config
+
+
+def test_validate_config_rejects_orphan_zipartifact_board_via_helper():
     custom_stages = [
         {
             "param": "p",
@@ -650,7 +718,30 @@ def test_validate_boards_rejects_orphan_zipartifact_board():
         },
     ]
     with pytest.raises(ValueError, match="FakeBoard"):
-        ci_sharding.validate_boards(stages=custom_stages, boards={})
+        ci_sharding.validate_config(stages=custom_stages, boards={})
+
+
+@pytest.mark.parametrize(
+    "zip_art,match",
+    [
+        ({}, "non-empty hwTestType"),
+        ({"hwTestType": "", "boards": ["U250"]}, "non-empty hwTestType"),
+        ({"hwTestType": "t"}, "non-empty boards list"),
+        ({"hwTestType": "t", "boards": []}, "non-empty boards list"),
+        ({"hwTestType": "t", "boards": [""]}, "non-empty boards list"),
+    ],
+)
+def test_validate_stage_row_rejects_bad_zip_artifacts(zip_art, match):
+    row = {
+        "param": "p",
+        "stage": "X",
+        "marker": "x",
+        "shards": 1,
+        "workers": 1,
+        "zipArtifacts": zip_art,
+    }
+    with pytest.raises(ValueError, match=match):
+        ci_sharding.validate_stage_row(row)
 
 
 def test_hw_shards_flattens_boards_dict_for_groovy():
@@ -756,7 +847,7 @@ def test_locked_update_backs_up_corrupt_master(tmp_path):
     master.write_text("{ this is not json")
 
     updated = ci_sharding.locked_update(
-        str(master), lambda cur: {"version": 1, "groups": {"k": {"samples": [1.0]}}}
+        str(master), lambda cur: {"schema_version": 1, "groups": {"k": {"samples": [1.0]}}}
     )
 
     assert updated["groups"]["k"]["samples"] == [1.0]
@@ -777,7 +868,7 @@ def test_backup_if_corrupt_caps_history(tmp_path):
         (tmp_path / ("master.json.corrupt-%d" % (1000 + i))).write_text("old %d" % i)
     master.write_text("{ this is not json")
 
-    ci_sharding.locked_update(str(master), lambda cur: {"version": 1, "groups": {}})
+    ci_sharding.locked_update(str(master), lambda cur: {"schema_version": 1, "groups": {}})
 
     backups = sorted(p.name for p in tmp_path.iterdir() if ".corrupt-" in p.name)
     # Newest cap survivors plus the freshly-made one from this run.
@@ -792,7 +883,7 @@ def test_locked_update_does_not_backup_empty_master(tmp_path):
     master = tmp_path / "master.json"
     master.write_text("")
 
-    ci_sharding.locked_update(str(master), lambda cur: {"version": 1, "groups": {}})
+    ci_sharding.locked_update(str(master), lambda cur: {"schema_version": 1, "groups": {}})
 
     # zero-byte master is the idle-create case, not corruption, so no backup
     backups = [p for p in tmp_path.iterdir() if ".corrupt-" in p.name]
@@ -834,7 +925,7 @@ def test_update_master_no_master_path_writes_preview(tmp_path):
 
 
 def _seed_master_with_group(path, name, samples, **extra):
-    write_json(path, {"version": 1, "groups": {name: {"samples": list(samples), **extra}}})
+    write_json(path, {"schema_version": 1, "groups": {name: {"samples": list(samples), **extra}}})
 
 
 def _write_observation(reports_dir, stash, name, seconds):
@@ -863,7 +954,7 @@ def test_update_master_cold_start_accepts_first_observation(tmp_path):
     reports.mkdir()
     master = tmp_path / "master.json"
     out = reports / "ci_timings_master.json"
-    write_json(master, {"version": 1, "groups": {}})
+    write_json(master, {"schema_version": 1, "groups": {}})
     _write_observation(reports, "stage", "newgroup", 42.0)
     ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
     persisted = json.loads(master.read_text())
@@ -986,7 +1077,7 @@ def test_update_master_skips_all_updates_on_build_wide_anomaly(tmp_path):
     write_json(
         master,
         {
-            "version": 1,
+            "schema_version": 1,
             "groups": {name: {"samples": [100.0, 100.0]} for name in ["a", "b", "c", "d", "e"]},
         },
     )
@@ -1013,7 +1104,7 @@ def test_update_master_build_wide_veto_requires_minimum_eligible(tmp_path):
     write_json(
         master,
         {
-            "version": 1,
+            "schema_version": 1,
             "groups": {"a": {"samples": [100.0]}, "b": {"samples": [100.0]}},
         },
     )
@@ -1038,7 +1129,7 @@ def test_update_master_garbage_collects_groups_unseen_for_n_builds(tmp_path):
     write_json(
         master,
         {
-            "version": 1,
+            "schema_version": 1,
             "build_seq": ci_sharding.GC_BUILDS_UNSEEN + 50,
             "groups": {
                 "stale": {"samples": [10.0], "last_seen_build_seq": 1},
@@ -1067,7 +1158,7 @@ def test_update_master_preview_does_not_gc_unobserved_groups(tmp_path):
     write_json(
         master,
         {
-            "version": 1,
+            "schema_version": 1,
             "build_seq": ci_sharding.GC_BUILDS_UNSEEN + 50,
             "groups": {
                 "end2end": {"samples": [100.0], "last_seen_build_seq": 1},
@@ -1091,7 +1182,7 @@ def test_load_group_weights_returns_median_of_samples(tmp_path):
     write_json(
         master,
         {
-            "version": 1,
+            "schema_version": 1,
             "groups": {"g": {"samples": [10.0, 20.0, 30.0]}},
         },
     )
@@ -1099,9 +1190,17 @@ def test_load_group_weights_returns_median_of_samples(tmp_path):
     assert weights["g"] == 20.0
 
 
-def test_normalise_master_rejects_unknown_schema_version():
-    with pytest.raises(ValueError, match="unsupported master schema version"):
-        ci_sharding.normalise_master({"version": 2, "groups": {}})
+def test_normalise_master_drops_unknown_schema_version(capsys):
+    out = ci_sharding.normalise_master({"schema_version": 99, "groups": {"g": {"samples": [1.0]}}})
+    assert out["schema_version"] == ci_sharding.SCHEMA_VERSION
+    assert out["groups"] == {}
+    assert "unrecognised schema_version" in capsys.readouterr().err
+
+
+def test_normalise_master_writes_canonical_schema_version_key():
+    out = ci_sharding.normalise_master({"groups": {}})
+    assert "schema_version" in out
+    assert out["schema_version"] == 1
 
 
 def test_pytest_plugin_writes_timings_for_successful_sharded_run(pytester):
@@ -1147,3 +1246,280 @@ def test_ok():
     assert data["stash"] == "stage"
     assert data["shard"] == {"num": 1, "id": 0}
     assert data["groups"][0]["name"].endswith("test_sample.py::test_ok")
+
+
+# ============================================================================
+# CLI regressions: dropped subcommands must stay dropped
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["stages-json"],
+        ["retention-json"],
+        ["enabled-params", "--choice", "sanity"],
+        ["stash-name", "Stage", "1", "0"],
+    ],
+)
+def test_dropped_subcommands_exit_non_zero(argv):
+    # The build pipeline does not call any of these; re-adding one means
+    # wiring its own Groovy caller, not silently re-using a CLI that no
+    # longer has tests behind it.
+    with pytest.raises(SystemExit) as exc:
+        ci_sharding.main(argv)
+    assert exc.value.code != 0
+
+
+# ============================================================================
+# hw-test-types-json
+# ============================================================================
+
+
+def test_hw_test_types_lists_distinct_values_in_stage_order():
+    types = ci_sharding.hw_test_types()
+    assert types == ["bnn_build_sanity", "bnn_build_full"]
+    declared = {
+        row["zipArtifacts"]["hwTestType"] for row in ci_sharding.STAGES if row.get("zipArtifacts")
+    }
+    assert set(types) == declared
+
+
+def test_hw_test_types_json_cli_emits_valid_json(capsys):
+    rc = ci_sharding.main(["hw-test-types-json"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert isinstance(parsed, list)
+    assert "bnn_build_sanity" in parsed
+    assert "bnn_build_full" in parsed
+
+
+# ============================================================================
+# which-shard
+# ============================================================================
+
+
+def test_which_shard_returns_one_row_per_stage_without_marker_filter():
+    rows = ci_sharding.which_shard("synthetic-group")
+    stage_names = [r["stage"] for r in rows]
+    expected = [row["stage"] for row in ci_sharding.STAGES]
+    assert stage_names == expected
+    for r in rows:
+        assert 0 <= r["shard"] < r["shards"]
+        assert r["stash"]
+
+
+def test_which_shard_filters_by_marker():
+    rows = ci_sharding.which_shard("any-group", marker_filter="fpgadataflow")
+    assert len(rows) == 1
+    assert rows[0]["stage"] == "fpgadataflow"
+    assert rows[0]["shards"] == 2
+
+
+def test_which_shard_filters_compound_marker_by_token():
+    rows = ci_sharding.which_shard("any-group", marker_filter="util")
+    assert len(rows) == 1
+    assert rows[0]["stage"] == "Sanity - Unit Tests"
+
+
+def test_which_shard_uses_timing_master_for_placement(tmp_path):
+    master = tmp_path / "master.json"
+    write_json(
+        master,
+        {
+            "schema_version": 1,
+            "groups": {
+                "synthetic-group": {"samples": [10.0], "count": 1},
+            },
+        },
+    )
+    rows = ci_sharding.which_shard(
+        "synthetic-group", master_path=str(master), marker_filter="fpgadataflow"
+    )
+    assert rows and rows[0]["shards"] == 2
+    assert rows[0]["shard"] in (0, 1)
+
+
+def test_which_shard_cli_emits_valid_json(capsys):
+    rc = ci_sharding.main(["which-shard", "some-test", "--marker", "fpgadataflow"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert isinstance(parsed, list) and len(parsed) == 1
+    assert parsed[0]["stage"] == "fpgadataflow"
+
+
+def test_which_shard_cli_marker_filter_accepts_marker_token(capsys):
+    rc = ci_sharding.main(["which-shard", "some-test", "--marker", "util"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert isinstance(parsed, list) and len(parsed) == 1
+    assert parsed[0]["stage"] == "Sanity - Unit Tests"
+
+
+# ============================================================================
+# prune-snapshots
+# ============================================================================
+
+
+def test_prune_snapshots_keeps_current_build_and_newest(tmp_path):
+    state_root = tmp_path / "state"
+    job = "finn"
+    (state_root / job).mkdir(parents=True)
+    for n in (1, 2, 3, 4, 5):
+        (state_root / job / ("build_%d_timings_input.json" % n)).write_text("{}")
+    # Non-numbered files (the master itself, corrupt backups) must be left
+    # alone even when they sort lexicographically alongside snapshots.
+    (state_root / job / "ci_timings_master.json").write_text("{}")
+    (state_root / job / "ci_timings_master.json.corrupt-1").write_text("{}")
+    ci_sharding.prune_snapshots(str(state_root), job, current_build="3", retain_n=2, max_age_days=0)
+    remaining = sorted(p.name for p in (state_root / job).iterdir())
+    assert "build_3_timings_input.json" in remaining
+    assert "build_4_timings_input.json" in remaining
+    assert "build_5_timings_input.json" in remaining
+    assert "ci_timings_master.json" in remaining
+    assert "ci_timings_master.json.corrupt-1" in remaining
+    assert "build_1_timings_input.json" not in remaining
+    assert "build_2_timings_input.json" not in remaining
+
+
+def test_prune_snapshots_skips_when_parent_missing(tmp_path, capsys):
+    rc = ci_sharding.prune_snapshots(
+        str(tmp_path / "nope"), "finn", current_build="1", retain_n=2, max_age_days=0
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "not present, skipping" in captured.out
+
+
+def test_prune_snapshots_rejects_non_numeric_current(tmp_path):
+    with pytest.raises(ValueError, match="prune-snapshots: current_build must be"):
+        ci_sharding.prune_snapshots(
+            str(tmp_path), "finn", current_build="x", retain_n=1, max_age_days=0
+        )
+
+
+def test_prune_snapshots_honours_age_gating(tmp_path):
+    state_root = tmp_path / "state"
+    job = "finn"
+    parent = state_root / job
+    parent.mkdir(parents=True)
+    old = parent / "build_1_timings_input.json"
+    fresh = parent / "build_2_timings_input.json"
+    old.write_text("{}")
+    fresh.write_text("{}")
+    os.utime(str(old), (1, 1))
+
+    ci_sharding.prune_snapshots(str(state_root), job, current_build="3", retain_n=1, max_age_days=1)
+
+    assert not old.exists()
+    assert fresh.exists()
+
+
+def test_prune_snapshots_tolerates_concurrent_delete_in_age_check(tmp_path, monkeypatch):
+    state_root = tmp_path / "state"
+    job = "finn"
+    parent = state_root / job
+    parent.mkdir(parents=True)
+    for n in (1, 2, 3):
+        path = parent / ("build_%d_timings_input.json" % n)
+        path.write_text("{}")
+        os.utime(str(path), (1, 1))
+    real_getmtime = ci_sharding.os.path.getmtime
+
+    def flaky_getmtime(path):
+        if path.endswith("build_1_timings_input.json"):
+            raise FileNotFoundError(path)
+        return real_getmtime(path)
+
+    monkeypatch.setattr(ci_sharding.os.path, "getmtime", flaky_getmtime)
+    ci_sharding.prune_snapshots(str(state_root), job, current_build="9", retain_n=1, max_age_days=7)
+
+    assert not (parent / "build_2_timings_input.json").exists()
+    assert (parent / "build_3_timings_input.json").exists()
+
+
+def test_prune_snapshots_tolerates_concurrent_delete_on_unlink(tmp_path, monkeypatch):
+    state_root = tmp_path / "state"
+    job = "finn"
+    parent = state_root / job
+    parent.mkdir(parents=True)
+    for n in (1, 2, 3):
+        path = parent / ("build_%d_timings_input.json" % n)
+        path.write_text("{}")
+        os.utime(str(path), (1, 1))
+    real_unlink = ci_sharding.os.unlink
+    state = {"first": True}
+
+    def flaky_unlink(path):
+        if state["first"]:
+            state["first"] = False
+            raise FileNotFoundError(path)
+        return real_unlink(path)
+
+    monkeypatch.setattr(ci_sharding.os, "unlink", flaky_unlink)
+    ci_sharding.prune_snapshots(str(state_root), job, current_build="9", retain_n=1, max_age_days=0)
+
+    assert not (parent / "build_2_timings_input.json").exists()
+    assert (parent / "build_3_timings_input.json").exists()
+
+
+def test_prune_snapshots_dry_run_does_not_delete(tmp_path):
+    state_root = tmp_path / "state"
+    job = "finn"
+    (state_root / job).mkdir(parents=True)
+    for n in (1, 2, 3):
+        (state_root / job / ("build_%d_timings_input.json" % n)).write_text("{}")
+    ci_sharding.prune_snapshots(
+        str(state_root), job, current_build="3", retain_n=1, max_age_days=0, dry_run=True
+    )
+    remaining = sorted(p.name for p in (state_root / job).iterdir())
+    assert remaining == [
+        "build_1_timings_input.json",
+        "build_2_timings_input.json",
+        "build_3_timings_input.json",
+    ]
+
+
+def test_prune_snapshots_cli_smoke(tmp_path):
+    state_root = tmp_path / "state"
+    job = "finn"
+    (state_root / job).mkdir(parents=True)
+    (state_root / job / "build_1_timings_input.json").write_text("{}")
+    rc = ci_sharding.main(["prune-snapshots", str(state_root), job, "1", "1", "0", "--dry-run"])
+    assert rc == 0
+
+
+# ============================================================================
+# validate_stage_row
+# ============================================================================
+
+
+def test_validate_stage_row_accepts_each_live_row():
+    for row in ci_sharding.STAGES:
+        ci_sharding.validate_stage_row(row)
+
+
+@pytest.mark.parametrize(
+    "bad,match",
+    [
+        ({"stage": "X", "marker": "a and b", "shards": 1, "workers": 1}, "unsafe marker"),
+        ({"stage": "X", "marker": "a", "shards": 0, "workers": 1}, "invalid shards"),
+        ({"stage": "X", "marker": "a", "shards": 1, "workers": 0}, "invalid workers"),
+        (
+            {"stage": "X", "marker": "a", "shards": 1, "workers": 1, "distMode": "bogus"},
+            "invalid distMode",
+        ),
+    ],
+)
+def test_validate_stage_row_rejects_bad_input(bad, match):
+    with pytest.raises(ValueError, match=match):
+        ci_sharding.validate_stage_row(bad)
+
+
+def test_validate_config_runs_validate_stage_row_for_every_entry(monkeypatch):
+    bad_stages = [
+        {"param": "p", "stage": "Bad", "marker": "a and b", "shards": 1, "workers": 1},
+    ]
+    monkeypatch.setattr(ci_sharding, "STAGES", bad_stages)
+    with pytest.raises(ValueError, match="unsafe marker"):
+        ci_sharding.main(["validate-config", "--choice", "p", "--job-name", "j"])

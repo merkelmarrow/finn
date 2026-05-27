@@ -2,6 +2,8 @@
 # lsf_summary.sh <build_dir> <agent> <stash>
 #
 # Per-tool run counts and hosts so Blue Ocean shows LSF fan-out.
+# Best-effort: failures are logged but never abort the pipeline (the real
+# test result is owned by pytest).
 set +e
 
 if [ "$#" -ne 3 ]; then

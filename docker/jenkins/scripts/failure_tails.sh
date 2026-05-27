@@ -3,6 +3,8 @@
 #
 # Tail every tool log with an ERROR: marker so the Jenkins console shows the
 # actual error without downloading the artifact tarball.
+# Best-effort: failures are logged but never abort the pipeline (the real
+# test result is owned by pytest).
 set +e
 
 if [ "$#" -ne 3 ]; then

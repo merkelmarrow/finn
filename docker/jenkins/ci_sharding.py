@@ -66,19 +66,34 @@ CORRUPT_BACKUP_RETAIN = 5
 # summarize-timings flags shards exceeding this multiple of the family median.
 SLOW_FACTOR = 1.5
 
-# Per-tree retention for the prune-images / prune-artifacts CLI subcommands.
-# Images are cheap to rebuild; artifacts double as the per-board fallback
-# when an individual board's most recent build regressed, so the artifact
-# window is deep enough to outlast the longest realistic single-board streak.
+# Per-tree retention for the prune-images / prune-artifacts / prune-snapshots
+# CLI subcommands. Images are cheap to rebuild; artifacts double as the
+# per-board fallback when an individual board's most recent build regressed,
+# so the artifact window is deep enough to outlast the longest realistic
+# single-board streak. Snapshots are kB-sized per build but accumulate
+# forever otherwise, so a tight window is sufficient.
 RETENTION = {
     "image": {"retain": 3, "ageDays": 14},
     "artifact": {"retain": 30, "ageDays": 30},
+    "snapshot": {"retain": 3, "ageDays": 2},
 }
 
 
 # Internal regexes for canonical_key and stash family lookup.
 GROUP_SUFFIX_RE = re.compile(r"@(\S+)$")
 NOTEBOOK_PARAM_RE = re.compile(r"\[(/[^\]]+\.ipynb)\]")
+
+# STAGES row markers are interpolated into a shell command. Only the
+# ``a or b or c`` shape is accepted so the conftest plugin's mini-evaluator
+# and the Jenkinsfile's MARKER_SAFE_PATTERN agree on what is safe.
+MARKER_SAFE_PATTERN = re.compile(r"^[A-Za-z0-9_]+( or [A-Za-z0-9_]+)*$")
+
+# Recognised pytest-xdist ``--dist`` modes for STAGES rows. ``None`` means
+# "use the xdist default (worksteal)" without setting --dist explicitly.
+VALID_DIST_MODES = (None, "loadgroup", "worksteal")
+
+# Board setup scripts implemented by Jenkinsfile_HW.createTestScript().
+VALID_BOARD_SETUP_SCRIPTS = ("alveo", "pynq")
 
 
 # =============================================================================
@@ -97,27 +112,17 @@ NOTEBOOK_PARAM_RE = re.compile(r"\[(/[^\]]+\.ipynb)\]")
 #   marker:        the ``-m`` expression the on-board test file runs against
 #                  (differs from the board name only for Pynq-Z1, whose
 #                  marker cannot contain a hyphen)
+#
+# Key order is the canonical test-parametrisation order and is load-bearing:
+# ``TEST_BOARDS`` below derives from it and is what ``tests/end2end``
+# parametrises against. Reordering the keys reorders the test matrix.
 BOARDS = {
-    "U250": {
-        "agentLabel": "finn-u250",
-        "credentialsId": None,
-        "restartPrep": False,
-        "setupScript": "alveo",
-        "marker": "U250",
-    },
     "Pynq-Z1": {
         "agentLabel": "finn-pynq",
         "credentialsId": "pynq-z1-credentials",
         "restartPrep": True,
         "setupScript": "pynq",
         "marker": "Pynq",
-    },
-    "ZCU104": {
-        "agentLabel": "finn-zcu104",
-        "credentialsId": "pynq-z1-credentials",
-        "restartPrep": True,
-        "setupScript": "pynq",
-        "marker": "ZCU104",
     },
     "KV260_SOM": {
         "agentLabel": "finn-kv260",
@@ -126,7 +131,26 @@ BOARDS = {
         "setupScript": "pynq",
         "marker": "KV260_SOM",
     },
+    "ZCU104": {
+        "agentLabel": "finn-zcu104",
+        "credentialsId": "pynq-z1-credentials",
+        "restartPrep": True,
+        "setupScript": "pynq",
+        "marker": "ZCU104",
+    },
+    "U250": {
+        "agentLabel": "finn-u250",
+        "credentialsId": None,
+        "restartPrep": False,
+        "setupScript": "alveo",
+        "marker": "U250",
+    },
 }
+
+# Canonical board iteration order for test parametrisation. Single source of
+# truth: ``tests/end2end/test_end2end_bnn_pynq.py`` and the cross-check in
+# ``tests/util/test_bnn_board_config.py`` both consume this tuple.
+TEST_BOARDS = tuple(BOARDS)
 
 
 # Per-row CI matrix. Fields:
@@ -222,10 +246,98 @@ STAGES = [
 ]
 
 
-def validate_boards(stages=None, boards=None):
-    """Fail loud if a STAGES row references a board not declared in BOARDS."""
+def marker_tokens(marker_expr):
+    """Return marker names from the restricted ``a or b`` expression form."""
+    return [t for t in str(marker_expr).split() if t != "or"]
+
+
+def validate_stage_row(row):
+    """Sanity-check a single STAGES row in isolation.
+
+    Catches a typo in marker / shards / workers / distMode at config-load
+    time so a malformed row cannot silently survive into Jenkins or the
+    conftest plugin.
+    """
+    stage = row.get("stage", "<unnamed>")
+    marker = row.get("marker", "")
+    if not MARKER_SAFE_PATTERN.match(str(marker)):
+        raise ValueError(
+            "STAGES row %r has unsafe marker %r "
+            "(only 'a or b or c ...' is allowed)" % (stage, marker)
+        )
+    shards = row.get("shards")
+    if not isinstance(shards, int) or shards < 1:
+        raise ValueError("STAGES row %r has invalid shards=%r" % (stage, shards))
+    workers = row.get("workers")
+    if not isinstance(workers, int) or workers < 1:
+        raise ValueError("STAGES row %r has invalid workers=%r" % (stage, workers))
+    dist_mode = row.get("distMode")
+    if dist_mode not in VALID_DIST_MODES:
+        raise ValueError(
+            "STAGES row %r has invalid distMode=%r (allowed: %r)"
+            % (stage, dist_mode, list(VALID_DIST_MODES))
+        )
+    if shards > 1 and dist_mode != "loadgroup":
+        raise ValueError(
+            "STAGES row %r has shards=%r and must set distMode='loadgroup'" % (stage, shards)
+        )
+    zip_art = row.get("zipArtifacts")
+    if zip_art is None:
+        return
+    if not isinstance(zip_art, dict):
+        raise ValueError("STAGES row %r has invalid zipArtifacts=%r" % (stage, zip_art))
+    hw_test_type = zip_art.get("hwTestType")
+    if not isinstance(hw_test_type, str) or not hw_test_type:
+        raise ValueError("STAGES row %r has zipArtifacts without a non-empty hwTestType" % stage)
+    boards = zip_art.get("boards")
+    if (
+        not isinstance(boards, list)
+        or not boards
+        or not all(isinstance(b, str) and b for b in boards)
+    ):
+        raise ValueError("STAGES row %r has zipArtifacts without a non-empty boards list" % stage)
+
+
+def validate_board_row(board, row):
+    """Sanity-check one BOARDS row consumed by Jenkinsfile_HW."""
+    if not isinstance(row, dict):
+        raise ValueError("BOARDS row %r must be a dict, got %r" % (board, row))
+    required = ("agentLabel", "credentialsId", "restartPrep", "setupScript", "marker")
+    missing = [key for key in required if key not in row]
+    if missing:
+        raise ValueError("BOARDS row %r is missing required field(s): %r" % (board, missing))
+    if not isinstance(row["agentLabel"], str) or not row["agentLabel"]:
+        raise ValueError("BOARDS row %r has invalid agentLabel=%r" % (board, row["agentLabel"]))
+    credentials = row["credentialsId"]
+    if credentials is not None and (not isinstance(credentials, str) or not credentials):
+        raise ValueError("BOARDS row %r has invalid credentialsId=%r" % (board, credentials))
+    if not isinstance(row["restartPrep"], bool):
+        raise ValueError("BOARDS row %r has invalid restartPrep=%r" % (board, row["restartPrep"]))
+    if row["restartPrep"] and not credentials:
+        raise ValueError("BOARDS row %r has restartPrep=true but no credentialsId" % board)
+    if row["setupScript"] not in VALID_BOARD_SETUP_SCRIPTS:
+        raise ValueError(
+            "BOARDS row %r has invalid setupScript=%r (allowed: %r)"
+            % (board, row["setupScript"], list(VALID_BOARD_SETUP_SCRIPTS))
+        )
+    if not isinstance(row["marker"], str) or not row["marker"]:
+        raise ValueError("BOARDS row %r has invalid marker=%r" % (board, row["marker"]))
+
+
+def validate_config(stages=None, boards=None):
+    """Validate every STAGES row and the global BOARDS cross-references.
+
+    Fails loud if a STAGES row references a board not declared in BOARDS or
+    if any single row is malformed. Replaces the old ``validate_boards``.
+    The rename reflects that this is the one entry point the Validate stage
+    in Jenkins delegates to.
+    """
     stages = stages if stages is not None else STAGES
     boards = boards if boards is not None else BOARDS
+    for board, row in boards.items():
+        validate_board_row(board, row)
+    for row in stages:
+        validate_stage_row(row)
     referenced = set()
     for row in stages:
         zip_art = row.get("zipArtifacts") or {}
@@ -234,6 +346,10 @@ def validate_boards(stages=None, boards=None):
     missing = sorted(referenced - set(boards))
     if missing:
         raise ValueError("STAGES references board(s) not declared in BOARDS: %r" % missing)
+
+
+# kept as an alias for any out-of-tree caller that still imports the old name
+validate_boards = validate_config
 
 
 # =============================================================================
@@ -245,6 +361,25 @@ def hw_shards(boards=None):
     """Flatten BOARDS into the ordered list of rows the Groovy HW pipeline expects."""
     boards = boards if boards is not None else BOARDS
     return [dict(board=name, **fields) for name, fields in boards.items()]
+
+
+def hw_test_types(stages=None):
+    """Return distinct ``zipArtifacts.hwTestType`` values in declaration order.
+
+    Single source of truth for the HW pipeline's per-test-type stage loop;
+    Jenkinsfile_HW reads this via ``hw-test-types-json`` instead of
+    duplicating the list on the Groovy side.
+    """
+    stages = stages if stages is not None else STAGES
+    seen = []
+    for row in stages:
+        zip_art = row.get("zipArtifacts")
+        if not zip_art:
+            continue
+        hw_test_type = zip_art["hwTestType"]
+        if hw_test_type not in seen:
+            seen.append(hw_test_type)
+    return seen
 
 
 def stash_name(stage, shards, shard_id):
@@ -419,6 +554,45 @@ def assign_groups_to_shards(group_keys, num_shards, weights=None, pins=None):
     return assignment, source, shard_load, fallback
 
 
+def which_shard(query, master_path="", marker_filter=None, stages=None):
+    """Return per-stage placement rows for ``query`` against the timing master.
+
+    For each STAGES row (optionally filtered by ``marker_filter``), inject
+    ``query`` as a synthetic group alongside the master's known groups,
+    rerun the placement, and report which shard the query lands on.
+
+    The result is an approximation: the timing master holds canonical
+    group keys, not test-id strings, and it does not record which row
+    "owns" each group. The exact answer still requires
+    ``pytest --collect-only`` from a finn-installed venv. Without the
+    finn install, this is the closest the operator can get from a plain
+    Python checkout.
+    """
+    stages = stages if stages is not None else STAGES
+    weights = load_group_weights(master_path) if master_path else {}
+    canonical = canonical_key(query)
+    rows = []
+    for row in stages:
+        if marker_filter is not None and marker_filter not in marker_tokens(row.get("marker", "")):
+            continue
+        shards = int(row.get("shards", 1))
+        keys = list(weights.keys())
+        if canonical not in keys:
+            keys.append(canonical)
+        assignment, _src, _load, _fallback = assign_groups_to_shards(keys, shards, weights=weights)
+        shard_id = assignment[canonical]
+        rows.append(
+            {
+                "stage": row.get("stage", ""),
+                "marker": row.get("marker", ""),
+                "shards": shards,
+                "shard": shard_id,
+                "stash": stash_name(row.get("stage", ""), shards, shard_id),
+            }
+        )
+    return rows
+
+
 # =============================================================================
 # Reports I/O (read/write JSON, merge maps, per-shard summary)
 # =============================================================================
@@ -566,25 +740,39 @@ def summarize_timings(reports_dir):
 # Timing master state machine
 # =============================================================================
 # The persistent master at ${FINN_CI_NFS_ROOT}/_ci_state/<jobKey>/ci_timings_master.json
-# is refreshed only by trusted full-matrix builds. Schema:
+# is refreshed only by trusted full-matrix builds. Schema v1:
 #
-#   {"version": 1, "build_seq": int, "updated_at": str, "last_update": {...},
+#   {"schema_version": 1, "build_seq": int, "updated_at": str,
+#    "last_update": {...},
 #    "groups": {<name>: {"samples": [s1, ..., sMAX_SAMPLES], "count": int,
 #                        "consecutive_rejections": int, "last_seen_*": ...}}}
+#
+# The per-build snapshot written by ``prepare_timing_snapshot`` is the same
+# shape so a snapshot can be inspected with the same tools as the master.
+# Read path: a snapshot with a missing or unrecognised ``schema_version`` is
+# logged and treated as empty, which makes old/corrupt state degrade to
+# round-robin sharding rather than crashing a build.
+
+SCHEMA_VERSION = 1
 
 
 def normalise_master(data):
     """Coerce arbitrary input to the master schema (drops unknown top-level keys)."""
     if not isinstance(data, dict):
         data = {}
-    version = data.get("version")
-    if version is not None and version != 1:
-        raise ValueError("ci_sharding: unsupported master schema version %r" % version)
+    schema_version = data.get("schema_version")
+    if schema_version is not None and schema_version != SCHEMA_VERSION:
+        print(
+            "ci_sharding normalise_master: unrecognised schema_version %r, "
+            "treating as empty (expected %d)" % (schema_version, SCHEMA_VERSION),
+            file=sys.stderr,
+        )
+        data = {}
     groups = data.get("groups")
     if not isinstance(groups, dict):
         groups = {}
     return {
-        "version": 1,
+        "schema_version": SCHEMA_VERSION,
         "updated_at": data.get("updated_at"),
         "build_seq": int(data.get("build_seq", 0) or 0),
         "groups": dict(groups),
@@ -1078,6 +1266,65 @@ def prune_artifacts(artifact_dir, job_key, current_build, retain_n, max_age_days
     return _prune_subtree(parent, "prune-artifacts", current_build, retain_n, max_age_days, dry_run)
 
 
+SNAPSHOT_FILE_RE = re.compile(r"^build_(\d+)_timings_input\.json$")
+
+
+def prune_snapshots(state_root, job_key, current_build, retain_n, max_age_days, dry_run=False):
+    """Rotate per-build timing snapshot files under ``_ci_state/<job_key>/``.
+
+    Snapshots are named ``build_<N>_timings_input.json`` alongside the
+    persistent ``ci_timings_master.json``; only the build-numbered files
+    are eligible for pruning. Tolerant of concurrent unlink on a shared
+    NFS parent (vanished entries are treated as already-pruned).
+    """
+    retain_n = int(retain_n)
+    max_age_days = int(max_age_days)
+    if retain_n < 1:
+        raise ValueError("retain_n must be >= 1")
+    current_build = _coerce_current_build(current_build, "prune-snapshots")
+    current_build_int = int(current_build)
+    parent = os.path.join(state_root, job_key)
+    tag = "prune-snapshots"
+    if not os.path.isdir(parent):
+        print("ci_sharding %s: %s not present, skipping" % (tag, parent))
+        return 0
+    cutoff = time.time() - (max_age_days * 24 * 60 * 60)
+    candidates = []
+    for name in os.listdir(parent):
+        m = SNAPSHOT_FILE_RE.match(name)
+        if m:
+            candidates.append((int(m.group(1)), name))
+    candidates.sort()
+    keep = {n for n, _ in candidates[-retain_n:]}
+    keep.add(current_build_int)
+    matched = 0
+    for num, name in candidates:
+        if num in keep:
+            continue
+        path = os.path.join(parent, name)
+        if max_age_days > 0:
+            try:
+                if os.path.getmtime(path) >= cutoff:
+                    continue
+            except FileNotFoundError:
+                continue
+        matched += 1
+        if dry_run:
+            print("ci_sharding %s: would delete %s" % (tag, path))
+        else:
+            print("ci_sharding %s: deleting %s" % (tag, path))
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+    print(
+        "ci_sharding %s: done (parent=%s current=%s retain_n=%s "
+        "max_age_days=%s dry_run=%s matched=%d)"
+        % (tag, parent, current_build, retain_n, max_age_days, int(dry_run), matched)
+    )
+    return 0
+
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -1087,26 +1334,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd")
 
-    sub.add_parser("stages-json")
     sub.add_parser("stage-choices-json")
-    sub.add_parser("retention-json")
     sub.add_parser("hw-shards-json")
+    sub.add_parser("hw-test-types-json")
 
-    p = sub.add_parser("enabled-params")
-    p.add_argument("--choice", required=True)
-
-    # validate-config folds stages-json + enabled-params + retention-json +
-    # job-key into a single subprocess so the Validate stage in Jenkins
-    # makes one shell-out, and validate_boards() runs first so an orphan
-    # zipArtifact board fails Validate loudly.
+    # validate-config is the one entry point the Validate stage in Jenkins
+    # delegates to. Folds enabled_params / retention / job_key into a
+    # single subprocess and runs validate_config() first so a malformed
+    # row or orphan zipArtifact board fails Validate loudly.
     p = sub.add_parser("validate-config")
     p.add_argument("--choice", required=True)
     p.add_argument("--job-name", required=True)
-
-    p = sub.add_parser("stash-name")
-    p.add_argument("stage")
-    p.add_argument("shards", type=int)
-    p.add_argument("shard_id", type=int)
 
     p = sub.add_parser("job-key")
     p.add_argument("name")
@@ -1158,26 +1396,36 @@ def main(argv=None):
     p.add_argument("max_age_days", type=int)
     p.add_argument("--dry-run", action="store_true")
 
+    p = sub.add_parser("prune-snapshots")
+    p.add_argument("state_root")
+    p.add_argument("job_key")
+    p.add_argument("current_build")
+    p.add_argument("retain_n", type=int)
+    p.add_argument("max_age_days", type=int)
+    p.add_argument("--dry-run", action="store_true")
+
+    # which-shard is a finn-less approximation: it reads the timing master
+    # directly so an operator without a finn install can still ask
+    # "where would test X land?" before kicking off a build.
+    p = sub.add_parser("which-shard")
+    p.add_argument("query")
+    p.add_argument("--marker", default=None)
+    p.add_argument("--timings", default="")
+
     args = parser.parse_args(argv)
-    if args.cmd == "stages-json":
-        validate_boards()
-        print(json.dumps(STAGES))
-        return 0
     if args.cmd == "stage-choices-json":
         print(json.dumps(jenkins_stage_choices()))
         return 0
-    if args.cmd == "retention-json":
-        print(json.dumps(RETENTION))
-        return 0
     if args.cmd == "hw-shards-json":
-        validate_boards()
+        validate_config()
         print(json.dumps(hw_shards()))
         return 0
-    if args.cmd == "enabled-params":
-        print(json.dumps(enabled_params_for_choice(args.choice)))
+    if args.cmd == "hw-test-types-json":
+        validate_config()
+        print(json.dumps(hw_test_types()))
         return 0
     if args.cmd == "validate-config":
-        validate_boards()
+        validate_config()
         print(
             json.dumps(
                 {
@@ -1188,9 +1436,6 @@ def main(argv=None):
                 }
             )
         )
-        return 0
-    if args.cmd == "stash-name":
-        print(stash_name(args.stage, args.shards, args.shard_id))
         return 0
     if args.cmd == "job-key":
         print(job_key(args.name))
@@ -1238,6 +1483,19 @@ def main(argv=None):
             args.max_age_days,
             args.dry_run,
         )
+    if args.cmd == "prune-snapshots":
+        return prune_snapshots(
+            args.state_root,
+            args.job_key,
+            args.current_build,
+            args.retain_n,
+            args.max_age_days,
+            args.dry_run,
+        )
+    if args.cmd == "which-shard":
+        rows = which_shard(args.query, master_path=args.timings, marker_filter=args.marker)
+        print(json.dumps(rows, indent=2))
+        return 0
     parser.print_help()
     return 2
 

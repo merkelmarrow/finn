@@ -38,9 +38,6 @@ from typing import Dict, Optional, Tuple
 
 from finn.util.data_packing import finnpy_to_packed_bytearray
 
-# test boards used for bnn pynq tests
-test_board_map = ["Pynq-Z1", "KV260_SOM", "ZCU104", "U250"]
-
 # mapping from PYNQ board names to FPGA part names
 pynq_part_map = dict()
 pynq_part_map["Ultra96"] = "xczu3eg-sbva484-1-e"
@@ -277,13 +274,25 @@ def resolve_xilinx_tool(default_name):
     """Return the Xilinx-tool command to embed in generated bash scripts.
 
     Honours the registered override env var so a bare name or absolute path
-    both work in the script."""
+    both work in the script. Raises FileNotFoundError when the resolved
+    command is not on PATH; assert is unsuitable here because the check
+    is runtime input, not an invariant, and would be stripped under -O.
+    """
     override_env_var = _XILINX_TOOL_OVERRIDES.get(default_name)
-    tool = os.environ.get(override_env_var, default_name) if override_env_var else default_name
-    assert which(tool) is not None, "%s not found in PATH (override=%s)" % (
-        tool,
-        override_env_var or "<none>",
-    )
+    override_value = os.environ.get(override_env_var) if override_env_var else None
+    tool = override_value if override_value else default_name
+    if which(tool) is None:
+        if override_env_var:
+            override_state = (
+                "currently set to %r" % override_value
+                if override_value
+                else "currently unset; set to an absolute path to override"
+            )
+            raise FileNotFoundError(
+                "%s not found in PATH (override env var %s, %s)"
+                % (tool, override_env_var, override_state)
+            )
+        raise FileNotFoundError("%s not found in PATH (no override env var registered)" % tool)
     return tool
 
 

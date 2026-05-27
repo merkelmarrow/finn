@@ -106,6 +106,13 @@ def _group_key(item):
 
 
 def _pinned_shard(item, num_shards):
+    """Return the @pytest.mark.shard(N) pin for a test item, or None.
+
+    Pins are enforced per-xdist_group: every member of a group must agree on
+    a single pin (or none), otherwise chained ``load_test_checkpoint_or_skip``
+    tests would split across shards and silently break the BNN end2end
+    chains. The cohesion check lives in ``_assignment_details`` below.
+    """
     for mark in item.iter_markers(name=SHARD_MARKER_NAME):
         if not mark.args:
             continue

@@ -95,7 +95,7 @@ from finn.transformation.streamline.reorder import (
     MoveScalarLinearPastInvariants,
 )
 from finn.transformation.streamline.round_thresholds import RoundAndClipThresholds
-from finn.util.basic import get_finn_root, make_build_dir, test_board_map
+from finn.util.basic import get_finn_root, make_build_dir
 from finn.util.pytorch import ToTensor
 from finn.util.test import (
     execute_parent,
@@ -105,6 +105,23 @@ from finn.util.test import (
     get_trained_network_and_ishape,
     load_test_checkpoint_or_skip,
 )
+
+# ci_sharding lives under docker/jenkins/, so its parent must be on sys.path.
+# tests/conftest.py also inserts it before collection; this local guard keeps
+# the import resolvable in tools that load the file directly (e.g. IDE
+# inspection, isolated test reruns). The non-import statements below force
+# isort to treat the trailing import as positionally fixed.
+_JENKINS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "docker",
+    "jenkins",
+)
+import sys  # noqa: E402
+
+if _JENKINS_DIR not in sys.path:
+    sys.path.insert(0, _JENKINS_DIR)
+
+from ci_sharding import TEST_BOARDS as test_board_map  # noqa: E402
 
 build_dir = os.environ["FINN_BUILD_DIR"]
 target_clk_ns = 20

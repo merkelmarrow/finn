@@ -16,6 +16,10 @@ import groovy.transform.Field
 // _common.groovy is loaded once on the first active node and reused from
 // every subsequent stage. Several wrappers below run from no-agent
 // orchestration code, so the loaded module must remain accessible.
+// @Field is load-bearing here: under Jenkins CPS replay, top-level locals
+// are not preserved between stage replays, so the cached module would have
+// to be reloaded every stage. @Field promotes it to a script-scoped field
+// that survives replay and keeps the load() call to one per build.
 
 @Field
 def _common = null
@@ -54,8 +58,27 @@ int FINN_CI_MIN_FREE_GB = 120
 @Field
 Map RETENTION = [:]
 
-// STAGES row markers are interpolated into a shell command; only accept the
-// 'a or b or c' shape so the conftest plugin's mini-evaluator stays sound.
+// Jenkins agent label every non-board stage runs on. Hoisted so a relabel
+// only touches one line; mirrored in node(...) and the budget probe below.
+@Field
+static final String FINN_BUILD_LABEL = 'finn-build'
+
+// Optional setup-local.sh stage agent label and cache root are read via
+// helpers (not @Field) so env. resolution happens inside the running pipeline,
+// not at script-load. FINN_LOCAL_BUILD_LABEL defaults to FINN_BUILD_LABEL so
+// single-label installs need no extra wiring; override on agents that need an
+// apt/python3.10-equipped host distinct from the main build pool.
+// FINN_CI_LOCAL_CACHE_ROOT defaults to WORKSPACE_TMP so a fresh install needs
+// no extra wiring; override on agents whose home/scratch layout matters.
+String finnLocalBuildLabel() { return (env.FINN_LOCAL_BUILD_LABEL ?: FINN_BUILD_LABEL) }
+String finnCiLocalCacheRoot() {
+  return (env.FINN_CI_LOCAL_CACHE_ROOT ?: "${env.WORKSPACE_TMP ?: '/tmp'}/finn-ci-cache")
+}
+
+// STAGES row markers are interpolated into a shell command. Only the
+// 'a or b or c' shape passes here so the conftest plugin's mini-evaluator
+// stays sound; the Python side enforces the same pattern via
+// ci_sharding.MARKER_SAFE_PATTERN.
 @Field
 java.util.regex.Pattern MARKER_SAFE_PATTERN = ~/^[A-Za-z0-9_]+( or [A-Za-z0-9_]+)*$/
 
@@ -83,6 +106,7 @@ String finnAgentCachesDir(String node)    { return loadCommonOnce().finnAgentCac
 String finnDockerImagesRoot()             { return loadCommonOnce().finnDockerImagesRoot() }
 String finnDockerImagesDir(String jobKey) { return loadCommonOnce().finnDockerImagesDir(jobKey) }
 String finnArtifactsRoot()                { return loadCommonOnce().finnArtifactsRoot() }
+String finnCiStateRoot()                  { return loadCommonOnce().finnCiStateRoot() }
 String finnCiStateDir(String jobKey)      { return loadCommonOnce().finnCiStateDir(jobKey) }
 
 
@@ -117,7 +141,7 @@ pipeline {
   }
   stages {
     stage('Validate') {
-      agent { label 'finn-build' }
+      agent { label "${FINN_BUILD_LABEL}" }
       steps {
         script {
           wipeStaleWorkspace()
@@ -133,7 +157,7 @@ pipeline {
       }
     }
     stage('Build Docker Image') {
-      agent { label 'finn-build' }
+      agent { label "${FINN_BUILD_LABEL}" }
       environment { FINN_DOCKER_PREBUILT = '0' }
       steps { script { wipeStaleWorkspace(); withAgentNfsEnv { buildAndPublishDockerImage() } } }
     }
@@ -141,7 +165,7 @@ pipeline {
       steps { script { runParallelOrFail(buildParallelStageMap()) } }
     }
     stage('Check Stage Results') {
-      agent { label 'finn-build' }
+      agent { label "${FINN_BUILD_LABEL}" }
       steps { script { withAgentNfsEnv { aggregateReports() } } }
     }
   }
@@ -165,7 +189,7 @@ void announceCiMode() {
   }
 }
 
-// One subprocess loads the full Validate-time config bundle. validate_boards()
+// One subprocess loads the full Validate-time config bundle. validate_config()
 // runs inside the subcommand so any orphan zipArtifact board fails Validate
 // loudly instead of slipping into the per-shard runs.
 void loadStageConfig() {
@@ -217,18 +241,18 @@ void validateShards() {
   }
   int available = 0
   try {
-    def lbl = Jenkins.instance.getLabelAtom('finn-build')
+    def lbl = Jenkins.instance.getLabelAtom(FINN_BUILD_LABEL)
     if (lbl) { available = lbl.getTotalExecutors() }
   } catch (Exception e) {
     echo "validateShards: executor query failed (${e.class.name}: ${e.message}), skipping budget check"
   }
   if (available > 0) {
-    echo "validateShards: ${activeCount} shard(s) active, finn-build executors available: ${available}"
+    echo "validateShards: ${activeCount} shard(s) active, ${FINN_BUILD_LABEL} executors available: ${available}"
     if (activeCount > available) {
-      unstable "PARALLEL_SHARDS requests ${activeCount} parallel shards but only ${available} finn-build executors are available, stages will queue and wall-clock will extend"
+      unstable "PARALLEL_SHARDS requests ${activeCount} parallel shards but only ${available} ${FINN_BUILD_LABEL} executors are available, stages will queue and wall-clock will extend"
     }
   } else {
-    echo "validateShards: ${activeCount} shard(s) active, finn-build label has 0 online executors, skipping budget check"
+    echo "validateShards: ${activeCount} shard(s) active, ${FINN_BUILD_LABEL} label has 0 online executors, skipping budget check"
   }
 }
 
@@ -300,6 +324,7 @@ void rotateBuildTree(String subcommand, String root, Map policy) {
 void rotateBuildTrees() {
   rotateBuildTree('prune-images', finnDockerImagesRoot(), RETENTION.image)
   rotateBuildTree('prune-artifacts', finnArtifactsRoot(), RETENTION.artifact)
+  rotateBuildTree('prune-snapshots', finnCiStateRoot(), RETENTION.snapshot)
 }
 
 
@@ -422,13 +447,17 @@ String shardStashName(Map row, int id) {
 }
 
 void runShard(Map row, int shardIdx, String stageName, String stashName) {
-  node('finn-build') {
+  node(FINN_BUILD_LABEL) {
     withAgentNfsEnv {
       stage(stageName) {
         checkout scm
         wipeStaleWorkspace()
         String perBuildRoot = finnCiPerBuildRoot()
         String buildDir = "${perBuildRoot}/${stashName}"
+        // startMarker is touched just before runShardBody and consumed by
+        // archive_failure_logs.sh to scope the LSF staging-log scan to
+        // files mtime'd after this shard began. Without it, the archiver
+        // would slurp the entire shared staging dir.
         String startMarker = "${perBuildRoot}/${stashName}.start"
         String stageMap = "[stage-map] build=${env.BUILD_NUMBER} stage='${stageName}' stash=${stashName} shard=${shardIdx + 1}/${row.shards} node=${env.NODE_NAME} workspace=${env.WORKSPACE} build_dir=${buildDir}"
         echo stageMap
@@ -466,10 +495,10 @@ void runShardBody(Map row, int shardIdx, String stageName, String stashName, Str
         shardId: shardIdx,
     ]
     if (row.coverage) {
-      opts.extraArgs = "--cov --cov-report=html:coverage_${stashName}"
+      opts.extraArgs = "--cov"
+      opts.coverageFile = "${stashName}.coverage"
     }
     runPytest(opts)
-    if (row.coverage) { archiveStageFolder("coverage_${stashName}") }
     Map zipArt = row.zipArtifacts as Map
     if (zipArt) {
       String testType = zipArt.hwTestType as String
@@ -487,11 +516,13 @@ void runShardBody(Map row, int shardIdx, String stageName, String stashName, Str
   }
 }
 
-// Pinned to a local-build host because finn-build hosts may not have the
-// apt/python3.10 prerequisites setup-local.sh expects. pip and XDG caches
-// go to /scratch/jenkins because /home/cse-jenkins is small.
+// Agent label and cache root come from FINN_LOCAL_BUILD_LABEL and
+// FINN_CI_LOCAL_CACHE_ROOT (see helpers near the top of the file); both
+// default sensibly so a single-label install needs no extra wiring.
+// setup-local.sh expects apt + python3.10 on the agent; override the label
+// when the main build pool lacks those.
 void runLocalSetupTest() {
-  node('finn-local-build') {
+  node(finnLocalBuildLabel()) {
     withAgentNfsEnv {
       stage('Local Setup (non-Docker) with Vivado') {
         checkout scm
@@ -505,18 +536,24 @@ void runLocalSetupTest() {
           script: 'sha256sum requirements.txt setup.py setup.cfg pyproject.toml 2>/dev/null | sha256sum | cut -c1-16'
         ).trim()
         if (!pipCacheKey) { pipCacheKey = "build-${env.BUILD_NUMBER}" }
-        String pipCacheRoot = '/scratch/jenkins/.pip-cache'
+        String cacheRoot   = finnCiLocalCacheRoot()
+        String pipCacheRoot = "${cacheRoot}/pip"
         String pipCacheDir  = "${pipCacheRoot}/${pipCacheKey}"
-        String xdgCacheDir  = '/scratch/jenkins/.xdg-cache'
+        String xdgCacheDir  = "${cacheRoot}/xdg"
+        String pruneLock    = "${pipCacheRoot}/.prune.lock"
         withEnv([
           "FINN_HOST_BUILD_DIR=${buildDir}",
           "PIP_CACHE_DIR=${pipCacheDir}",
           "XDG_CACHE_HOME=${xdgCacheDir}",
         ]) {
+          // flock -n on the prune: concurrent builds skip the find rather
+          // than racing `rm -rf` against another build's `pip install`.
           sh """
-mkdir -p '${perBuildRoot}' '${pipCacheDir}' '${xdgCacheDir}'
-find '${pipCacheRoot}' -mindepth 1 -maxdepth 1 -type d -mtime +14 -not -path '${pipCacheDir}' \\
-  -exec rm -rf {} + 2>/dev/null || true
+mkdir -p ${shellQuote(perBuildRoot)} ${shellQuote(pipCacheDir)} ${shellQuote(xdgCacheDir)}
+touch ${shellQuote(pruneLock)}
+flock -n ${shellQuote(pruneLock)} \\
+  find ${shellQuote(pipCacheRoot)} -mindepth 1 -maxdepth 1 -type d -mtime +14 -not -path ${shellQuote(pipCacheDir)} \\
+    -exec rm -rf {} + 2>/dev/null || true
 """
           cleanPreviousBuildFiles(buildDir)
           catchError(stageResult: 'FAILURE') {
@@ -533,9 +570,13 @@ source scripts/finn-env.sh
   }
 }
 
-// FINN_CI_MARKER passes the marker via env to dodge shell injection.
-// FINN_CI_TIMINGS_FILE is optional: when no snapshot is available the
-// conftest plugin falls back to deterministic round-robin sharding.
+// FINN_CI_MARKER passes the marker via env to dodge shell injection. The
+// marker shape is already validated against MARKER_SAFE_PATTERN at
+// loadStageConfig time, so the echoed value here is guaranteed to be
+// the 'a or b or c' form and safe to surround with double-quotes in the
+// pytest command. FINN_CI_TIMINGS_FILE is optional: when no snapshot is
+// available the conftest plugin falls back to deterministic round-robin
+// sharding.
 void runPytest(Map opts) {
   def parts = ["python -m pytest -m \"\$FINN_CI_MARKER\""]
   if (opts.workers) {
@@ -564,6 +605,11 @@ void runPytest(Map opts) {
       "export FINN_CI_BUILD_NUMBER=${shellQuote(env.BUILD_NUMBER ?: '')}",
       "export FINN_CI_TIMINGS_FILE=${shellQuote(timingsFile)}",
   ]
+  // per-shard COVERAGE_FILE keeps each shard's raw .coverage data unique so
+  // aggregateReports can `coverage combine` them later without clashes.
+  if (opts.coverageFile) {
+    envLines << "export COVERAGE_FILE=${shellQuote(opts.coverageFile as String)}"
+  }
   // run-tests.sh sits at workspace root; each parallel branch gets its own
   // @N workspace from Jenkins so two shards on the same agent never race.
   writeFile file: 'run-tests.sh', text:
@@ -580,7 +626,7 @@ void runPytest(Map opts) {
 // junit first (workspace-local, never flakes); html merge and artifact
 // archive after, because agent-to-controller transfer can flake on large globs.
 void aggregateReports() {
-  sh 'mkdir -p reports'
+  // cleanPreviousBuildFiles wipes then recreates 'reports', so no mkdir first.
   cleanPreviousBuildFiles('reports')
   dir('reports') {
     expectedStashes().each { name -> unstashIfPresent(name) }
@@ -588,6 +634,7 @@ void aggregateReports() {
   junit allowEmptyResults: true, testResults: 'reports/*.xml'
   mergeShardMaps()
   echoShardTimings()
+  combineCoverageReports()
   aggregatePublishedBoardZips()
   assertZipArtifactsEmitted()
   updateTimingState()
@@ -605,9 +652,40 @@ void aggregateReports() {
     archiveArtifacts artifacts: 'reports/*.html', allowEmptyArchive: true
   }
   catchError(buildResult: null, stageResult: 'UNSTABLE',
-             message: 'archiveArtifacts (timings and shard maps) failed') {
-    archiveArtifacts artifacts: 'reports/*.timings.json,reports/*shardmap.*,reports/shard_map.*,reports/ci_timings_master.json',
+             message: 'archiveArtifacts (timings, shard maps, empty-shard markers) failed') {
+    archiveArtifacts artifacts: 'reports/*.timings.json,reports/*shardmap.*,reports/shard_map.*,reports/ci_timings_master.json,reports/*.empty-shard',
                      allowEmptyArchive: true
+  }
+}
+
+// Per-shard pytest runs with COVERAGE_FILE=${stash}.coverage, so each shard
+// stashes its own raw .coverage data file. Combine them here into a single
+// .coverage and render one HTML report. Skips silently when no row opted in.
+void combineCoverageReports() {
+  catchError(buildResult: null, stageResult: 'UNSTABLE',
+             message: 'combineCoverageReports failed, non-fatal') {
+    if (!fileExists('reports')) { return }
+    String found = sh(returnStdout: true,
+                      script: "ls reports/*.coverage 2>/dev/null | head -1 || true").trim()
+    if (!found) {
+      echo "combineCoverageReports: no per-shard .coverage files, skipping"
+      return
+    }
+    sh '''#!/bin/bash
+set -eo pipefail
+rm -rf coverage_data coverage_combined
+mkdir -p coverage_data
+n=0
+for f in reports/*.coverage; do
+  cp "$f" "coverage_data/.coverage.shard${n}"
+  n=$((n+1))
+done
+    '''
+    // pytest-cov ships its own coverage; run via the same docker image so
+    // the merge uses the same Python/library versions as the per-shard runs.
+    runDockerCommand("./run-docker.sh bash -c 'cd coverage_data && coverage combine && " +
+                     "coverage html -d ../coverage_combined'")
+    archiveArtifacts artifacts: 'coverage_combined/**/*', allowEmptyArchive: true
   }
 }
 
@@ -643,6 +721,25 @@ void mergeShardMaps() {
   }
 }
 
+// Walks every active row that declares zipArtifacts, calling body with the
+// row, the hwTestType, and one board per invocation. Single source of truth
+// for the four checks that all phrase themselves as "for each active
+// (row, board) that publishes a zip"; tweaking the active-row predicate or
+// the board flattening now happens here once.
+void eachActiveZipArtifact(Closure body) {
+  for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
+    Map row = PARALLEL_SHARDS[rowIdx]
+    if (!rowIsActive(row)) { continue }
+    Map zipArt = row.zipArtifacts as Map
+    if (!zipArt) { continue }
+    String testType = zipArt.hwTestType as String
+    List boards = (zipArt.boards ?: []) as List
+    for (int b = 0; b < boards.size(); b++) {
+      body(row, testType, boards[b] as String)
+    }
+  }
+}
+
 // Marks UNSTABLE when an active row declared zipArtifacts but no READY
 // was produced. Local fallback is a no-op (banner already flagged it).
 void assertZipArtifactsEmitted() {
@@ -658,19 +755,10 @@ void assertZipArtifactsEmitted() {
       return
     }
     def missing = []
-    for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
-      Map row = PARALLEL_SHARDS[rowIdx]
-      if (!rowIsActive(row)) { continue }
-      Map zipArt = row.zipArtifacts as Map
-      if (!zipArt) { continue }
-      String testType = zipArt.hwTestType as String
-      List boards = (zipArt.boards ?: []) as List
-      for (int b = 0; b < boards.size(); b++) {
-        String board = boards[b] as String
-        String ready = "${boardZipPath(testType, board)}.READY"
-        if (!fileExists(ready)) {
-          missing << "${row.stage} -> ${board} (no .READY at ${ready})"
-        }
+    eachActiveZipArtifact { row, testType, board ->
+      String ready = "${boardZipPath(testType, board)}.READY"
+      if (!fileExists(ready)) {
+        missing << "${row.stage} -> ${board} (no .READY at ${ready})"
       }
     }
     if (!missing.isEmpty()) {
@@ -710,16 +798,8 @@ void aggregatePublishedBoardZips() {
   catchError(buildResult: null, stageResult: null,
              message: 'aggregatePublishedBoardZips failed, non-fatal') {
     def pairs = new LinkedHashSet<String>()
-    for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
-      Map row = PARALLEL_SHARDS[rowIdx]
-      if (!rowIsActive(row)) { continue }
-      Map zipArt = row.zipArtifacts as Map
-      if (!zipArt) { continue }
-      String testType = zipArt.hwTestType as String
-      List boards = (zipArt.boards ?: []) as List
-      for (int b = 0; b < boards.size(); b++) {
-        pairs << "${testType}/${boards[b]}"
-      }
+    eachActiveZipArtifact { row, testType, board ->
+      pairs << "${testType}/${board}"
     }
     def pairsList = pairs as List
     for (int p = 0; p < pairsList.size(); p++) {
@@ -880,23 +960,30 @@ String boardZipPath(String testType, String board) {
 }
 
 boolean hasActiveArtifactRows() {
-  for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
-    Map row = PARALLEL_SHARDS[rowIdx]
-    if (!rowIsActive(row)) { continue }
-    if (row.zipArtifacts) { return true }
-  }
-  return false
+  boolean has = false
+  eachActiveZipArtifact { row, testType, board -> has = true }
+  return has
 }
 
 String activeArtifactRowSummary() {
-  def parts = []
-  for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
-    Map row = PARALLEL_SHARDS[rowIdx]
-    if (!rowIsActive(row)) { continue }
-    Map zipArt = row.zipArtifacts as Map
-    if (!zipArt) { continue }
-    parts << "${row.stage} -> ${(zipArt.boards ?: []).join(',')}"
+  // Collapse the per-(row, board) walk back into a per-row summary so each
+  // active row appears once even when it publishes for multiple boards.
+  // CPS: computeIfAbsent takes a java.util.function.Function and CPS-
+  // transformed closures do not coerce reliably to that SAM type, so we use
+  // the explicit get/put pattern that matches the C-style loop earlier in
+  // the file.
+  def rowToBoards = [:] as LinkedHashMap<String, List<String>>
+  eachActiveZipArtifact { row, testType, board ->
+    String stage = row.stage as String
+    List<String> existing = rowToBoards.get(stage)
+    if (existing == null) {
+      existing = []
+      rowToBoards.put(stage, existing)
+    }
+    existing << board
   }
+  def parts = []
+  rowToBoards.each { stage, boards -> parts << "${stage} -> ${boards.join(',')}" }
   return parts.join('; ')
 }
 
@@ -929,13 +1016,6 @@ df -BG "\$d" | awk 'NR==2 {print \$4}' | tr -d 'G'
   }
   if (freeGB < minFreeGB) {
     error "agent ${env.NODE_NAME} has only ${freeGB} GB free on ${target} (< ${minFreeGB} GB threshold), aborting shard to avoid mid-run disk exhaustion."
-  }
-}
-
-void archiveStageFolder(String folder) {
-  catchError(buildResult: null, stageResult: null,
-             message: "archiveArtifacts(${folder}) failed, non-fatal") {
-    archiveArtifacts artifacts: "${folder}/**/*", allowEmptyArchive: true
   }
 }
 
