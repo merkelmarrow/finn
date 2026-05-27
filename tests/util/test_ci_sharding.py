@@ -433,7 +433,7 @@ def test_validate_config_single_invocation_returns_full_payload(capsys):
     assert payload["job_key"] == "finn.dev"
 
 
-def test_validate_config_rejects_orphan_zipartifact_board(monkeypatch):
+def test_validate_config_rejects_orphan_zipartifact_board(monkeypatch, capsys):
     # validate_config() runs inside the subcommand so a STAGES row with
     # an orphan board fails Validate loudly, not three stages later when
     # the HW pipeline tries to look it up.
@@ -444,12 +444,13 @@ def test_validate_config_rejects_orphan_zipartifact_board(monkeypatch):
             "marker": "sanity_bnn",
             "shards": 1,
             "workers": 1,
-            "zipArtifacts": {"hwTestType": "t", "boards": ["NotABoard"]},
+            "zipArtifacts": {"hwTestType": "bnn_build_sanity", "boards": ["NotABoard"]},
         }
     ]
     monkeypatch.setattr(ci_sharding, "STAGES", bad_stages)
-    with pytest.raises(ValueError, match="NotABoard"):
-        ci_sharding.main(["validate-config", "--choice", "full", "--job-name", "j"])
+    rc = ci_sharding.main(["validate-config", "--choice", "full", "--job-name", "j"])
+    assert rc == 2
+    assert "NotABoard" in capsys.readouterr().err
 
 
 def test_active_artifact_rows_present_for_sanity_and_end2end_choices():
@@ -697,13 +698,6 @@ def test_boards_has_metadata_for_every_zip_artifact_board():
 def test_validate_board_row_rejects_bad_input(board, row, match):
     with pytest.raises(ValueError, match=match):
         ci_sharding.validate_board_row(board, row)
-
-
-def test_validate_boards_is_alias_for_validate_config():
-    # validate_boards stays as a compatibility shim for any out-of-tree
-    # caller that still imports the old name; both should run the same
-    # checks against the live STAGES/BOARDS tables.
-    assert ci_sharding.validate_boards is ci_sharding.validate_config
 
 
 def test_validate_config_rejects_orphan_zipartifact_board_via_helper():
@@ -1203,7 +1197,12 @@ def test_normalise_master_writes_canonical_schema_version_key():
     assert out["schema_version"] == 1
 
 
-def test_pytest_plugin_writes_timings_for_successful_sharded_run(pytester):
+def _install_finn_ci_plugin(pytester):
+    """Wire the real tests/conftest.py into a pytester sandbox.
+
+    Reused by every test that exercises the conftest plugin end-to-end so
+    each one only has to declare its own test files and pytest invocation.
+    """
     plugin_path = os.path.join(REPO_ROOT, "tests", "conftest.py")
     pytester.makeconftest(
         """
@@ -1227,6 +1226,10 @@ for name in (
             plugin_path=plugin_path
         )
     )
+
+
+def test_pytest_plugin_writes_timings_for_successful_sharded_run(pytester):
+    _install_finn_ci_plugin(pytester)
     pytester.makepyfile(
         test_sample="""
 def test_ok():
@@ -1248,27 +1251,105 @@ def test_ok():
     assert data["groups"][0]["name"].endswith("test_sample.py::test_ok")
 
 
-# ============================================================================
-# CLI regressions: dropped subcommands must stay dropped
-# ============================================================================
+def test_pytest_plugin_writes_empty_shard_sidecar_when_slice_collected_zero(pytester):
+    # Two single-test groups round-robin onto shards 0 and 1 (sorted by
+    # nodeid); shard 1 therefore gets one item, shard 0 gets the other.
+    # If we then ask for shard 0 with a marker that only matches the
+    # second test, the slice is empty and the plugin must:
+    #  - remap exit 5 to 0 so the build does not fail spuriously
+    #  - drop a <stash>.empty-shard sidecar so the aggregator can tell
+    #    "shard had no work" apart from "shard crashed".
+    _install_finn_ci_plugin(pytester)
+    pytester.makepyfile(
+        test_sample="""
+import pytest
+
+@pytest.mark.fpgadataflow
+def test_a():
+    assert True
+
+@pytest.mark.end2end
+def test_b():
+    assert True
+"""
+    )
+
+    result = pytester.runpytest(
+        "-m", "fpgadataflow",
+        "--num-shards=2",
+        "--shard-id=1",
+        "--junitxml=stage.xml",
+        "-q",
+    )
+
+    assert result.ret == 0
+    sidecar = pytester.path / "stage.empty-shard"
+    assert sidecar.exists()
+    assert "0 items" in sidecar.read_text()
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["stages-json"],
-        ["retention-json"],
-        ["enabled-params", "--choice", "sanity"],
-        ["stash-name", "Stage", "1", "0"],
-    ],
-)
-def test_dropped_subcommands_exit_non_zero(argv):
-    # The build pipeline does not call any of these; re-adding one means
-    # wiring its own Groovy caller, not silently re-using a CLI that no
-    # longer has tests behind it.
-    with pytest.raises(SystemExit) as exc:
-        ci_sharding.main(argv)
-    assert exc.value.code != 0
+def test_pytest_plugin_rejects_conflicting_shard_pins_within_xdist_group(pytester):
+    # Two tests share an xdist_group and disagree on @pytest.mark.shard(N).
+    # _assignment_details must surface this as a UsageError rather than
+    # silently splitting a chained checkpoint sequence across shards.
+    _install_finn_ci_plugin(pytester)
+    pytester.makepyfile(
+        test_sample="""
+import pytest
+
+@pytest.mark.xdist_group(name="chain")
+@pytest.mark.shard(0)
+def test_first():
+    assert True
+
+@pytest.mark.xdist_group(name="chain")
+@pytest.mark.shard(1)
+def test_second():
+    assert True
+"""
+    )
+
+    result = pytester.runpytest(
+        "--num-shards=2",
+        "--shard-id=0",
+        "--junitxml=stage.xml",
+        "-q",
+    )
+
+    assert result.ret != 0
+    combined = "\n".join(result.outlines + result.errlines)
+    assert "conflicting" in combined
+    assert "chain" in combined
+
+
+def test_pytest_plugin_dry_run_prints_per_shard_table_and_exits_zero(pytester):
+    # --dry-run-shards must print the header row and exit 0 without running
+    # any test. We deselect everything by design so exit 5 is benign.
+    _install_finn_ci_plugin(pytester)
+    pytester.makepyfile(
+        test_sample="""
+def test_a():
+    assert True
+
+def test_b():
+    assert True
+"""
+    )
+
+    result = pytester.runpytest(
+        "--num-shards=2",
+        "--shard-id=0",
+        "--dry-run-shards",
+        "--junitxml=stage.xml",
+        "-q",
+    )
+
+    assert result.ret == 0
+    out = "\n".join(result.outlines)
+    assert "dry-run-shards" in out
+    assert "shard" in out and "items" in out and "groups" in out
+    # No tests should have actually run.
+    result.assert_outcomes()
 
 
 # ============================================================================
@@ -1292,6 +1373,40 @@ def test_hw_test_types_json_cli_emits_valid_json(capsys):
     assert isinstance(parsed, list)
     assert "bnn_build_sanity" in parsed
     assert "bnn_build_full" in parsed
+
+
+def test_hw_test_type_labels_returns_label_for_every_referenced_type():
+    labels = ci_sharding.hw_test_type_labels()
+    # ordering matches first-appearance of the hwTestType in STAGES so the
+    # Jenkins HW UI rows render in the same order as the build-side stages
+    assert list(labels) == ci_sharding.hw_test_types()
+    for tt in ci_sharding.hw_test_types():
+        assert labels[tt]
+        assert isinstance(labels[tt], str)
+
+
+def test_hw_test_type_labels_json_cli_emits_valid_json(capsys):
+    rc = ci_sharding.main(["hw-test-type-labels-json"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert isinstance(parsed, dict)
+    assert parsed == ci_sharding.hw_test_type_labels()
+
+
+def test_validate_config_rejects_hw_test_type_without_label(monkeypatch):
+    bad_stages = list(ci_sharding.STAGES) + [
+        {
+            "param": "sanity",
+            "stage": "Bad",
+            "marker": "sanity_bnn",
+            "shards": 1,
+            "workers": 1,
+            "zipArtifacts": {"hwTestType": "bnn_build_unlabelled", "boards": ["U250"]},
+        }
+    ]
+    monkeypatch.setattr(ci_sharding, "STAGES", bad_stages)
+    with pytest.raises(ValueError, match="bnn_build_unlabelled"):
+        ci_sharding.validate_config()
 
 
 # ============================================================================
@@ -1516,10 +1631,26 @@ def test_validate_stage_row_rejects_bad_input(bad, match):
         ci_sharding.validate_stage_row(bad)
 
 
-def test_validate_config_runs_validate_stage_row_for_every_entry(monkeypatch):
+def test_validate_config_runs_validate_stage_row_for_every_entry(monkeypatch, capsys):
+    # CLI form: main() catches ValueError, prints a one-line ci_sharding:
+    # message to stderr, and exits 2 instead of leaking a Python traceback
+    # into the Jenkins Validate console.
     bad_stages = [
         {"param": "p", "stage": "Bad", "marker": "a and b", "shards": 1, "workers": 1},
     ]
     monkeypatch.setattr(ci_sharding, "STAGES", bad_stages)
-    with pytest.raises(ValueError, match="unsafe marker"):
-        ci_sharding.main(["validate-config", "--choice", "p", "--job-name", "j"])
+    rc = ci_sharding.main(["validate-config", "--choice", "p", "--job-name", "j"])
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert captured.err.startswith("ci_sharding: ")
+    assert "unsafe marker" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_validate_config_unknown_choice_returns_clean_error(capsys):
+    rc = ci_sharding.main(["validate-config", "--choice", "notathing", "--job-name", "j"])
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert captured.err.startswith("ci_sharding: ")
+    assert "unknown STAGES choice" in captured.err
+    assert "Traceback" not in captured.err

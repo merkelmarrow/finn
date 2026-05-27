@@ -114,7 +114,7 @@ fetch_repo() {
 
     CURRENT_COMMIT=$(git -C "$CLONE_TO" rev-parse HEAD)
     if [ "$CURRENT_COMMIT" != "$REPO_COMMIT" ]; then
-        echo "fetch-repos: ERROR — $REPO_DIR is at $CURRENT_COMMIT, expected $REPO_COMMIT" >&2
+        echo "fetch-repos: ERROR: $REPO_DIR is at $CURRENT_COMMIT, expected $REPO_COMMIT" >&2
         return 1
     fi
     echo "Successfully checked out $REPO_DIR at commit $CURRENT_COMMIT"

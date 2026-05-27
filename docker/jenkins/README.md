@@ -119,10 +119,7 @@ Edit the `_BNN_WBITS`, `_BNN_ABITS`, and `_BNN_TOPOLOGY` constants in `tests/end
 
 ### Add a new HW test type?
 
-Adding a new `hwTestType` (today `bnn_build_sanity` or `bnn_build_full`) is a two-line change:
-
-1. In [`ci_sharding.py`](./ci_sharding.py), add `STAGES` rows whose `zipArtifacts.hwTestType` is the new name. The `hw-test-types-json` subcommand picks it up automatically in first-appearance order, so place smoke/sanity types before longer test types.
-2. In [`Jenkinsfile_HW`](./Jenkinsfile_HW), add a `HW_TEST_TYPE_LABELS` entry mapping the new test type to the human-readable label that should appear in the Jenkins UI (e.g. `'bnn_build_robust': 'Robust'`). The `Run Hardware Tests` stage discovers the new test type from the CLI and renders one nested stage per entry. Missing labels fail `loadHwShards()` loudly so the mapping cannot silently regress.
+Adding a new `hwTestType` (today `bnn_build_sanity` or `bnn_build_full`) is a one-line change in [`ci_sharding.py`](./ci_sharding.py): add `STAGES` rows whose `zipArtifacts.hwTestType` is the new name and an entry in `HW_TEST_TYPE_LABELS` mapping that name to the human-readable label that should appear in the Jenkins UI (e.g. `"bnn_build_robust": "Robust"`). The `hw-test-types-json` and `hw-test-type-labels-json` subcommands pick the new entry up automatically in first-appearance order (so place smoke/sanity types before longer test types), and `validate_config()` rejects an `hwTestType` declared in `STAGES` without a matching label.
 
 ### Add a new BNN board?
 

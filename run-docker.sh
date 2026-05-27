@@ -80,14 +80,6 @@ SCRIPTPATH=$(dirname "$SCRIPT")
 : ${FINN_XRT_PATH=""}
 : ${FINN_DOCKER_NO_CACHE="0"}
 
-# Deprecation warning: FINN_DOCKER_ALLOW_PREBUILT_FALLBACK was an opt-in to
-# silently fall back to a local build when the shared image was missing under
-# FINN_DOCKER_PREBUILT=1. The fallback now always errors so a missing shared
-# image cannot quietly poison a CI run. Drop the env var from your call sites.
-if [ -n "${FINN_DOCKER_ALLOW_PREBUILT_FALLBACK:-}" ]; then
-  echo "warn: FINN_DOCKER_ALLOW_PREBUILT_FALLBACK is deprecated and now ignored; shared image load failure is fatal" >&2
-fi
-
 DOCKER_INTERACTIVE=""
 
 # Catch FINN_DOCKER_EXTRA options being passed in without a trailing space
@@ -200,6 +192,16 @@ if [ "$FINN_DOCKER_NO_CACHE" = "1" ]; then
   FINN_DOCKER_BUILD_EXTRA+="--no-cache "
 fi
 
+# fail fast on PREBUILT=1 with no usable image source: with no shared dir
+# configured and no local image, docker run further down would fail with
+# a generic "Unable to find image" much later in the pipeline.
+if [ "$FINN_DOCKER_PREBUILT" = "1" ] && [ -z "$FINN_DOCKER_SHARED_IMAGE_DIR" ] \
+   && ! docker image inspect "$FINN_DOCKER_TAG" > /dev/null 2>&1; then
+  recho "FINN_DOCKER_PREBUILT=1 but FINN_DOCKER_SHARED_IMAGE_DIR is unset and tag $FINN_DOCKER_TAG is not loaded locally"
+  recho "Set FINN_DOCKER_SHARED_IMAGE_DIR to a directory containing finn-docker-image.tar.gz, or unset FINN_DOCKER_PREBUILT to build locally."
+  exit 1
+fi
+
 # If a shared-image dir is configured, load from there. In prebuilt mode
 # the shared image is authoritative and any same-tag local image is ignored.
 if [ -n "$FINN_DOCKER_SHARED_IMAGE_DIR" ] && \
@@ -212,7 +214,7 @@ if [ -n "$FINN_DOCKER_SHARED_IMAGE_DIR" ] && \
     gecho "Loading Docker image from shared storage ($SHARED_DIR)..."
     SHARED_TAG=$(cat "$SHARED_TAG_FILE")
     if [ "$FINN_DOCKER_PREBUILT" = "1" ] && [ "$SHARED_TAG" != "$FINN_DOCKER_TAG" ]; then
-      gecho "ERROR: Shared Docker tag $SHARED_TAG does not match requested tag $FINN_DOCKER_TAG"
+      recho "Shared Docker tag $SHARED_TAG does not match requested tag $FINN_DOCKER_TAG"
       exit 1
     fi
     # local /tmp lock to serialise concurrent loads on the same host
@@ -231,9 +233,7 @@ if [ -n "$FINN_DOCKER_SHARED_IMAGE_DIR" ] && \
     gecho "WARNING: No usable shared Docker image found at FINN_DOCKER_SHARED_IMAGE_DIR=$SHARED_DIR; falling back to local build"
   fi
   if [ "$FINN_DOCKER_PREBUILT" = "1" ] && [ "$SHARED_LOADED" != "1" ]; then
-    gecho "No usable shared Docker image found at FINN_DOCKER_SHARED_IMAGE_DIR=$SHARED_DIR"
-    gecho "Expected both finn-docker-image.tar.gz and finn-docker-tag.txt to be present"
-    gecho "ERROR: FINN_DOCKER_PREBUILT=1 requires a usable shared Docker image"
+    recho "FINN_DOCKER_PREBUILT=1 but no usable shared Docker image at FINN_DOCKER_SHARED_IMAGE_DIR=$SHARED_DIR (expected finn-docker-image.tar.gz and finn-docker-tag.txt)"
     exit 1
   fi
 fi

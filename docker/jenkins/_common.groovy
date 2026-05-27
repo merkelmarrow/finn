@@ -15,6 +15,9 @@ String paramString(String name) {
   return v == null ? '' : v.toString()
 }
 
+// Sole shell-quoting primitive for the build and HW pipelines. Wraps the
+// argument in single quotes and escapes embedded single quotes via the
+// canonical '"'"' dance. Re-run any shell-injection tests after touching it.
 String shellQuote(String s) {
   return "'" + (s ?: '').replace("'", "'\"'\"'") + "'"
 }

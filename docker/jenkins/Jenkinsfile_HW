@@ -32,13 +32,11 @@ List<Map> HW_SHARDS = []
 @Field
 List<String> HW_TEST_TYPES = []
 
-// Per-test-type human-readable label, used in the Jenkins stage name. Add a
-// row here when introducing a new STAGES.zipArtifacts.hwTestType.
+// Populated from ci_sharding.py's hw-test-type-labels-json. Adding a new
+// HW test type is a one-line edit of HW_TEST_TYPE_LABELS in ci_sharding.py;
+// validate_config() rejects an hwTestType without a matching label.
 @Field
-Map<String, String> HW_TEST_TYPE_LABELS = [
-  'bnn_build_sanity': 'Sanity',
-  'bnn_build_full': 'end2end',
-]
+Map<String, String> HW_TEST_TYPE_LABELS = [:]
 
 // Keyed by agentLabel; populated by refreshNodeOnlineFlags().
 @Field
@@ -91,8 +89,8 @@ pipeline {
     }
     // One scripted stage per HW test type; the loop body adds a nested
     // ``stage(name)`` per entry so each test type still shows up as its
-    // own row in the Jenkins UI. Adding a new test type now requires one
-    // line in HW_TEST_TYPE_LABELS plus a STAGES row in ci_sharding.py.
+    // own row in the Jenkins UI. Adding a new test type is a one-line edit
+    // of HW_TEST_TYPE_LABELS in ci_sharding.py.
     stage('Run Hardware Tests') {
       steps {
         script {
@@ -126,10 +124,13 @@ void loadHwShards() {
     "python3 docker/jenkins/ci_sharding.py hw-test-types-json"
   ).trim()
   HW_TEST_TYPES = (readJSON(text: typesJson) as List).collect { it as String }
-  List<String> missingLabels = HW_TEST_TYPES.findAll { !HW_TEST_TYPE_LABELS.containsKey(it) }
-  if (missingLabels) {
-    error "HW_TEST_TYPE_LABELS missing entries for ${missingLabels} (declared in ci_sharding.py STAGES). Add a label row to Jenkinsfile_HW."
-  }
+  String labelsJson = sh(returnStdout: true, script:
+    "python3 docker/jenkins/ci_sharding.py hw-test-type-labels-json"
+  ).trim()
+  // validate-config (run inside hw-test-type-labels-json) rejects an
+  // hwTestType without a matching label, so this map is guaranteed to
+  // cover HW_TEST_TYPES by the time we get here.
+  HW_TEST_TYPE_LABELS = readJSON(text: labelsJson) as Map
 }
 
 String hwTestTypeLabel(String testType) {

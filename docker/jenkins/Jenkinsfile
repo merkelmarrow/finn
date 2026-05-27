@@ -548,6 +548,10 @@ void runLocalSetupTest() {
         ]) {
           // flock -n on the prune: concurrent builds skip the find rather
           // than racing `rm -rf` against another build's `pip install`.
+          // `-mtime +14` targets the cache-key dir's own mtime, not the
+          // files inside it, so a still-actively-used cache that has not
+          // been written to in 14 days is also eligible. The cache key is
+          // hashed off requirements/setup so the next build re-creates it.
           sh """
 mkdir -p ${shellQuote(perBuildRoot)} ${shellQuote(pipCacheDir)} ${shellQuote(xdgCacheDir)}
 touch ${shellQuote(pruneLock)}
@@ -579,8 +583,11 @@ source scripts/finn-env.sh
 // sharding.
 void runPytest(Map opts) {
   def parts = ["python -m pytest -m \"\$FINN_CI_MARKER\""]
-  if (opts.workers) {
-    parts << "-n ${opts.workers} --dist ${opts.distMode ?: 'worksteal'}"
+  // Skip -n entirely for single-worker rows: xdist still spawns a worker
+  // process for -n 1, which adds startup overhead and obscures tracebacks.
+  int workers = (opts.workers ?: 1) as int
+  if (workers > 1) {
+    parts << "-n ${workers} --dist ${opts.distMode ?: 'worksteal'}"
   }
   int numShards = (opts.numShards ?: 0) as int
   if (numShards > 0) {
@@ -854,35 +861,10 @@ void findCopyZip(String testType, String board, String findDir, String copyDir) 
   }
   String artifactRoot = artifactBuildRoot()
   if (!artifactRoot) { return }
-  if (!fileExists("${findDir}")) { return }
-  def found = sh(returnStdout: true, script:
-      "find ${shellQuote(findDir)} -maxdepth 2 -type d -name ${shellQuote(board)} -path '*/hw_deployment_*/*' | sort"
-  ).trim()
-  if (!found) { return }
   String stageDir = "${artifactRoot}/deployments/${testType}/${board}/${copyDir}"
-  sh """
-    set -eu
-    stage_dir=${shellQuote(stageDir)}
-    board=${shellQuote(board)}
-    mkdir -p "\${stage_dir}/\${board}"
-    chmod -R u+w "\${stage_dir}/\${board}" 2>/dev/null || true
-    rm -rf "\${stage_dir}/\${board:?}/"*
-    while IFS= read -r board_dir; do
-      [ -n "\${board_dir}" ] || continue
-      for model_dir in "\${board_dir}"/*; do
-        [ -d "\${model_dir}" ] || continue
-        name=\$(basename "\${model_dir}")
-        if [ -e "\${stage_dir}/\${board}/\${name}" ]; then
-          echo "findCopyZip(${testType}/${board}): duplicate deployment \${name} across hw_deployment dirs"
-          exit 1
-        fi
-        cp -a "\${model_dir}" "\${stage_dir}/\${board}/"
-      done
-    done <<'EOF'
-${found}
-EOF
-  """
-  echo "findCopyZip(${testType}/${board}): staged deployments under ${stageDir}"
+  sh "docker/jenkins/scripts/find_copy_zip.sh " +
+     "${shellQuote(testType)} ${shellQuote(board)} " +
+     "${shellQuote(findDir)} ${shellQuote(stageDir)}"
 }
 
 

@@ -153,6 +153,15 @@ BOARDS = {
 TEST_BOARDS = tuple(BOARDS)
 
 
+# Per-test-type human-readable label, surfaced in the Jenkins HW pipeline
+# stage names. Add a row when introducing a new STAGES.zipArtifacts.hwTestType;
+# validate_config() rejects an hwTestType without a label.
+HW_TEST_TYPE_LABELS = {
+    "bnn_build_sanity": "Sanity",
+    "bnn_build_full": "end2end",
+}
+
+
 # Per-row CI matrix. Fields:
 #   param:        Jenkins ``STAGES`` choice that activates this row
 #   stage:        human-readable display name
@@ -165,7 +174,8 @@ TEST_BOARDS = tuple(BOARDS)
 #                 loadgroup is load-bearing for any row whose tests chain via
 #                 load_test_checkpoint_or_skip across xdist_group siblings
 #   zipArtifacts: optional, {"hwTestType": ..., "boards": [...]} declaring the
-#                 build-to-HW handoff zips this row publishes
+#                 build-to-HW handoff zips this row publishes; hwTestType must
+#                 have a HW_TEST_TYPE_LABELS entry
 STAGES = [
     {
         "param": "sanity",
@@ -279,7 +289,8 @@ def validate_stage_row(row):
         )
     if shards > 1 and dist_mode != "loadgroup":
         raise ValueError(
-            "STAGES row %r has shards=%r and must set distMode='loadgroup'" % (stage, shards)
+            "STAGES row %r has shards=%r and must set distMode='loadgroup'"
+            % (stage, shards)
         )
     zip_art = row.get("zipArtifacts")
     if zip_art is None:
@@ -288,14 +299,14 @@ def validate_stage_row(row):
         raise ValueError("STAGES row %r has invalid zipArtifacts=%r" % (stage, zip_art))
     hw_test_type = zip_art.get("hwTestType")
     if not isinstance(hw_test_type, str) or not hw_test_type:
-        raise ValueError("STAGES row %r has zipArtifacts without a non-empty hwTestType" % stage)
+        raise ValueError(
+            "STAGES row %r has zipArtifacts without a non-empty hwTestType" % stage
+        )
     boards = zip_art.get("boards")
-    if (
-        not isinstance(boards, list)
-        or not boards
-        or not all(isinstance(b, str) and b for b in boards)
-    ):
-        raise ValueError("STAGES row %r has zipArtifacts without a non-empty boards list" % stage)
+    if not isinstance(boards, list) or not boards or not all(isinstance(b, str) and b for b in boards):
+        raise ValueError(
+            "STAGES row %r has zipArtifacts without a non-empty boards list" % stage
+        )
 
 
 def validate_board_row(board, row):
@@ -324,32 +335,41 @@ def validate_board_row(board, row):
         raise ValueError("BOARDS row %r has invalid marker=%r" % (board, row["marker"]))
 
 
-def validate_config(stages=None, boards=None):
+def validate_config(stages=None, boards=None, hw_test_type_labels=None):
     """Validate every STAGES row and the global BOARDS cross-references.
 
-    Fails loud if a STAGES row references a board not declared in BOARDS or
-    if any single row is malformed. Replaces the old ``validate_boards``.
-    The rename reflects that this is the one entry point the Validate stage
-    in Jenkins delegates to.
+    Fails loud if a STAGES row references a board not declared in BOARDS, if
+    a row's hwTestType has no HW_TEST_TYPE_LABELS entry, or if any single
+    row is malformed. The one entry point the Validate stage in Jenkins
+    delegates to.
     """
     stages = stages if stages is not None else STAGES
     boards = boards if boards is not None else BOARDS
+    labels = hw_test_type_labels if hw_test_type_labels is not None else HW_TEST_TYPE_LABELS
     for board, row in boards.items():
         validate_board_row(board, row)
     for row in stages:
         validate_stage_row(row)
-    referenced = set()
+    referenced_boards = set()
+    referenced_test_types = set()
     for row in stages:
         zip_art = row.get("zipArtifacts") or {}
         for b in zip_art.get("boards", []) or []:
-            referenced.add(str(b))
-    missing = sorted(referenced - set(boards))
-    if missing:
-        raise ValueError("STAGES references board(s) not declared in BOARDS: %r" % missing)
-
-
-# kept as an alias for any out-of-tree caller that still imports the old name
-validate_boards = validate_config
+            referenced_boards.add(str(b))
+        hw_test_type = zip_art.get("hwTestType")
+        if hw_test_type:
+            referenced_test_types.add(str(hw_test_type))
+    missing_boards = sorted(referenced_boards - set(boards))
+    if missing_boards:
+        raise ValueError(
+            "STAGES references board(s) not declared in BOARDS: %r" % missing_boards
+        )
+    missing_labels = sorted(referenced_test_types - set(labels))
+    if missing_labels:
+        raise ValueError(
+            "STAGES references hwTestType(s) without a HW_TEST_TYPE_LABELS entry: %r"
+            % missing_labels
+        )
 
 
 # =============================================================================
@@ -380,6 +400,18 @@ def hw_test_types(stages=None):
         if hw_test_type not in seen:
             seen.append(hw_test_type)
     return seen
+
+
+def hw_test_type_labels(stages=None, labels=None):
+    """Return ``{hwTestType: label}`` for every hwTestType referenced in STAGES.
+
+    Same iteration order as :func:`hw_test_types`. Jenkinsfile_HW reads this
+    via ``hw-test-type-labels-json``, so a new HW test type is a one-line
+    edit of HW_TEST_TYPE_LABELS instead of a Groovy edit too.
+    """
+    stages = stages if stages is not None else STAGES
+    labels = labels if labels is not None else HW_TEST_TYPE_LABELS
+    return {tt: labels[tt] for tt in hw_test_types(stages)}
 
 
 def stash_name(stage, shards, shard_id):
@@ -579,7 +611,9 @@ def which_shard(query, master_path="", marker_filter=None, stages=None):
         keys = list(weights.keys())
         if canonical not in keys:
             keys.append(canonical)
-        assignment, _src, _load, _fallback = assign_groups_to_shards(keys, shards, weights=weights)
+        assignment, _src, _load, _fallback = assign_groups_to_shards(
+            keys, shards, weights=weights
+        )
         shard_id = assignment[canonical]
         rows.append(
             {
@@ -618,8 +652,9 @@ def read_json(path, default=None):
 
 def write_json_atomic(path, data):
     parent = os.path.dirname(os.path.abspath(path))
-    if not os.path.isdir(parent):
-        os.makedirs(parent)
+    # exist_ok=True so two concurrent first-time callers on a shared NFS root
+    # cannot race on mkdir.
+    os.makedirs(parent, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=parent)
     try:
         with os.fdopen(fd, "w") as f:
@@ -856,7 +891,7 @@ def _is_build_wide_anomaly(observed, master_groups):
 
 
 def _apply_per_group_update(
-    name, observed_seconds, current_entry, metadata, build_seq, allow_force_accept=False
+    name, observed_seconds, current_entry, metadata, build_seq, *, allow_force_accept=False
 ):
     """Merge one observation into one master entry. Returns ``(new_entry, status, reason)``."""
     current_entry = current_entry or {}
@@ -1038,18 +1073,34 @@ def prepare_timing_snapshot(master_path, snapshot_path):
 
 
 def _prune_corrupt_backups(master_path, retain=CORRUPT_BACKUP_RETAIN):
-    """Keep only the newest ``retain`` ``<master>.corrupt-*`` siblings."""
+    """Keep only the newest ``retain`` ``<master>.corrupt-*`` siblings.
+
+    Sorts by the integer epoch suffix rather than lexicographically so a
+    digit-count rollover (or a clock-skewed agent's future-dated backup)
+    cannot mask a freshly-made one.
+    """
     parent = os.path.dirname(os.path.abspath(master_path))
     base = os.path.basename(master_path)
     prefix = base + ".corrupt-"
     try:
-        names = [n for n in os.listdir(parent) if n.startswith(prefix)]
+        candidates = []
+        for name in os.listdir(parent):
+            if not name.startswith(prefix):
+                continue
+            suffix = name[len(prefix):]
+            try:
+                epoch = int(suffix)
+            except ValueError:
+                # non-numeric suffix: keep but treat as oldest so a real
+                # backup never gets evicted in favour of garbage
+                epoch = -1
+            candidates.append((epoch, name))
     except OSError:
         return
-    if len(names) <= retain:
+    if len(candidates) <= retain:
         return
-    names.sort()
-    for stale in names[:-retain]:
+    candidates.sort()
+    for _, stale in candidates[:-retain]:
         try:
             os.unlink(os.path.join(parent, stale))
         except OSError:
@@ -1098,8 +1149,9 @@ def locked_update(master_path, update_fn):
     if not master_path:
         return update_fn({})
     parent = os.path.dirname(os.path.abspath(master_path))
-    if not os.path.isdir(parent):
-        os.makedirs(parent)
+    # exist_ok=True so two concurrent first-time callers on a shared NFS root
+    # cannot race on mkdir.
+    os.makedirs(parent, exist_ok=True)
     base = os.path.basename(master_path)
     lock_path = os.path.join(parent, "." + base + ".lock")
     with open(lock_path, "a+") as lock:
@@ -1237,12 +1289,14 @@ def _coerce_current_build(value, tag):
         )
 
 
-def _prune_subtree(parent, tag, current_build, retain_n, max_age_days, dry_run):
+def _prune_subtree(parent, tag, current_build, retain_n, max_age_days, *, dry_run):
     current_build = _coerce_current_build(current_build, tag)
     if not os.path.isdir(parent):
         print("ci_sharding %s: %s not present, skipping" % (tag, parent))
         return 0
-    matched = prune_numeric_builds(parent, current_build, retain_n, max_age_days, dry_run, tag=tag)
+    matched = prune_numeric_builds(
+        parent, current_build, retain_n, max_age_days, dry_run, tag=tag
+    )
     print(
         "ci_sharding %s: done (parent=%s current=%s retain_n=%s "
         "max_age_days=%s dry_run=%s matched=%d)"
@@ -1253,7 +1307,9 @@ def _prune_subtree(parent, tag, current_build, retain_n, max_age_days, dry_run):
 
 def prune_images(shared_dir, job_key, current_build, retain_n, max_age_days, dry_run=False):
     parent = os.path.join(shared_dir, job_key)
-    return _prune_subtree(parent, "prune-images", current_build, retain_n, max_age_days, dry_run)
+    return _prune_subtree(
+        parent, "prune-images", current_build, retain_n, max_age_days, dry_run=dry_run
+    )
 
 
 def prune_artifacts(artifact_dir, job_key, current_build, retain_n, max_age_days, dry_run=False):
@@ -1263,7 +1319,9 @@ def prune_artifacts(artifact_dir, job_key, current_build, retain_n, max_age_days
     older build cannot strand a HW shard.
     """
     parent = os.path.join(artifact_dir, "ci_runs", job_key)
-    return _prune_subtree(parent, "prune-artifacts", current_build, retain_n, max_age_days, dry_run)
+    return _prune_subtree(
+        parent, "prune-artifacts", current_build, retain_n, max_age_days, dry_run=dry_run
+    )
 
 
 SNAPSHOT_FILE_RE = re.compile(r"^build_(\d+)_timings_input\.json$")
@@ -1331,12 +1389,25 @@ def prune_snapshots(state_root, job_key, current_build, retain_n, max_age_days, 
 
 
 def main(argv=None):
+    """CLI entry point. Catches validate_* failures so a malformed STAGES row
+    surfaces in the Validate Jenkins console as a one-line ``ci_sharding:``
+    message instead of a Python traceback.
+    """
+    try:
+        return _dispatch(argv)
+    except (ValueError, AssertionError) as exc:
+        print("ci_sharding: %s" % exc, file=sys.stderr)
+        return 2
+
+
+def _dispatch(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd")
 
     sub.add_parser("stage-choices-json")
     sub.add_parser("hw-shards-json")
     sub.add_parser("hw-test-types-json")
+    sub.add_parser("hw-test-type-labels-json")
 
     # validate-config is the one entry point the Validate stage in Jenkins
     # delegates to. Folds enabled_params / retention / job_key into a
@@ -1378,7 +1449,9 @@ def main(argv=None):
         help="Comma-separated HW test types (e.g. bnn_build_sanity,bnn_build_full)",
     )
     p.add_argument("--boards", required=True, help="Comma-separated board names")
-    p.add_argument("--build-dir", default="", help="Optional explicit build directory override")
+    p.add_argument(
+        "--build-dir", default="", help="Optional explicit build directory override"
+    )
 
     p = sub.add_parser("prune-images")
     p.add_argument("shared_dir")
@@ -1424,6 +1497,10 @@ def main(argv=None):
         validate_config()
         print(json.dumps(hw_test_types()))
         return 0
+    if args.cmd == "hw-test-type-labels-json":
+        validate_config()
+        print(json.dumps(hw_test_type_labels()))
+        return 0
     if args.cmd == "validate-config":
         validate_config()
         print(
@@ -1462,7 +1539,9 @@ def main(argv=None):
     if args.cmd == "resolve-build-zips":
         tests = [t for t in args.tests.split(",") if t]
         boards = [b for b in args.boards.split(",") if b]
-        result = resolve_build_zips(args.artifact_dir, args.job_key, tests, boards, args.build_dir)
+        result = resolve_build_zips(
+            args.artifact_dir, args.job_key, tests, boards, args.build_dir
+        )
         print(json.dumps(result))
         return 0
     if args.cmd == "prune-images":
@@ -1493,7 +1572,9 @@ def main(argv=None):
             args.dry_run,
         )
     if args.cmd == "which-shard":
-        rows = which_shard(args.query, master_path=args.timings, marker_filter=args.marker)
+        rows = which_shard(
+            args.query, master_path=args.timings, marker_filter=args.marker
+        )
         print(json.dumps(rows, indent=2))
         return 0
     parser.print_help()

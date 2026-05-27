@@ -219,7 +219,10 @@ def launch_process_helper(args, proc_env=None, cwd=None, check=False):
     """Helper function to launch a process in a way that facilitates logging
     stdout/stderr with Python loggers.
     Returns (cmd_out, cmd_err). Raises :class:`subprocess.CalledProcessError`
-    when ``check`` is True and the process exits non-zero."""
+    when ``check`` is True and the process exits non-zero. Note that under
+    ``check=True`` the raised ``CalledProcessError``'s ``output`` and
+    ``stderr`` attributes carry pre-decoded ``str``, not the conventional
+    ``bytes``."""
     if proc_env is None:
         proc_env = os.environ.copy()
     with subprocess.Popen(

@@ -171,13 +171,10 @@ def _assign_groups_to_shards(groups, num_shards):
     return _assignment_details(groups, num_shards)[0]
 
 
-def _marker_tokens(marker_expr):
-    # STAGES.marker is constrained to "a or b ..." by MARKER_SAFE_PATTERN.
-    return [t for t in marker_expr.split() if t != "or"]
-
-
 def _item_matches_marker_expr(item, marker_expr):
-    tokens = _marker_tokens(marker_expr)
+    # STAGES.marker is constrained to "a or b ..." by MARKER_SAFE_PATTERN
+    # so ci_sharding.marker_tokens is the one definition we share.
+    tokens = ci_sharding.marker_tokens(marker_expr)
     return any(any(True for _ in item.iter_markers(name=t)) for t in tokens)
 
 
