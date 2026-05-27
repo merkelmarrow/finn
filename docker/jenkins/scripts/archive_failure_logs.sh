@@ -34,6 +34,13 @@ newer_ref=$bd
 if [ -n "$start_marker" ] && [ -e "$start_marker" ]; then
   newer_ref=$start_marker
 fi
+
+# Collect to a temp file first so we can both count (visibility for the
+# operator) and tar (the actual archive). The previous shape piped find
+# straight into tar and emitted an allowEmptyArchive zero-byte tarball
+# indistinguishable from a healthy "no candidates" run.
+list=$(mktemp)
+trap 'rm -f "$list"' EXIT
 {
   find "$abs_bd" -type f \( \
       -name vitis_hls.log -o \
@@ -49,4 +56,11 @@ fi
         -name 'remote_runner.sh' \
       \) -print0 2>/dev/null
   fi
-} | tar --null --create --gzip --file "$tarball" --files-from - 2>/dev/null || true
+} > "$list"
+
+n=$(tr -cd '\0' < "$list" | wc -c)
+echo "[archive-failure-logs] ${n} candidate file(s) for ${tarball}"
+if [ "$n" = "0" ]; then
+  exit 0
+fi
+tar --null --create --gzip --file "$tarball" --files-from "$list" 2>/dev/null || true

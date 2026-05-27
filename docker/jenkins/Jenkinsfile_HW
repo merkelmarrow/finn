@@ -159,10 +159,12 @@ void resolveSwBoardZipPaths() {
     "python3 docker/jenkins/ci_sharding.py job-key ${shellQuote(rawJob)}"
   ).trim()
   String override = paramString('sw_build_dir').trim()
-  String artifactDir = loadCommonOnce().finnArtifactDir()
+  String artifactDir = loadCommonOnce().finnArtifactsRoot()
   if (!artifactDir && !override) {
-    error "resolveSwBoardZipPaths: neither FINN_CI_NFS_ROOT nor ARTIFACT_DIR is set, " +
-          "and no explicit sw_build_dir override was provided. Cannot auto-discover SW builds."
+    error "resolveSwBoardZipPaths: FINN_CI_NFS_ROOT is unset; the HW pipeline cannot " +
+          "locate SW build artifacts. Set FINN_CI_NFS_ROOT in the HW job's environment " +
+          "to the same path as the SW job, or pass sw_build_dir explicitly to pin a " +
+          "single build directory (useful for off-NFS recovery)."
   }
   String tests = HW_TEST_TYPES.join(',')
   String boards = HW_SHARDS.collect { it.board }.join(',')

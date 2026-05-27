@@ -7,18 +7,7 @@
 // genuinely pipeline-specific (e.g. PARALLEL_SHARDS, HW_SHARDS, the various
 // printLsfSummary helpers) stay in their owning Jenkinsfile.
 
-// PRESET overrides the CI-progression booleans supplied by the SW Jenkinsfile.
-// The HW Jenkinsfile has no PRESET param, so the branch is skipped there.
-// ``smokeParams`` is the explicit SMOKE_PARAMS list from ci_sharding.py
-// loaded once at Validate time, never derived from CI_PARAMS ordering.
-boolean paramBool(String name, Collection ciProgressionParams = [], Collection smokeParams = []) {
-  def presetValue = params.get('PRESET')
-  def ciParams = (ciProgressionParams ?: []) as List
-  if (presetValue != null && name in ciParams) {
-    String preset = presetValue.toString().toLowerCase().trim() ?: 'custom'
-    if (preset == 'smoke') { return (smokeParams ?: []).contains(name) }
-    if (preset == 'full')  { return true }
-  }
+boolean paramBool(String name) {
   def v = params.get(name)
   if (v == null) { return false }
   if (v instanceof Boolean) { return v }
@@ -36,9 +25,9 @@ String shellQuote(String s) {
 
 // Hints run-docker.sh with FINN_DOCKER_PREBUILT=1 when a shared image is
 // configured so non-builder agents docker-load from NFS instead of rebuilding.
-// Falls through to a plain sh when no shared image is configured.
+// Falls through to a local image build in local-fallback mode.
 void runDockerCommand(String command) {
-  if (env.FINN_DOCKER_SHARED_IMAGE_DIR || env.FINN_DOCKER_SHARED_DIR) {
+  if (env.FINN_DOCKER_SHARED_IMAGE_DIR) {
     withEnv(['FINN_DOCKER_PREBUILT=1']) {
       sh command
     }
@@ -84,7 +73,7 @@ void safeStashHwReport(String stashName, String fileBase) {
 
 // SW form: rm with tolerance, hard-fail on root-owned residue, then mkdir.
 // Pre-create as the unprivileged user so docker's -v doesn't bind as root.
-void cleanPreviousBuildFilesStrict(String buildDir) {
+void cleanPreviousBuildFiles(String buildDir) {
   if (!buildDir || buildDir.empty) { return }
   String q = shellQuote(buildDir)
   sh """
@@ -111,46 +100,30 @@ void cleanPreviousBuildFilesHw(String buildDir, boolean includeSiblings) {
   sh "${prefix}rm -rf ${targets}"
 }
 
-// FINN_CI_NFS_ROOT consolidates the legacy FINN_NFS_ROOT_BASE,
-// FINN_DOCKER_SHARED_DIR, and ARTIFACT_DIR env vars into one. The legacy
-// vars still win when explicitly set so a partial migration cannot relocate
-// any tree silently. Conventional subdir layout under FINN_CI_NFS_ROOT:
-//   agent_workspaces/<NODE>/workspace/tmp     (legacy FINN_NFS_ROOT_BASE)
-//   docker_images/<jobKey>/<BUILD>/           (legacy FINN_DOCKER_SHARED_DIR)
-//   artifacts/ci_runs/<jobKey>/<BUILD>/       (legacy ARTIFACT_DIR)
-String finnCiNfsRoot()       { return (env.FINN_CI_NFS_ROOT ?: '').trim() }
-String finnNfsRootBase()     { return resolveNfsTree('FINN_NFS_ROOT_BASE',     'agent_workspaces') }
-String finnDockerSharedDir() { return resolveNfsTree('FINN_DOCKER_SHARED_DIR', 'docker_images') }
-String finnArtifactDir()     { return resolveNfsTree('ARTIFACT_DIR',           'artifacts') }
+// FINN_CI_NFS_ROOT is the only env var operators set. Every shared tree
+// derives from it. Returning '' means "no NFS available" and callers
+// MUST handle the fallback (skip cache mounts, skip image publish, skip
+// artifact handoff, skip persistent timing master). Local fallback is a
+// degraded but functional mode for software-only debug runs.
+String finnCiNfsRoot() { return (env.FINN_CI_NFS_ROOT ?: '').trim() }
 
-String resolveNfsTree(String legacyEnv, String subdir) {
-  String legacy = legacyNfsEnv(legacyEnv)
-  if (legacy) { return legacy }
-  String root = finnCiNfsRoot()
-  if (!root) { return '' }
-  return "${root}/${subdir}"
-}
-
-String legacyNfsEnv(String name) {
-  if (name == 'FINN_NFS_ROOT_BASE')     { return (env.FINN_NFS_ROOT_BASE ?: '').trim() }
-  if (name == 'FINN_DOCKER_SHARED_DIR') { return (env.FINN_DOCKER_SHARED_DIR ?: '').trim() }
-  if (name == 'ARTIFACT_DIR')           { return (env.ARTIFACT_DIR ?: '').trim() }
-  error "legacyNfsEnv: unknown env var ${name}"
-}
-
-// Echoes once per build when FINN_CI_NFS_ROOT is set alongside any of the
-// legacy vars, so operators know which path actually won.
-void warnLegacyNfsEnv() {
-  if (!finnCiNfsRoot()) { return }
-  warnLegacyNfsEnvOne('FINN_NFS_ROOT_BASE',     env.FINN_NFS_ROOT_BASE)
-  warnLegacyNfsEnvOne('FINN_DOCKER_SHARED_DIR', env.FINN_DOCKER_SHARED_DIR)
-  warnLegacyNfsEnvOne('ARTIFACT_DIR',           env.ARTIFACT_DIR)
-}
-
-void warnLegacyNfsEnvOne(String name, String value) {
-  if ((value ?: '').trim()) {
-    echo "warnLegacyNfsEnv: ${name} is set alongside FINN_CI_NFS_ROOT, the legacy var still wins for safety. Drop it once you have verified the FINN_CI_NFS_ROOT-derived layout."
+// Shared "anchor a subtree under FINN_CI_NFS_ROOT" helper so every callsite
+// shares the same '' fallback semantics. Empty suffix segments collapse out
+// so finnAgentCachesDir('') (missing NODE_NAME) returns '' rather than a
+// dangling /agent_caches/ path.
+String finnSubdir(String... segments) {
+  String r = finnCiNfsRoot()
+  if (!r) { return '' }
+  for (int i = 0; i < segments.length; i++) {
+    if (!segments[i]) { return '' }
   }
+  return ([r] + (segments as List)).join('/')
 }
+
+String finnAgentCachesDir(String node)    { return finnSubdir('agent_caches', node) }
+String finnDockerImagesRoot()             { return finnSubdir('docker_images') }
+String finnDockerImagesDir(String jobKey) { return finnSubdir('docker_images', jobKey) }
+String finnArtifactsRoot()                { return finnSubdir('artifacts') }
+String finnCiStateDir(String jobKey)      { return finnSubdir('_ci_state', jobKey) }
 
 return this

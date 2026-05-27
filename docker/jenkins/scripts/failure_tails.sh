@@ -36,7 +36,7 @@ fi
 
 echo "$tag ${#failed[@]} log file(s) with ERROR: markers"
 for f in "${failed[@]}"; do
-  rel="${f#$bd/}"
+  rel="${f#"$bd"/}"
   echo ""
   echo "=== FAIL: $rel (tail ${tail_lines}) ==="
   tail -n "$tail_lines" "$f"

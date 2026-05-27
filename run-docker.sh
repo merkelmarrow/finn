@@ -41,26 +41,6 @@ recho () {
   echo -e "${RED}$1${NC}"
 }
 
-if [ -z "$FINN_XILINX_PATH" ];then
-  recho "Please set the FINN_XILINX_PATH environment variable to the path to your Xilinx tools installation directory (e.g. /opt/Xilinx)."
-  recho "FINN functionality depending on Vivado, Vitis or HLS will not be available."
-fi
-
-if [ -z "$FINN_XILINX_VERSION" ];then
-  recho "Please set the FINN_XILINX_VERSION to the version of the Xilinx tools to use (e.g. 2022.2)"
-  recho "FINN functionality depending on Vivado, Vitis or HLS will not be available."
-fi
-
-if [ -z "$PLATFORM_REPO_PATHS" ];then
-  recho "Please set PLATFORM_REPO_PATHS pointing to Vitis platform files (DSAs)."
-  recho "This is required to be able to use Vitis-based Alveo PCIe cards."
-fi
-
-if [ -z "$V80PP_DEB_PACKAGE" ];then
-  recho "Please set V80PP_DEB_PACKAGE pointing to the SLASH v80++ .deb package."
-  recho "This is required to be able to use the Alveo V80 card."
-fi
-
 DOCKER_GID=$(id -g)
 DOCKER_GNAME=$(id -gn)
 DOCKER_UNAME=$(id -un)
@@ -105,6 +85,40 @@ DOCKER_INTERACTIVE=""
 
 # Catch FINN_DOCKER_EXTRA options being passed in without a trailing space
 FINN_DOCKER_EXTRA+=" "
+
+# print-tag prints the Docker image tag and exits. Used by the Jenkins
+# publish step so the tag string has one source of truth (here, in
+# FINN_DOCKER_TAG) rather than being duplicated across files. Extra args
+# are rejected so a fat-fingered `./run-docker.sh print-tag > out.txt`
+# fails loudly instead of writing a misleading file.
+if [ "$1" = "print-tag" ]; then
+  if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 print-tag" >&2
+    exit 2
+  fi
+  echo "$FINN_DOCKER_TAG"
+  exit 0
+fi
+
+if [ -z "$FINN_XILINX_PATH" ];then
+  recho "Please set the FINN_XILINX_PATH environment variable to the path to your Xilinx tools installation directory (e.g. /opt/Xilinx)."
+  recho "FINN functionality depending on Vivado, Vitis or HLS will not be available."
+fi
+
+if [ -z "$FINN_XILINX_VERSION" ];then
+  recho "Please set the FINN_XILINX_VERSION to the version of the Xilinx tools to use (e.g. 2022.2)"
+  recho "FINN functionality depending on Vivado, Vitis or HLS will not be available."
+fi
+
+if [ -z "$PLATFORM_REPO_PATHS" ];then
+  recho "Please set PLATFORM_REPO_PATHS pointing to Vitis platform files (DSAs)."
+  recho "This is required to be able to use Vitis-based Alveo PCIe cards."
+fi
+
+if [ -z "$V80PP_DEB_PACKAGE" ];then
+  recho "Please set V80PP_DEB_PACKAGE pointing to the SLASH v80++ .deb package."
+  recho "This is required to be able to use the Alveo V80 card."
+fi
 
 if [ "$1" = "test" ]; then
   gecho "Running test suite (all tests)"
@@ -185,28 +199,13 @@ fi
 # If the image isn't available locally, try loading from shared storage. In
 # prebuilt mode, always verify/load the build-scoped shared image instead of
 # trusting a same-tag local image left by an older build.
-if { [ -n "$FINN_DOCKER_SHARED_IMAGE_DIR" ] || [ -n "$FINN_DOCKER_SHARED_DIR" ]; } && \
+if [ -n "$FINN_DOCKER_SHARED_IMAGE_DIR" ] && \
    { [ "$FINN_DOCKER_PREBUILT" = "1" ] || ! docker image inspect "$FINN_DOCKER_TAG" > /dev/null 2>&1; }; then
-  SHARED_DIR=""
+  SHARED_DIR="$FINN_DOCKER_SHARED_IMAGE_DIR"
   SHARED_LOADED="0"
-  PROBED=""
-  if [ -n "$FINN_DOCKER_SHARED_IMAGE_DIR" ]; then
-    candidate_vars=(FINN_DOCKER_SHARED_IMAGE_DIR)
-  else
-    candidate_vars=(FINN_DOCKER_SHARED_DIR)
-  fi
-  for candidate_var in "${candidate_vars[@]}"; do
-    candidate="${!candidate_var:-}"
-    if [ -z "$candidate" ]; then continue; fi
-    PROBED="$PROBED $candidate_var=$candidate"
-    if [ -f "$candidate/finn-docker-image.tar.gz" ] && [ -f "$candidate/finn-docker-tag.txt" ]; then
-      SHARED_DIR="$candidate"
-      break
-    fi
-  done
-  if [ -n "$SHARED_DIR" ]; then
-    SHARED_IMG="$SHARED_DIR/finn-docker-image.tar.gz"
-    SHARED_TAG_FILE="$SHARED_DIR/finn-docker-tag.txt"
+  SHARED_IMG="$SHARED_DIR/finn-docker-image.tar.gz"
+  SHARED_TAG_FILE="$SHARED_DIR/finn-docker-tag.txt"
+  if [ -f "$SHARED_IMG" ] && [ -f "$SHARED_TAG_FILE" ]; then
     gecho "Loading Docker image from shared storage ($SHARED_DIR)..."
     SHARED_TAG=$(cat "$SHARED_TAG_FILE")
     if [ "$FINN_DOCKER_PREBUILT" = "1" ] && [ "$SHARED_TAG" != "$FINN_DOCKER_TAG" ]; then
@@ -226,28 +225,18 @@ if { [ -n "$FINN_DOCKER_SHARED_IMAGE_DIR" ] || [ -n "$FINN_DOCKER_SHARED_DIR" ];
       gecho "WARNING: Failed to load Docker image from shared storage ($SHARED_DIR)"
     fi
   fi
+  if [ "$SHARED_LOADED" != "1" ] && [ "$FINN_DOCKER_PREBUILT" != "1" ]; then
+    gecho "WARNING: No usable shared Docker image found at FINN_DOCKER_SHARED_IMAGE_DIR=$SHARED_DIR; falling back to local build"
+  fi
   if [ "$FINN_DOCKER_PREBUILT" = "1" ] && [ "$SHARED_LOADED" != "1" ]; then
-    gecho "No usable shared Docker image found. Probed:${PROBED:- (none set)}"
-    gecho "Each candidate must contain both finn-docker-image.tar.gz and finn-docker-tag.txt"
+    gecho "No usable shared Docker image found at FINN_DOCKER_SHARED_IMAGE_DIR=$SHARED_DIR"
+    gecho "Expected both finn-docker-image.tar.gz and finn-docker-tag.txt to be present"
     if [ "$FINN_DOCKER_ALLOW_PREBUILT_FALLBACK" = "1" ]; then
       gecho "Falling back to local Docker build because FINN_DOCKER_ALLOW_PREBUILT_FALLBACK=1"
       FINN_DOCKER_PREBUILT="0"
     else
       gecho "ERROR: FINN_DOCKER_PREBUILT=1 requires a usable shared Docker image"
       exit 1
-    fi
-  fi
-  if ! docker image inspect "$FINN_DOCKER_TAG" > /dev/null 2>&1; then
-    gecho "No usable shared Docker image found. Probed:${PROBED:- (none set)}"
-    gecho "Each candidate must contain both finn-docker-image.tar.gz and finn-docker-tag.txt"
-    if [ "$FINN_DOCKER_PREBUILT" = "1" ]; then
-      if [ "$FINN_DOCKER_ALLOW_PREBUILT_FALLBACK" = "1" ]; then
-        gecho "Falling back to local Docker build because FINN_DOCKER_ALLOW_PREBUILT_FALLBACK=1"
-        FINN_DOCKER_PREBUILT="0"
-      else
-        gecho "ERROR: FINN_DOCKER_PREBUILT=1 requires a usable shared Docker image"
-        exit 1
-      fi
     fi
   fi
 fi

@@ -379,10 +379,10 @@ _SANITY_BNN_CONFIGS = [
 ]
 
 _BNN_MARKER_BY_BOARD = {
-    "Pynq-Z1":   "bnn_pynq",
+    "Pynq-Z1": "bnn_pynq",
     "KV260_SOM": "bnn_kv260",
-    "ZCU104":    "bnn_zcu104",
-    "U250":      "bnn_u250",
+    "ZCU104": "bnn_zcu104",
+    "U250": "bnn_u250",
 }
 
 _BNN_WBITS = [1, 2]
@@ -392,31 +392,49 @@ _BNN_TOPOLOGY = ["lfc", "tfc", "cnv"]
 
 def _bnn_scenarios():
     """Return a list of (id, kwargs, marks) tuples covering every scenario."""
+    # xdist_group names embed the parameters directly (not an index) so a
+    # future edit to _BNN_WBITS/_BNN_ABITS/_BNN_TOPOLOGY does not silently
+    # renumber every existing group and invalidate the timing master's
+    # accumulated samples for those tests. Board names with hyphens (e.g.
+    # ``Pynq-Z1``) are deliberately allowed here; the strictly-validated
+    # ``MARKER_SAFE_PATTERN`` in the Jenkinsfile applies only to pytest -m
+    # marker expressions, not to xdist_group names.
     scenarios = []
-    for idx, (w, a, top, board) in enumerate(_SANITY_BNN_CONFIGS):
-        scenarios.append((
-            f"sanity_bnn_w{w}_a{a}_{top}_{board}",
-            {"wbits": w, "abits": a, "topology": top, "board": board},
-            [
-                pytest.mark.sanity_bnn,
-                pytest.mark.xdist_group(name=f"sanity_bnn_group_{idx}"),
-            ],
-        ))
+    for w, a, top, board in _SANITY_BNN_CONFIGS:
+        scenarios.append(
+            (
+                f"sanity_bnn_w{w}_a{a}_{top}_{board}",
+                {"wbits": w, "abits": a, "topology": top, "board": board},
+                [
+                    pytest.mark.sanity_bnn,
+                    pytest.mark.xdist_group(name=f"sanity_bnn_w{w}_a{a}_{top}_{board}"),
+                ],
+            )
+        )
     for board in test_board_map:
         marker_name = _BNN_MARKER_BY_BOARD[board]
         marker = getattr(pytest.mark, marker_name)
-        for idx, (w, a, top) in enumerate(
-            itertools.product(_BNN_WBITS, _BNN_ABITS, _BNN_TOPOLOGY)
-        ):
-            scenarios.append((
-                f"bnn_w{w}_a{a}_{top}_{board}",
-                {"wbits": w, "abits": a, "topology": top, "board": board},
-                [
-                    marker,
-                    pytest.mark.xdist_group(name=f"{marker_name}_group_{idx}"),
-                ],
-            ))
+        for w, a, top in itertools.product(_BNN_WBITS, _BNN_ABITS, _BNN_TOPOLOGY):
+            scenarios.append(
+                (
+                    f"bnn_w{w}_a{a}_{top}_{board}",
+                    {"wbits": w, "abits": a, "topology": top, "board": board},
+                    [
+                        marker,
+                        pytest.mark.xdist_group(name=f"{marker_name}_w{w}_a{a}_{top}_{board}"),
+                    ],
+                )
+            )
     return scenarios
+
+
+def test_bnn_xdist_group_names_are_unique():
+    groups = []
+    for _, _, marks in _bnn_scenarios():
+        for mark in marks:
+            if mark.name == "xdist_group":
+                groups.append(mark.kwargs["name"])
+    assert len(groups) == len(set(groups))
 
 
 def pytest_generate_tests(metafunc):
@@ -425,10 +443,7 @@ def pytest_generate_tests(metafunc):
         return
     argnames = ["wbits", "abits", "topology", "board"]
     idlist = [s[0] for s in scenarios]
-    argvalues = [
-        pytest.param(*(s[1][k] for k in argnames), marks=s[2])
-        for s in scenarios
-    ]
+    argvalues = [pytest.param(*(s[1][k] for k in argnames), marks=s[2]) for s in scenarios]
     metafunc.parametrize(argnames, argvalues, ids=idlist, scope="class")
 
 

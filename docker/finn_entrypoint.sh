@@ -58,11 +58,15 @@ recho () {
 }
 
 # qonnx pyproject.toml workaround for https://github.com/pypa/pip/issues/7953.
-# Trap restores the file if pip install aborts under `set -e`.
-mv ${FINN_ROOT}/deps/qonnx/pyproject.toml ${FINN_ROOT}/deps/qonnx/pyproject.tmp
-trap 'mv ${FINN_ROOT}/deps/qonnx/pyproject.tmp ${FINN_ROOT}/deps/qonnx/pyproject.toml 2>/dev/null || true' EXIT
-pip install --user -e ${FINN_ROOT}/deps/qonnx
-mv ${FINN_ROOT}/deps/qonnx/pyproject.tmp ${FINN_ROOT}/deps/qonnx/pyproject.toml
+# Trap restores the file if pip install aborts under `set -e`. Paths are
+# captured into locals before the trap so an unset-FINN_ROOT mid-script
+# cannot strand the rename in /deps/qonnx.
+_qonnx_pyproj_toml="${FINN_ROOT}/deps/qonnx/pyproject.toml"
+_qonnx_pyproj_tmp="${FINN_ROOT}/deps/qonnx/pyproject.tmp"
+mv "$_qonnx_pyproj_toml" "$_qonnx_pyproj_tmp"
+trap 'mv "$_qonnx_pyproj_tmp" "$_qonnx_pyproj_toml" 2>/dev/null || true' EXIT
+pip install --user -e "${FINN_ROOT}/deps/qonnx"
+mv "$_qonnx_pyproj_tmp" "$_qonnx_pyproj_toml"
 trap - EXIT
 
 # finn-experimental

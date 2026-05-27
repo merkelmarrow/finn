@@ -7,6 +7,7 @@ import pytest
 
 import json
 import os
+import re
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -99,8 +100,8 @@ def test_update_master_preserves_unseen_and_replaces_seen(tmp_path):
         {
             "version": 1,
             "groups": {
-                "seen": {"seconds": 1.0, "count": 1},
-                "unseen": {"seconds": 7.0, "count": 2},
+                "seen": {"samples": [1.0], "count": 1},
+                "unseen": {"samples": [7.0], "count": 2},
             },
         },
     )
@@ -113,48 +114,17 @@ def test_update_master_preserves_unseen_and_replaces_seen(tmp_path):
         },
     )
 
-    # promote=True exercises the persistent-master path, the test name
-    # describes the persisted file, not just the preview.
-    ci_sharding.update_master(str(reports), str(master), str(out), promote=True)
+    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
 
     persisted = json.loads(master.read_text())
     merged = json.loads(out.read_text())
-    assert persisted["groups"]["seen"]["seconds"] == 3.5
-    assert persisted["groups"]["seen"]["count"] == 4
-    assert persisted["groups"]["unseen"]["seconds"] == 7.0
-    assert merged["groups"]["seen"]["seconds"] == 3.5
-    assert merged["groups"]["unseen"]["seconds"] == 7.0
-
-
-def test_update_master_skips_persistent_update_when_not_promoted(tmp_path):
-    reports = tmp_path / "reports"
-    reports.mkdir()
-    master = tmp_path / "master.json"
-    out = reports / "ci_timings_master.json"
-    write_json(master, {"version": 1, "groups": {"seen": {"seconds": 1.0, "count": 1}}})
-    write_json(
-        reports / "stage.timings.json",
-        {
-            "stash": "stage",
-            "metadata": {"job": "job", "build": "12", "stage": "Stage"},
-            "groups": [{"name": "seen", "seconds": 3.5, "count": 4}],
-        },
-    )
-
-    ci_sharding.update_master(
-        str(reports),
-        str(master),
-        str(out),
-        promote=False,
-        metadata={"job": "job", "build": "12", "full_run": False, "stage_filter": "BNN"},
-    )
-
-    persisted = json.loads(master.read_text())
-    merged = json.loads(out.read_text())
-    assert persisted["groups"]["seen"]["seconds"] == 1.0
-    assert merged["groups"]["seen"]["seconds"] == 3.5
-    assert merged["last_update"]["promoted"] is False
-    assert merged["last_update"]["stage_filter"] == "BNN"
+    # seen's prior median is 1.0, observed 3.5 -- ratio 3.5 is within [0.25, 4.0]
+    # so it's accepted and appended to samples.
+    assert persisted["groups"]["seen"]["samples"] == [1.0, 3.5]
+    assert persisted["groups"]["unseen"]["samples"] == [7.0]
+    assert merged["groups"]["seen"]["samples"] == [1.0, 3.5]
+    assert merged["last_update"]["accepted"] == 1
+    assert merged["last_update"]["rejected"] == 0
 
 
 def test_merge_maps_writes_searchable_text(tmp_path):
@@ -185,64 +155,23 @@ def test_merge_maps_writes_searchable_text(tmp_path):
     assert "source=known" in text
 
 
-def test_regen_seed_flattens_master_groups_and_skips_zero_seconds(tmp_path):
-    master = tmp_path / "master.json"
-    out = tmp_path / "seed.json"
-    write_json(
-        master,
-        {
-            "version": 1,
-            "groups": {
-                "alpha": {"seconds": 12.345, "count": 1},
-                "beta": {"seconds": 0.0, "count": 1},
-                "gamma": {"seconds": 7.0, "count": 2},
-                "delta": "not a number",
-            },
-        },
-    )
-
-    ci_sharding.regen_seed(str(master), str(out))
-
-    data = json.loads(out.read_text())
-    assert data["_comment"].startswith("Seed per-group wall seconds")
-    assert data["groups"] == {"alpha": 12.345, "gamma": 7.0}
-    assert list(data["groups"].keys()) == ["alpha", "gamma"]
-
-
-def test_regen_seed_rejects_non_object_master(tmp_path):
-    master = tmp_path / "master.json"
-    out = tmp_path / "seed.json"
-    master.write_text("[1, 2, 3]")
-    with pytest.raises(ValueError, match="not a JSON object"):
-        ci_sharding.regen_seed(str(master), str(out))
-
-
-def test_prepare_timing_snapshot_uses_seed_when_master_missing(tmp_path):
-    seed = tmp_path / "seed.json"
+def test_prepare_timing_snapshot_empty_when_master_missing(tmp_path):
     snapshot = tmp_path / "snapshot.json"
-    write_json(seed, {"version": 1, "groups": {"slow": 12.0}})
+    ci_sharding.prepare_timing_snapshot(str(tmp_path / "missing-master.json"), str(snapshot))
+    data = json.loads(snapshot.read_text())
+    assert data["groups"] == {}
+    assert data["build_seq"] == 0
 
-    ci_sharding.prepare_timing_snapshot(
-        str(tmp_path / "missing-master.json"), str(snapshot), str(seed)
-    )
+
+def test_prepare_timing_snapshot_copies_master_when_present(tmp_path):
+    master = tmp_path / "master.json"
+    snapshot = tmp_path / "snapshot.json"
+    write_json(master, {"version": 1, "groups": {"slow": {"samples": [12.0]}}})
+
+    ci_sharding.prepare_timing_snapshot(str(master), str(snapshot))
 
     data = json.loads(snapshot.read_text())
-    assert data["groups"]["slow"] == 12.0
-
-
-def test_prune_tmp_keeps_newest_numeric_builds(tmp_path):
-    root = tmp_path / "nfs"
-    base = root / "agent" / "workspace" / "tmp" / "ci_runs" / "job"
-    for build in ("98", "99", "100"):
-        path = base / build
-        path.mkdir(parents=True)
-        os.utime(str(path), (1, 1))
-
-    ci_sharding.prune_tmp(str(root), "job", "101", retain_n=1, max_age_days=0)
-
-    assert not (base / "98").exists()
-    assert not (base / "99").exists()
-    assert (base / "100").exists()
+    assert data["groups"]["slow"]["samples"] == [12.0]
 
 
 def test_prune_images_keeps_current_build_and_newest(tmp_path):
@@ -376,94 +305,138 @@ def test_prune_artifacts_skips_when_parent_missing(tmp_path, capsys):
     assert "not present, skipping" in captured.out
 
 
-def test_is_full_matrix_run_true_on_canonical_stages_with_every_param_ticked():
-    # The canonical STAGES has no skipWhen rows, so ticking every CI param
-    # is sufficient to trigger auto-promote on a successful build. Any
-    # missing param or a non-empty STAGE_FILTER must turn it off.
-    required = ci_sharding.ci_param_names()
-    assert ci_sharding.is_full_matrix_run(required)
-    assert not ci_sharding.is_full_matrix_run(required[:-1])
-    assert not ci_sharding.is_full_matrix_run([])
-    assert not ci_sharding.is_full_matrix_run(required, stage_filter="BNN")
-    payload = ci_sharding.full_matrix_status(required, stage_filter="")
-    assert payload["full"] is True
-    assert payload["required"] == required
+def test_enabled_params_sanity_runs_only_sanity_rows():
+    assert ci_sharding.enabled_params_for_choice("sanity") == ["sanity"]
 
 
-def test_ci_params_payload_uses_explicit_smoke_constant():
-    payload = ci_sharding.ci_params_payload()
-    assert payload["params"] == ci_sharding.ci_param_names()
-    assert payload["smoke"] == list(ci_sharding.SMOKE_PARAMS)
+def test_enabled_params_full_returns_every_distinct_param_in_stages_order():
+    assert ci_sharding.enabled_params_for_choice("full") == ci_sharding.ci_param_names()
 
 
-def test_smoke_is_immune_to_stages_reorder():
-    # Reorder a synthetic STAGES. Smoke must still resolve to SMOKE_PARAMS
-    # rather than "whatever happens to be index 0", which is the regression
-    # the explicit SMOKE_PARAMS constant prevents.
-    forward = [
-        {"param": "sanity", "stage": "S", "marker": "s", "shards": 1, "workers": 1},
-        {"param": "end2end", "stage": "E", "marker": "e", "shards": 1, "workers": 1},
-    ]
-    reversed_stages = list(reversed(forward))
-    fwd = ci_sharding.ci_params_payload(forward, smoke_params=("sanity",))
-    rev = ci_sharding.ci_params_payload(reversed_stages, smoke_params=("sanity",))
-    assert fwd["smoke"] == ["sanity"]
-    assert rev["smoke"] == ["sanity"]
-    # params order naturally follows STAGES order, smoke does not.
-    assert fwd["params"] != rev["params"]
+def test_enabled_params_bare_name_returns_that_one():
+    assert ci_sharding.enabled_params_for_choice("fpgadataflow") == ["fpgadataflow"]
+    assert ci_sharding.enabled_params_for_choice("end2end") == ["end2end"]
 
 
-def test_ci_params_payload_drops_smoke_entries_not_in_stages():
-    # A SMOKE_PARAMS entry referencing a no-longer-existing param is dropped
-    # silently, so a stale constant cannot enable nothing-at-all rather than
-    # the intended subset.
-    stages = [{"param": "sanity", "stage": "S", "marker": "s", "shards": 1, "workers": 1}]
-    payload = ci_sharding.ci_params_payload(stages, smoke_params=("sanity", "vanished"))
-    assert payload["smoke"] == ["sanity"]
+def test_jenkins_stage_choices_list_is_sanity_full_then_bare_params():
+    assert ci_sharding.jenkins_stage_choices() == ["sanity", "full", "fpgadataflow", "end2end"]
 
 
-def test_is_full_matrix_run_short_circuits_on_stage_filter():
-    assert not ci_sharding.is_full_matrix_run(
-        ["sanity", "fpgadataflow", "end2end"], stage_filter="BNN"
+def test_jenkinsfile_stage_choices_match_python_source():
+    # Anchor on the STAGES choice block specifically so a future second
+    # ``choice(name: 'XYZ', ...)`` cannot match instead. Accept both
+    # single- and double-quoted Groovy string literals so a future edit
+    # in either style does not silently fall off the regex and read [].
+    jenkinsfile = os.path.join(REPO_ROOT, "docker", "jenkins", "Jenkinsfile")
+    text = open(jenkinsfile).read()
+    match = re.search(
+        r"""choice\(\s*name:\s*['"]STAGES['"],\s*choices:\s*\[([^\]]+)\]""",
+        text,
+    )
+    assert match is not None, "could not locate STAGES choice block in Jenkinsfile"
+    choices = re.findall(r"""['"]([^'"]+)['"]""", match.group(1))
+    expected = ci_sharding.jenkins_stage_choices()
+    assert (
+        choices == expected
+    ), "Jenkinsfile STAGES choices %r drifted from ci_sharding.jenkins_stage_choices() %r" % (
+        choices,
+        expected,
     )
 
 
-def test_is_full_matrix_run_true_when_no_skipwhen_rows_block():
-    # Synthetic STAGES with no skipWhen: is_full_matrix_run is True when
-    # every distinct param is enabled, and False otherwise.
+def test_enabled_params_rejects_unknown_choice_loudly():
+    with pytest.raises(ValueError, match="unknown STAGES choice"):
+        ci_sharding.enabled_params_for_choice("notarealchoice")
+
+
+def test_enabled_params_full_on_synthetic_stages_picks_up_new_params():
+    # A new CI param (no edits to enabled_params_for_choice required) flows
+    # through ``full`` automatically because the function reads ci_param_names.
     custom_stages = [
-        {"param": "alpha", "stage": "A", "marker": "a", "shards": 1, "workers": 1},
-        {"param": "beta", "stage": "B", "marker": "b", "shards": 1, "workers": 1},
+        {"param": "sanity", "stage": "S", "marker": "s", "shards": 1, "workers": 1},
+        {"param": "newthing", "stage": "N", "marker": "n", "shards": 1, "workers": 1},
     ]
-    assert ci_sharding.is_full_matrix_run(["alpha", "beta"], stages=custom_stages)
-    assert not ci_sharding.is_full_matrix_run(["alpha"], stages=custom_stages)
-    assert ci_sharding.ci_param_names(custom_stages) == ["alpha", "beta"]
-    assert not ci_sharding.is_full_matrix_run([], stages=[])
+    assert ci_sharding.enabled_params_for_choice("full", stages=custom_stages) == [
+        "sanity",
+        "newthing",
+    ]
+    assert ci_sharding.enabled_params_for_choice("newthing", stages=custom_stages) == ["newthing"]
+    assert ci_sharding.jenkins_stage_choices(stages=custom_stages) == [
+        "sanity",
+        "full",
+        "newthing",
+    ]
 
 
-def test_rows_that_would_run_excludes_skipwhen_rows():
-    custom_stages = [
+def test_validate_config_single_invocation_returns_full_payload(capsys):
+    # The Jenkinsfile collapsed three sh calls into this one; the contract
+    # is "all four keys present, well-formed, ready for readJSON". If this
+    # subcommand ever silently changes shape, loadStageConfig() loses a
+    # field and the rest of Validate degrades quietly.
+    rc = ci_sharding.main(["validate-config", "--choice", "sanity", "--job-name", "finn.dev"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert set(payload) == {"stages", "enabled_params", "retention", "job_key"}
+    assert isinstance(payload["stages"], list) and payload["stages"]
+    assert payload["enabled_params"] == ["sanity"]
+    assert set(payload["retention"]) == {"image", "artifact"}
+    # job-key sanitiser is shared with the standalone subcommand.
+    assert payload["job_key"] == "finn.dev"
+
+
+def test_validate_config_rejects_orphan_zipartifact_board(monkeypatch):
+    # validate_boards() runs inside the subcommand so a STAGES row with
+    # an orphan board fails Validate loudly, not three stages later when
+    # the HW pipeline tries to look it up.
+    bad_stages = list(ci_sharding.STAGES) + [
         {
             "param": "sanity",
-            "stage": "Sanity",
-            "marker": "s",
+            "stage": "Bad",
+            "marker": "sanity_bnn",
             "shards": 1,
             "workers": 1,
-            "skipWhen": "end2end",
-        },
-        {"param": "end2end", "stage": "End2end", "marker": "e", "shards": 1, "workers": 1},
+            "zipArtifacts": {"hwTestType": "t", "boards": ["NotABoard"]},
+        }
     ]
-    # Only sanity ticked -> the sanity row runs.
-    rows = ci_sharding.rows_that_would_run(["sanity"], stages=custom_stages)
-    assert [r["stage"] for r in rows] == ["Sanity"]
-    # Both ticked -> sanity is skipped by skipWhen, only End2end runs.
-    rows = ci_sharding.rows_that_would_run(["sanity", "end2end"], stages=custom_stages)
-    assert [r["stage"] for r in rows] == ["End2end"]
-    # Neither ticked -> no rows run.
-    assert ci_sharding.rows_that_would_run([], stages=custom_stages) == []
+    monkeypatch.setattr(ci_sharding, "STAGES", bad_stages)
+    with pytest.raises(ValueError, match="NotABoard"):
+        ci_sharding.main(["validate-config", "--choice", "full", "--job-name", "j"])
 
 
-def test_update_master_records_promote_failure_in_preview(tmp_path, monkeypatch):
+def test_active_artifact_rows_present_for_sanity_and_end2end_choices():
+    # Mirrors the Groovy hasActiveArtifactRows() decision: in local-fallback
+    # mode the SW->HW handoff is silently skipped for these choices (yellow
+    # build via aggregateReports), and absent for fpgadataflow.
+    def has_artifact_rows(choice):
+        enabled = set(ci_sharding.enabled_params_for_choice(choice))
+        return any(
+            row.get("zipArtifacts") and row.get("param") in enabled for row in ci_sharding.STAGES
+        )
+
+    assert has_artifact_rows("sanity") is True
+    assert has_artifact_rows("end2end") is True
+    assert has_artifact_rows("full") is True
+    assert has_artifact_rows("fpgadataflow") is False
+
+
+def test_jenkins_stage_choices_omits_sanity_head_when_param_absent():
+    # If a future STAGES has no sanity rows at all, jenkins_stage_choices()
+    # must not synthesise a "sanity" choice the dropdown cannot deliver.
+    no_sanity = [
+        {"param": "fpgadataflow", "stage": "F", "marker": "f", "shards": 1, "workers": 1},
+        {"param": "end2end", "stage": "E", "marker": "e", "shards": 1, "workers": 1},
+    ]
+    assert ci_sharding.jenkins_stage_choices(stages=no_sanity) == [
+        "full",
+        "fpgadataflow",
+        "end2end",
+    ]
+
+
+def test_update_master_raises_on_persistent_write_failure(tmp_path, monkeypatch):
+    # Persistent write failure propagates so the calling pipeline can mark
+    # the build UNSTABLE instead of silently leaving a stale master behind.
     reports = tmp_path / "reports"
     reports.mkdir()
     master = tmp_path / "master.json"
@@ -483,20 +456,14 @@ def test_update_master_records_promote_failure_in_preview(tmp_path, monkeypatch)
 
     monkeypatch.setattr(ci_sharding, "locked_update", boom)
 
-    # Promote failure is advisory: rc stays 0 so per-build CI doesn't flap on
-    # routine NFS hiccups. The preview's last_update.promoted records it.
-    rc = ci_sharding.update_master(
-        str(reports),
-        str(master),
-        str(out),
-        promote=True,
-        metadata={"job": "j", "build": "1", "full_run": True, "stage_filter": ""},
-    )
-
-    preview = json.loads(out.read_text())
-    assert rc == 0
-    assert preview["last_update"]["promoted"] is False
-    assert preview["groups"]["seen"]["seconds"] == 1.0
+    with pytest.raises(IOError, match="simulated NFS write failure"):
+        ci_sharding.update_master(
+            str(reports),
+            str(master),
+            str(out),
+            update_persistent=True,
+            metadata={"job": "j", "build": "1"},
+        )
 
 
 def test_read_json_warns_on_corrupt_file(tmp_path, capsys):
@@ -586,12 +553,30 @@ def test_prune_numeric_builds_rejects_non_numeric_current(tmp_path):
         )
 
 
-def test_prune_tmp_validates_current_build_at_boundary(tmp_path):
-    # The boundary check (prune-tmp/images/artifacts) fires before the
-    # per-tree loop, so a bad BUILD_NUMBER fails loudly rather than
-    # silently aborting on the first tree after partial work.
-    with pytest.raises(ValueError, match="prune-tmp: current_build must be"):
-        ci_sharding.prune_tmp(str(tmp_path), "job", "not-a-number", 1, 0)
+def test_prune_numeric_builds_canonicalises_leading_zeros(tmp_path):
+    # On-disk dir name "0123" and a BUILD_NUMBER value of "123" refer to the
+    # same build for retention purposes. Without canonicalisation the keep set
+    # contained the BUILD_NUMBER as-is and the on-disk leading-zero variant
+    # would be eligible for pruning even though it is the current build.
+    parent = tmp_path / "p"
+    parent.mkdir()
+    for build in ("0123", "0124", "0125"):
+        (parent / build).mkdir()
+        os.utime(str(parent / build), (1, 1))
+
+    matched = ci_sharding.prune_numeric_builds(
+        str(parent),
+        current_build="123",
+        retain_n=1,
+        max_age_days=0,
+        dry_run=False,
+        tag="t",
+    )
+    # newest ("0125") kept by retain_n, current build ("0123" via int(123))
+    # kept by the current-build guard; "0124" is the only one pruned.
+    assert matched == 1
+    surviving = sorted(p.name for p in parent.iterdir())
+    assert surviving == ["0123", "0125"]
 
 
 def test_prune_images_validates_current_build_at_boundary(tmp_path):
@@ -773,6 +758,8 @@ def test_locked_update_does_not_backup_empty_master(tmp_path):
 
 
 def test_update_master_no_master_path_writes_preview(tmp_path):
+    # Local-fallback mode (no NFS): the per-build preview is still written,
+    # the master simply has nowhere to live.
     reports = tmp_path / "reports"
     reports.mkdir()
     out = reports / "ci_timings_master.json"
@@ -785,22 +772,341 @@ def test_update_master_no_master_path_writes_preview(tmp_path):
         },
     )
 
-    # promote=True is intentional: without a master path there is nothing to
-    # promote into, so the preview's last_update.promoted must come out
-    # False and the status string ``no-master`` records the cause.
     rc = ci_sharding.update_master(
         str(reports),
-        master_path=None,
+        master_path="",
         out_path=str(out),
-        promote=True,
-        metadata={"job": "j", "build": "1", "full_run": True, "stage_filter": ""},
+        metadata={"job": "j", "build": "1"},
     )
 
     preview = json.loads(out.read_text())
     assert rc == 0
-    assert preview["groups"]["seen"]["seconds"] == 1.0
-    assert preview["last_update"]["promoted"] is False
+    assert preview["groups"]["seen"]["samples"] == [1.0]
     assert preview["last_update"]["observed_groups"] == 1
+    assert preview["last_update"]["accepted"] == 1
+
+
+# ----------------------------------------------------------------------------
+# Anomaly protection (per-group rolling median + build-wide veto + GC).
+# ----------------------------------------------------------------------------
+
+
+def _seed_master_with_group(path, name, samples, **extra):
+    write_json(path, {"version": 1, "groups": {name: {"samples": list(samples), **extra}}})
+
+
+def _write_observation(reports_dir, stash, name, seconds):
+    write_json(
+        reports_dir / ("%s.timings.json" % stash),
+        {
+            "stash": stash,
+            "metadata": {"job": "j", "build": "1", "stage": stash},
+            "groups": [{"name": name, "seconds": seconds, "count": 1}],
+        },
+    )
+
+
+def test_observed_groups_uses_max_seconds_for_duplicate_group(tmp_path):
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    _write_observation(reports, "fast", "same", 1.0)
+    _write_observation(reports, "slow", "same", 9.0)
+    observed = ci_sharding.observed_groups_from_reports(str(reports))
+    assert observed["same"]["seconds"] == 9.0
+    assert observed["same"]["last_seen_stash"] == "slow"
+
+
+def test_update_master_cold_start_accepts_first_observation(tmp_path):
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    master = tmp_path / "master.json"
+    out = reports / "ci_timings_master.json"
+    write_json(master, {"version": 1, "groups": {}})
+    _write_observation(reports, "stage", "newgroup", 42.0)
+    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
+    persisted = json.loads(master.read_text())
+    assert persisted["groups"]["newgroup"]["samples"] == [42.0]
+    assert persisted["last_update"]["accepted"] == 1
+
+
+def test_update_master_grows_samples_to_max_then_trims(tmp_path):
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    master = tmp_path / "master.json"
+    out = reports / "ci_timings_master.json"
+    _seed_master_with_group(master, "g", [10.0, 10.0, 10.0, 10.0])
+    _write_observation(reports, "stage", "g", 11.0)
+    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
+    persisted = json.loads(master.read_text())
+    # 5th sample appended, window full but not yet trimmed.
+    assert persisted["groups"]["g"]["samples"] == [10.0, 10.0, 10.0, 10.0, 11.0]
+    # Next observation evicts the oldest sample (FIFO ring).
+    _write_observation(reports, "stage", "g", 12.0)
+    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
+    persisted = json.loads(master.read_text())
+    assert persisted["groups"]["g"]["samples"] == [10.0, 10.0, 10.0, 11.0, 12.0]
+
+
+def test_update_master_uses_median_so_one_outlier_in_five_is_absorbed(tmp_path):
+    # 4 samples at 10s plus one accepted-but-large 35s (ratio 3.5, within
+    # [0.25, 4.0]). Median is still 10 so the bin packer's weight is
+    # unaffected by the lone wobble.
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    master = tmp_path / "master.json"
+    out = reports / "ci_timings_master.json"
+    _seed_master_with_group(master, "g", [10.0, 10.0, 10.0, 10.0])
+    _write_observation(reports, "stage", "g", 35.0)
+    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
+    weights = ci_sharding.load_group_weights(str(master))
+    assert weights["g"] == 10.0
+
+
+def test_update_master_rejects_high_ratio_outlier(tmp_path):
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    master = tmp_path / "master.json"
+    out = reports / "ci_timings_master.json"
+    _seed_master_with_group(master, "g", [10.0, 10.0, 10.0])
+    _write_observation(reports, "stage", "g", 100.0)
+    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
+    persisted = json.loads(master.read_text())
+    assert persisted["groups"]["g"]["samples"] == [10.0, 10.0, 10.0]
+    assert persisted["groups"]["g"]["consecutive_rejections"] == 1
+    assert persisted["last_update"]["rejected"] == 1
+
+
+def test_update_master_rejects_low_ratio_outlier(tmp_path):
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    master = tmp_path / "master.json"
+    out = reports / "ci_timings_master.json"
+    _seed_master_with_group(master, "g", [100.0, 100.0, 100.0])
+    _write_observation(reports, "stage", "g", 10.0)
+    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
+    persisted = json.loads(master.read_text())
+    assert persisted["groups"]["g"]["samples"] == [100.0, 100.0, 100.0]
+    assert persisted["groups"]["g"]["consecutive_rejections"] == 1
+
+
+def test_update_master_rejects_crash_suspect_when_prior_was_large(tmp_path):
+    # 0.1s observation against a 600s prior is the "shard crashed before
+    # any real test ran" pattern: very low observed AND very large prior.
+    # 0.1 / 600 = ratio is also out of band, but the crash-floor rule
+    # fires first to give a clearer rejection reason.
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    master = tmp_path / "master.json"
+    out = reports / "ci_timings_master.json"
+    _seed_master_with_group(master, "g", [600.0, 600.0])
+    _write_observation(reports, "stage", "g", 0.1)
+    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
+    persisted = json.loads(master.read_text())
+    assert persisted["groups"]["g"]["samples"] == [600.0, 600.0]
+    assert persisted["groups"]["g"]["consecutive_rejections"] == 1
+
+
+def test_update_master_force_accepts_after_three_consecutive_rejections(tmp_path):
+    # A real regression (test legitimately becomes 10x slower) would
+    # otherwise be locked out forever. After FORCE_ACCEPT_AFTER consecutive
+    # rejections, the next observation force-accepts.
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    master = tmp_path / "master.json"
+    out = reports / "ci_timings_master.json"
+    _seed_master_with_group(master, "g", [10.0, 10.0, 10.0])
+    for _ in range(ci_sharding.FORCE_ACCEPT_AFTER):
+        _write_observation(reports, "stage", "g", 100.0)
+        ci_sharding.update_master(
+            str(reports),
+            str(master),
+            str(out),
+            update_persistent=True,
+            allow_force_accept=True,
+        )
+    persisted = json.loads(master.read_text())
+    # third pass triggers force-accept on its observation, master now
+    # contains 100.0 alongside the older 10.0 samples.
+    assert 100.0 in persisted["groups"]["g"]["samples"]
+    assert persisted["groups"]["g"]["consecutive_rejections"] == 0
+    assert persisted["last_update"]["force_accepted"] == 1
+
+
+def test_update_master_skips_all_updates_on_build_wide_anomaly(tmp_path):
+    # Five groups all 4.5x faster than usual at the same time -> looks
+    # like an LSF-storm where every shard finished faster than expected,
+    # poisoning every group at once. Build-wide veto leaves the master
+    # untouched and records the anomaly in last_update.
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    master = tmp_path / "master.json"
+    out = reports / "ci_timings_master.json"
+    write_json(
+        master,
+        {
+            "version": 1,
+            "groups": {name: {"samples": [100.0, 100.0]} for name in ["a", "b", "c", "d", "e"]},
+        },
+    )
+    for name in ["a", "b", "c", "d", "e"]:
+        _write_observation(reports, name, name, 600.0)  # 6x prior median
+    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
+    persisted = json.loads(master.read_text())
+    # No group was updated.
+    for name in ["a", "b", "c", "d", "e"]:
+        assert persisted["groups"][name]["samples"] == [100.0, 100.0]
+    assert persisted["last_update"]["anomaly"] is True
+    assert persisted["last_update"]["anomaly_outliers"] == 5
+    assert persisted["last_update"]["anomaly_eligible"] == 5
+
+
+def test_update_master_build_wide_veto_requires_minimum_eligible(tmp_path):
+    # With only two eligible groups, even both being outliers must not
+    # trigger the build-wide veto (a single-shard debug build observing
+    # one group should still apply per-group rules normally).
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    master = tmp_path / "master.json"
+    out = reports / "ci_timings_master.json"
+    write_json(
+        master,
+        {
+            "version": 1,
+            "groups": {"a": {"samples": [100.0]}, "b": {"samples": [100.0]}},
+        },
+    )
+    for name in ("a", "b"):
+        _write_observation(reports, name, name, 600.0)
+    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
+    persisted = json.loads(master.read_text())
+    assert persisted["last_update"]["anomaly"] is False
+    # both rejected per-group, master unchanged for both
+    assert persisted["last_update"]["rejected"] == 2
+    assert persisted["groups"]["a"]["samples"] == [100.0]
+    assert persisted["groups"]["b"]["samples"] == [100.0]
+
+
+def test_update_master_garbage_collects_groups_unseen_for_n_builds(tmp_path):
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    master = tmp_path / "master.json"
+    out = reports / "ci_timings_master.json"
+    # Set up a build_seq large enough that the cutoff kicks in, plus a
+    # group that's stale (last_seen_build_seq way below cutoff).
+    write_json(
+        master,
+        {
+            "version": 1,
+            "build_seq": ci_sharding.GC_BUILDS_UNSEEN + 50,
+            "groups": {
+                "stale": {"samples": [10.0], "last_seen_build_seq": 1},
+                "fresh": {
+                    "samples": [10.0],
+                    "last_seen_build_seq": ci_sharding.GC_BUILDS_UNSEEN + 40,
+                },
+            },
+        },
+    )
+    _write_observation(reports, "stage", "fresh", 10.0)
+    ci_sharding.update_master(
+        str(reports), str(master), str(out), update_persistent=True, run_gc=True
+    )
+    persisted = json.loads(master.read_text())
+    assert "stale" not in persisted["groups"]
+    assert "fresh" in persisted["groups"]
+    assert persisted["last_update"]["gc_dropped"] == 1
+
+
+def test_update_master_preview_does_not_gc_unobserved_groups(tmp_path):
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    master = tmp_path / "master.json"
+    out = reports / "ci_timings_master.json"
+    write_json(
+        master,
+        {
+            "version": 1,
+            "build_seq": ci_sharding.GC_BUILDS_UNSEEN + 50,
+            "groups": {
+                "end2end": {"samples": [100.0], "last_seen_build_seq": 1},
+                "sanity": {"samples": [10.0], "last_seen_build_seq": 200},
+            },
+        },
+    )
+    _write_observation(reports, "stage", "sanity", 10.0)
+    ci_sharding.update_master(str(reports), str(master), str(out))
+    persisted = json.loads(master.read_text())
+    preview = json.loads(out.read_text())
+    assert "end2end" in persisted["groups"]
+    assert persisted["build_seq"] == ci_sharding.GC_BUILDS_UNSEEN + 50
+    assert "end2end" in preview["groups"]
+    assert preview["last_update"]["persistent_update"] is False
+    assert preview["last_update"]["gc_dropped"] == 0
+
+
+def test_update_master_gc_keeps_old_entries_without_build_seq(tmp_path):
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    master = tmp_path / "master.json"
+    out = reports / "ci_timings_master.json"
+    write_json(
+        master,
+        {
+            "version": 1,
+            "build_seq": ci_sharding.GC_BUILDS_UNSEEN + 50,
+            "groups": {
+                "old": {"seconds": 25.0, "count": 1},
+                "fresh": {
+                    "samples": [10.0],
+                    "last_seen_build_seq": ci_sharding.GC_BUILDS_UNSEEN + 40,
+                },
+            },
+        },
+    )
+    _write_observation(reports, "stage", "fresh", 10.0)
+    ci_sharding.update_master(
+        str(reports), str(master), str(out), update_persistent=True, run_gc=True
+    )
+    persisted = json.loads(master.read_text())
+    assert "old" in persisted["groups"]
+    assert "fresh" in persisted["groups"]
+    assert persisted["last_update"]["gc_dropped"] == 0
+
+
+def test_update_master_auto_upgrades_old_seconds_only_entry(tmp_path):
+    # Older master files can have ``{seconds: float}`` entries. The first
+    # observation against such an entry treats seconds
+    # as a one-element samples series and immediately migrates the schema.
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    master = tmp_path / "master.json"
+    out = reports / "ci_timings_master.json"
+    write_json(master, {"version": 1, "groups": {"g": {"seconds": 25.0, "count": 1}}})
+    _write_observation(reports, "stage", "g", 30.0)
+    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
+    persisted = json.loads(master.read_text())
+    assert persisted["groups"]["g"]["samples"] == [25.0, 30.0]
+    # seconds key is no longer the source of truth
+    assert "samples" in persisted["groups"]["g"]
+
+
+def test_load_group_weights_handles_new_samples_schema(tmp_path):
+    master = tmp_path / "master.json"
+    write_json(
+        master,
+        {
+            "version": 1,
+            "groups": {
+                "g_samples": {"samples": [10.0, 20.0, 30.0]},
+                "g_old_dict": {"seconds": 7.5},
+                "g_old_flat": 4.2,
+            },
+        },
+    )
+    weights = ci_sharding.load_group_weights(str(master))
+    assert weights["g_samples"] == 20.0  # median of [10, 20, 30]
+    assert weights["g_old_dict"] == 7.5
+    assert weights["g_old_flat"] == 4.2
 
 
 def test_pytest_plugin_writes_timings_for_successful_sharded_run(pytester):
