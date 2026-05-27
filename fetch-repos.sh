@@ -28,9 +28,8 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# Fail-fast so a partial deps/ tree is caught here, not hours later as
-# ModuleNotFoundError during pytest collection. `-u` is deliberately omitted:
-# optional FINN_SKIP_* flags are expected to be unset.
+# Fail-fast so a partial deps/ tree is caught here, not hours later.
+# `-u` is deliberately omitted: optional FINN_SKIP_* flags may be unset.
 set -eo pipefail
 
 QONNX_COMMIT="f5c9819bd00f01f41e70639b8461c8e4b39432f7"

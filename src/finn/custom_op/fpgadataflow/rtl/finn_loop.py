@@ -1086,7 +1086,7 @@ class FINNLoop(HWCustomOp, RTLBackend):
         # create a shell script and call Vivado
         make_project_sh = vivado_stitch_proj_dir + "/make_loop_ip.sh"
         working_dir = os.environ["PWD"]
-        vivado_cmd = resolve_xilinx_tool("vivado", "FINN_VIVADO_OVERRIDE")
+        vivado_cmd = resolve_xilinx_tool("vivado")
         with open(make_project_sh, "w") as f:
             f.write("#!/bin/bash \n")
             f.write("cd {}\n".format(vivado_stitch_proj_dir))

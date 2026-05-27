@@ -1,29 +1,40 @@
-// Jenkins-only sharding config and timing helpers live in docker/jenkins/ci_sharding.py.
-// Shared Groovy utilities (paramBool, paramString, shellQuote, ...) live in
-// docker/jenkins/_common.groovy and are loaded once during Validate.
+// FINN build pipeline. The board-tethered HW tests live in Jenkinsfile_HW.
+//
+// Sharding config, timing helpers, and the STAGES/BOARDS tables live in
+// docker/jenkins/ci_sharding.py. Shared Groovy utilities live in
+// docker/jenkins/_common.groovy. This file is internally segmented by
+// '// =====' banners and is meant to be read top-down: knobs first,
+// pipeline next, per-stage helpers grouped after, cross-cutting helpers at
+// the bottom.
 
 import groovy.transform.Field
+
+
+// ============================================================================
+// Module-level imports and shared-helper cache
+// ============================================================================
+// _common.groovy is loaded once on the first active node and reused from
+// every subsequent stage. Several wrappers below run from no-agent
+// orchestration code, so the loaded module must remain accessible.
 
 @Field
 def _common = null
 
-// load() needs an active node and a checked-out workspace. The first stage
-// (Validate) covers both, so this runs there and the loaded module is shared
-// with every subsequent stage on every agent.
-//
-// load() needs an active workspace, but several wrappers are called later
-// from no-agent orchestration code. Cache the stateless helper script after
-// Validate so those calls do not depend on a node allocation.
 private def loadCommonOnce() {
   if (_common == null) { _common = load 'docker/jenkins/_common.groovy' }
   return _common
 }
 
+
+// ============================================================================
+// Configuration fields
+// ============================================================================
+// Populated once during Validate from the validate-config JSON payload, then
+// read by every later stage. Do not edit these in the middle of the pipeline.
+
 @Field
 List<Map> PARALLEL_SHARDS = []
 
-// Set of CI param names the current STAGES choice enables. Populated by
-// loadStageConfig() in Validate; rowIsActive() reads it as a set lookup.
 @Field
 List<String> ENABLED_PARAMS = []
 
@@ -33,11 +44,6 @@ String FINN_CI_TIMINGS_MASTER = ''
 @Field
 String FINN_CI_TIMINGS_SNAPSHOT = ''
 
-// Cached job_key, populated once during Validate by loadStageConfig() so
-// helpers that need it (per-build paths, prune subcommands) don't reshell
-// out per stage. ci_sharding.py is the single source of truth for the
-// sanitisation rule, including the leading/trailing dot strip that
-// prevents JOB_NAME=".." escaping out of the prune parent.
 @Field
 String FINN_CI_JOB_KEY = ''
 
@@ -45,33 +51,33 @@ String FINN_CI_JOB_KEY = ''
 @Field
 int FINN_CI_MIN_FREE_GB = 120
 
-// Per-tree rotation policy. Loaded once during Validate from
-// ci_sharding.RETENTION so SW pipeline and CLI prune subcommands cannot
-// drift. See the Python side for the rationale on each tree's depth.
 @Field
 Map RETENTION = [:]
 
-// One env var configures the whole FINN CI NFS layout. Set FINN_CI_NFS_ROOT
-// in the job DSL and the SW pipeline derives every shared subtree from it.
-// When FINN_CI_NFS_ROOT is unset the pipeline runs in local fallback mode:
-// shards execute per-agent, each agent builds its own Docker image, no
-// SW->HW handoff is staged, no timing master persists across builds. HW
-// jobs require FINN_CI_NFS_ROOT and error fast if it is unset.
+// STAGES row markers are interpolated into a shell command; only accept the
+// 'a or b or c' shape so the conftest plugin's mini-evaluator stays sound.
+@Field
+java.util.regex.Pattern MARKER_SAFE_PATTERN = ~/^[A-Za-z0-9_]+( or [A-Za-z0-9_]+)*$/
+
+
+// ============================================================================
+// NFS layout
+// ============================================================================
+// FINN_CI_NFS_ROOT is the only env var operators set; every shared subtree
+// derives from it. When unset the pipeline degrades to local fallback: per-
+// agent Docker builds, no build-to-HW handoff staged, no persistent timing master,
+// no per-agent NFS caches. The HW pipeline hard-requires FINN_CI_NFS_ROOT.
 //
-// Layout under ${FINN_CI_NFS_ROOT} (full mode):
 //   agent_caches/<NODE>/{xrt,finn_cache,vivado_ip_cache}   per-agent caches
 //   docker_images/<jobKey>/<BUILD>/                        shared docker image
-//   artifacts/ci_runs/<jobKey>/<BUILD>/                    SW->HW handoff + BUILD_INFO
+//   artifacts/ci_runs/<jobKey>/<BUILD>/                    build-to-HW handoff + BUILD_INFO
 //   _ci_state/<jobKey>/                                    timing master + snapshots
 //
-// Per-shard scratch lives at ${WORKSPACE}/tmp/ci_runs/<BUILD>/<stash>
-// regardless of FINN_CI_NFS_ROOT: the workspace is per-agent (NFS-mounted
-// on lab build hosts, local SSD elsewhere) and `git clean -ffdx` between
-// runs handles rotation.
+// Per-shard scratch lives at ${WORKSPACE}/tmp/ci_runs/<BUILD>/<stash>; the
+// workspace is per-agent and `git clean -ffdx` between runs handles rotation.
 //
-// Resolvers live in _common.groovy and are thin-wrapped here so call sites
-// keep their original short names. All return '' in local fallback mode;
-// callers MUST handle that.
+// All resolvers return '' in local fallback mode; callers MUST handle that.
+
 String finnCiNfsRoot()                    { return loadCommonOnce().finnCiNfsRoot() }
 String finnAgentCachesDir(String node)    { return loadCommonOnce().finnAgentCachesDir(node) }
 String finnDockerImagesRoot()             { return loadCommonOnce().finnDockerImagesRoot() }
@@ -79,46 +85,11 @@ String finnDockerImagesDir(String jobKey) { return loadCommonOnce().finnDockerIm
 String finnArtifactsRoot()                { return loadCommonOnce().finnArtifactsRoot() }
 String finnCiStateDir(String jobKey)      { return loadCommonOnce().finnCiStateDir(jobKey) }
 
-// Loud banner so a glance at the console log answers "is NFS visible
-// and what features does this build have?". Printed unconditionally
-// from Validate; the local-fallback branch lists each disabled feature
-// explicitly so the next operator does not have to guess.
-void announceCiMode() {
-  String root = finnCiNfsRoot()
-  if (root) {
-    echo "[finn-ci] FINN_CI_NFS_ROOT=${root} (full operation)"
-  } else {
-    echo "[finn-ci] FINN_CI_NFS_ROOT is unset; running in local fallback mode."
-    echo "[finn-ci]   - no shared Docker images (each agent builds locally)"
-    echo "[finn-ci]   - no SW->HW artifact handoff (HW pipeline will fail against this build)"
-    echo "[finn-ci]   - no persistent timing master (cold-start round-robin each build)"
-    echo "[finn-ci]   - no per-agent NFS caches (network downloads run fresh)"
-  }
-}
 
-// One subprocess for the entire Validate-time config bundle. ci_sharding.py
-// validate_boards() runs first inside the subcommand so any orphan
-// zipArtifact board fails Validate loudly instead of slipping into the
-// per-shard runs. FINN_CI_JOB_KEY is populated eagerly here so later
-// helpers (rotateBuildTree, prepareTimingState, ...) never need to lazy
-// shell out for it.
-void loadStageConfig() {
-  String choice = paramString('STAGES') ?: 'sanity'
-  String raw = sh(returnStdout: true, script:
-    "python3 docker/jenkins/ci_sharding.py validate-config " +
-    "--choice ${shellQuote(choice)} " +
-    "--job-name ${shellQuote(env.JOB_NAME ?: 'job')}"
-  ).trim()
-  Map payload = readJSON(text: raw) as Map
-  PARALLEL_SHARDS = (payload.stages as List).collect { it as Map }
-  ENABLED_PARAMS  = (payload.enabled_params as List).collect { it as String }
-  RETENTION       = payload.retention as Map
-  FINN_CI_JOB_KEY = payload.job_key as String
-}
-
-// Marker is interpolated into a shell command, so reject anything that could escape it.
-@Field
-java.util.regex.Pattern MARKER_SAFE_PATTERN = ~/^[A-Za-z0-9_ ]+$/
+// ============================================================================
+// Pipeline declaration
+// ============================================================================
+// Each stage delegates to a single helper to keep this block scannable.
 
 pipeline {
   agent none
@@ -126,11 +97,9 @@ pipeline {
     timeout(time: 72, unit: 'HOURS')
   }
   parameters {
-    // STAGES is the only knob most operators ever touch. Choices mirror
-    // ci_sharding.jenkins_stage_choices(): ``sanity`` is the per-PR
-    // default, ``full`` runs every CI param, and the bare param names
-    // let a contributor debug just one slice. Drift between the two
-    // sides is caught by test_jenkinsfile_stage_choices_match_python_source.
+    // STAGES choices mirror ci_sharding.jenkins_stage_choices(). Drift
+    // between this list and the Python source is caught by
+    // test_jenkinsfile_stage_choices_match_python_source.
     choice(name: 'STAGES',
            choices: ['sanity', 'full', 'fpgadataflow', 'end2end'],
            description: 'Which CI rows to run. ' +
@@ -147,8 +116,6 @@ pipeline {
                         'Leave empty for a normal build.')
   }
   stages {
-    // Funnel per-agent config through withAgentNfsEnv so adding a finn-build
-    // host is a jenkins_slaves.yml edit only, never a Jenkinsfile edit.
     stage('Validate') {
       agent { label 'finn-build' }
       steps {
@@ -180,12 +147,41 @@ pipeline {
   }
 }
 
-// Thin wrappers around docker/jenkins/_common.groovy.
-boolean paramBool(String name)   { return loadCommonOnce().paramBool(name) }
-String  paramString(String name) { return loadCommonOnce().paramString(name) }
-String  shellQuote(String s)     { return loadCommonOnce().shellQuote(s) }
 
-// Marker errors are fatal. Executor over-subscription only warns (queueing recovers).
+// ============================================================================
+// Validate-stage helpers
+// ============================================================================
+
+void announceCiMode() {
+  String root = finnCiNfsRoot()
+  if (root) {
+    echo "[finn-ci] FINN_CI_NFS_ROOT=${root} (full operation)"
+  } else {
+    echo "[finn-ci] FINN_CI_NFS_ROOT is unset; running in local fallback mode."
+    echo "[finn-ci]   - no shared Docker images (each agent builds locally)"
+    echo "[finn-ci]   - no build-to-HW artifact handoff (HW pipeline will fail against this build)"
+    echo "[finn-ci]   - no persistent timing master (cold-start round-robin each build)"
+    echo "[finn-ci]   - no per-agent NFS caches (network downloads run fresh)"
+  }
+}
+
+// One subprocess loads the full Validate-time config bundle. validate_boards()
+// runs inside the subcommand so any orphan zipArtifact board fails Validate
+// loudly instead of slipping into the per-shard runs.
+void loadStageConfig() {
+  String choice = paramString('STAGES') ?: 'sanity'
+  String raw = sh(returnStdout: true, script:
+    "python3 docker/jenkins/ci_sharding.py validate-config " +
+    "--choice ${shellQuote(choice)} " +
+    "--job-name ${shellQuote(env.JOB_NAME ?: 'job')}"
+  ).trim()
+  Map payload = readJSON(text: raw) as Map
+  PARALLEL_SHARDS = (payload.stages as List).collect { it as Map }
+  ENABLED_PARAMS  = (payload.enabled_params as List).collect { it as String }
+  RETENTION       = payload.retention as Map
+  FINN_CI_JOB_KEY = payload.job_key as String
+}
+
 void validateShards() {
   if (!PARALLEL_SHARDS) {
     error "PARALLEL_SHARDS is empty. loadStageConfig() must run before validateShards()"
@@ -194,7 +190,7 @@ void validateShards() {
   for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
     Map row = PARALLEL_SHARDS[rowIdx]
     if (!MARKER_SAFE_PATTERN.matcher(row.marker as String).matches()) {
-      error "PARALLEL_SHARDS row '${row.stage}' has unsafe marker '${row.marker}' (only [A-Za-z0-9_ ] allowed)"
+      error "PARALLEL_SHARDS row '${row.stage}' has unsafe marker '${row.marker}' (only 'a or b ...' allowed)"
     }
     if (!(row.shards instanceof Integer) || (row.shards as int) < 1) {
       error "PARALLEL_SHARDS row '${row.stage}' has invalid shards=${row.shards}"
@@ -202,9 +198,9 @@ void validateShards() {
   }
   def activeCount = 0
   eachActiveShard { row, id -> activeCount++ }
-  // STAGE_FILTER mismatch is fatal so a silent zero-shard "green" build
-  // cannot mask a typo. The error lists active stage names so the operator
-  // does not have to guess what the filter should look like.
+  // STAGE_FILTER mismatch is fatal so a zero-shard "green" build cannot
+  // mask a typo. The error lists active stage names so the operator does
+  // not have to guess what the filter should look like.
   String filter = resolveStageFilter()
   if (filter && activeCount == 0) {
     def candidates = []
@@ -236,182 +232,6 @@ void validateShards() {
   }
 }
 
-void buildAndPublishDockerImage() {
-  sh 'docker system prune -a -f'
-  sh "./run-docker.sh echo 'Docker image build complete'"
-  String imageDir = buildDockerImageDir()
-  if (imageDir) {
-    publishSharedDockerImage(imageDir)
-  } else {
-    echo "buildAndPublishDockerImage: local fallback mode, skipping image publish"
-  }
-}
-
-// Build-scoped image directory under FINN_CI_NFS_ROOT, or '' in local
-// fallback mode.
-String buildDockerImageDir() {
-  String parent = finnDockerImagesDir(finnCiJobKey())
-  if (!parent) { return '' }
-  return "${parent}/${env.BUILD_NUMBER}"
-}
-
-// Other agents docker load this image instead of rebuilding. Tag derives
-// from `./run-docker.sh print-tag` so the tag string has one source of
-// truth. The build-scoped imageDir isolates cross-build readers from
-// in-progress writes, so rename ordering is defence-in-depth only. The
-// flock guards a same-build retry of the Build Docker Image stage racing
-// against itself; the tag file is renamed last so an out-of-band peek
-// that observes the new tag is still guaranteed to find the matching image.
-void publishSharedDockerImage(String imageDir) {
-  def tag = sh(returnStdout: true, script: './run-docker.sh print-tag').trim()
-  if (!tag || tag.contains('\n')) {
-    error "run-docker.sh print-tag must emit exactly one Docker tag line; got: ${tag}"
-  }
-  sh "mkdir -p ${shellQuote(imageDir)}"
-  // bash for set -o pipefail because Jenkins defaults sh to dash. flock via
-  // a numeric fd avoids nested-quote gymnastics. The lock is released when
-  // the shell exits (no explicit unlock needed).
-  sh """#!/bin/bash
-set -eo pipefail
-image_dir=${shellQuote(imageDir)}
-tag=${shellQuote(tag)}
-build=${shellQuote(env.BUILD_NUMBER ?: '')}
-tmp_img="\${image_dir}/finn-docker-image.tar.gz.tmp-\${build}"
-tmp_tag="\${image_dir}/finn-docker-tag.txt.tmp-\${build}"
-final_img="\${image_dir}/finn-docker-image.tar.gz"
-final_tag="\${image_dir}/finn-docker-tag.txt"
-exec 9>"\${image_dir}/.publish.lock"
-flock -x 9
-rm -f "\$tmp_img" "\$tmp_tag"
-if command -v pigz >/dev/null 2>&1; then
-  docker save "\$tag" | pigz -p \$(nproc) > "\$tmp_img"
-else
-  docker save "\$tag" | gzip > "\$tmp_img"
-fi
-printf '%s\\n' "\$tag" > "\$tmp_tag"
-sync "\$tmp_img" "\$tmp_tag"
-mv "\$tmp_img" "\$final_img"
-mv "\$tmp_tag" "\$final_tag"
-"""
-}
-
-Map<String, Closure> buildParallelStageMap() {
-  def branches = [:]
-  eachActiveShard { row, id ->
-    String stage = shardStageName(row, id)
-    String stash = shardStashName(row, id)
-    branches[stage] = { runShard(row, id, stage, stash) }
-  }
-  if (paramBool('local_setup')) {
-    branches['Local Setup (non-Docker) with Vivado'] = { runLocalSetupTest() }
-  }
-  return branches
-}
-
-void runParallelOrFail(Map<String, Closure> branches) {
-  if (!branches) {
-    error "No CI stages selected. STAGES=${paramString('STAGES')}, " +
-          "ENABLED_PARAMS=${ENABLED_PARAMS}, STAGE_FILTER='${resolveStageFilter()}'"
-  }
-  parallel(branches)
-}
-
-// A row runs iff its CI-progression param is enabled by the current STAGES
-// choice (membership in ENABLED_PARAMS). Single source of truth for the gate
-// used by eachActiveShard, hasActiveArtifactRows, assertZipArtifactsEmitted,
-// and aggregatePublishedBoardZips.
-boolean rowIsActive(Map row) {
-  return ENABLED_PARAMS.contains(row.param as String)
-}
-
-String resolveStageFilter() { return paramString('STAGE_FILTER') }
-
-void eachActiveShard(Closure body) {
-  String filter = resolveStageFilter()
-  for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
-    Map row = PARALLEL_SHARDS[rowIdx]
-    if (!rowIsActive(row)) { continue }
-    int numShards = row.shards as int
-    // C-style for-loop because groovy.lang.IntRange is not Serializable and
-    // breaks CPS persistence when it survives into parallel(...).
-    for (int id = 0; id < numShards; id++) {
-      String stage = shardStageName(row, id)
-      if (filter && !stage.contains(filter)) { continue }
-      body.call(row, id)
-    }
-  }
-}
-
-String shardStageName(Map row, int id) {
-  return row.shards == 1 ? row.stage : "${row.stage} (${id + 1}/${row.shards})"
-}
-
-String shardStashName(Map row, int id) {
-  String base = row.stage.toLowerCase().replaceAll(/[^a-z0-9]+/, '_').replaceAll(/^_|_$/, '')
-  return row.shards == 1 ? base : "${base}_${id + 1}"
-}
-
-// jobKey under ci_runs/ keeps two jobs that happen to share a build number
-// on the same host from colliding. The sanitisation rule lives in
-// ci_sharding.py so SW and HW pipelines cannot diverge. Populated eagerly
-// by loadStageConfig() during Validate; callers downstream of that are
-// pure accessors with no subprocess cost.
-String finnCiJobKey() {
-  if (!FINN_CI_JOB_KEY) {
-    error "finnCiJobKey: FINN_CI_JOB_KEY is unset. loadStageConfig() must run before any helper that reads it."
-  }
-  return FINN_CI_JOB_KEY
-}
-
-// Per-build artifact root under ${FINN_CI_NFS_ROOT}/artifacts, or '' in
-// local fallback mode. Callers that require the path must check the
-// return value.
-String artifactBuildRoot() {
-  String base = finnArtifactsRoot()
-  if (!base) { return '' }
-  return "${base}/ci_runs/${finnCiJobKey()}/${env.BUILD_NUMBER}"
-}
-
-// boardZipPath is the canonical SW->HW handoff path. SW writes the zip
-// plus a sibling READY marker here, HW resolves per (testType, board) to
-// the newest build whose READY exists. HW reads via the
-// resolveSwBoardZipPath helper in Jenkinsfile_HW, not via this function.
-//
-// Errors in local fallback mode rather than returning '' so a future caller
-// cannot accidentally fileExists('.READY') in the agent workspace. Callers
-// MUST gate on finnArtifactsRoot() (or equivalent) before invoking.
-String boardZipPath(String testType, String board) {
-  String root = artifactBuildRoot()
-  if (!root) {
-    error "boardZipPath(${testType}/${board}): artifact tree unavailable. " +
-          "Callers must gate on finnArtifactsRoot() before invoking."
-  }
-  return "${root}/zips/${testType}/${board}.zip"
-}
-
-boolean hasActiveArtifactRows() {
-  for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
-    Map row = PARALLEL_SHARDS[rowIdx]
-    if (!rowIsActive(row)) { continue }
-    if (row.zipArtifacts) { return true }
-  }
-  return false
-}
-
-// Human-readable "row -> board(s)" list for the local-fallback warning so the
-// operator sees which handoff slots they lost without diffing STAGES.
-String activeArtifactRowSummary() {
-  def parts = []
-  for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
-    Map row = PARALLEL_SHARDS[rowIdx]
-    if (!rowIsActive(row)) { continue }
-    Map zipArt = row.zipArtifacts as Map
-    if (!zipArt) { continue }
-    parts << "${row.stage} -> ${(zipArt.boards ?: []).join(',')}"
-  }
-  return parts.join('; ')
-}
-
 void prepareTimingState() {
   FINN_CI_TIMINGS_MASTER = ''
   FINN_CI_TIMINGS_SNAPSHOT = ''
@@ -433,13 +253,8 @@ void prepareTimingState() {
   }
 }
 
-// Human-readable per-build traceability file. Never parsed by code, only
-// `cat`ed by operators. Lives alongside the zips so the HW pipeline can
-// archive it for cross-reference in the HW build description.
-// GIT_COMMIT/BRANCH_NAME/GIT_BRANCH are set by checkout scm. A direct
-// `git rev-parse HEAD` on a detached checkout would record "HEAD" as the
-// branch. writeFile takes the body verbatim, so operator-controlled values
-// (STAGE_FILTER, git_branch) cannot trigger shell expansion.
+// Per-build traceability file. Never parsed by code; `cat` it for the
+// human-readable summary of what produced a given build directory.
 void writeBuildInfo() {
   String enabled = ENABLED_PARAMS.join(',')
   String commit = env.GIT_COMMIT ?: ''
@@ -469,22 +284,9 @@ void writeBuildInfo() {
   }
 }
 
-// Per-shard scratch under ${WORKSPACE}/tmp. The workspace is per-agent
-// (NFS-shared on lab build hosts via remote_fs, local SSD on non-NFS
-// agents) and ``git clean -ffdx`` between runs handles rotation, so no
-// cross-build prune is needed for tmp anymore.
-String finnCiPerBuildRoot() {
-  if (!env.BUILD_NUMBER) { error "BUILD_NUMBER is unset" }
-  String ws = env.WORKSPACE
-  if (!ws) { error "WORKSPACE is unset" }
-  return "${ws}/tmp/ci_runs/${env.BUILD_NUMBER}"
-}
-
-// Generic per-build-tree rotation. Image and artifact trees live under
-// FINN_CI_NFS_ROOT and are shared across agents. Skips silently when
-// the root is empty (local fallback mode) or the parent directory does
-// not exist (cold-start). Per-shard scratch is workspace-local and
-// rotated by git clean, no explicit prune subcommand for it.
+// Image and artifact trees live under FINN_CI_NFS_ROOT and are shared
+// across agents. Per-shard scratch is workspace-local and rotated by
+// git clean, so no prune subcommand for it.
 void rotateBuildTree(String subcommand, String root, Map policy) {
   catchError(buildResult: null, stageResult: null,
              message: "${subcommand} failed, non-fatal") {
@@ -500,54 +302,125 @@ void rotateBuildTrees() {
   rotateBuildTree('prune-artifacts', finnArtifactsRoot(), RETENTION.artifact)
 }
 
-// Must run after node binding so ${NODE_NAME} resolves before
-// FINN_DOCKER_EXTRA is interpolated. Hostname pin is unconditional:
-// bsub's gethostbyname() on the default finn_dev_<user> fails with
-// "Error 0". Cache mounts and the build-scoped shared-image hint are
-// added only when FINN_CI_NFS_ROOT is set; in local fallback mode each
-// agent operates self-contained.
-void withAgentNfsEnv(Closure body) {
-  String node = env.NODE_NAME ?: 'localhost'
-  String dockerExtra = "${env.FINN_DOCKER_EXTRA ?: ''} --hostname ${node}"
-  List<String> envList = []
-  String cachesDir = finnAgentCachesDir(node)
-  if (cachesDir) {
-    sh "mkdir -p ${shellQuote(cachesDir + '/xrt')} " +
-       "${shellQuote(cachesDir + '/finn_cache')} " +
-       "${shellQuote(cachesDir + '/vivado_ip_cache')}"
-    dockerExtra += " -v ${cachesDir}/vivado_ip_cache:/tmp/vivado_ip_cache"
-    envList << "FINN_XRT_PATH=${cachesDir}/xrt"
-    envList << "FINN_DOCKER_CACHE_DIR=${cachesDir}/finn_cache"
-  }
-  envList << "FINN_DOCKER_EXTRA=${dockerExtra}"
+
+// ============================================================================
+// Build-Docker-Image stage helpers
+// ============================================================================
+
+void buildAndPublishDockerImage() {
+  sh 'docker system prune -a -f'
+  sh "./run-docker.sh echo 'Docker image build complete'"
   String imageDir = buildDockerImageDir()
   if (imageDir) {
-    envList << "FINN_DOCKER_SHARED_IMAGE_DIR=${imageDir}"
+    publishSharedDockerImage(imageDir)
   } else {
-    envList << "FINN_DOCKER_PREBUILT=0"
+    echo "buildAndPublishDockerImage: local fallback mode, skipping image publish"
   }
-  withEnv(envList) { body() }
 }
 
-// Cold start so stale outputs don't mask ordering bugs in a reused
-// workspace. The post-clean ``git status --porcelain`` check fails
-// loudly if the workspace still has changes afterwards (root-owned
-// residue, NFS permission glitches), since the rest of the pipeline
-// assumes the working tree matches the checkout.
-void wipeStaleWorkspace() {
-  sh '''
-    git clean -ffdx
-    dirty=$(git status --porcelain)
-    if [ -n "$dirty" ]; then
-      n=$(echo "$dirty" | wc -l)
-      echo "wipeStaleWorkspace: ${n} dirty path(s) after git clean -ffdx (showing first 20):"
-      echo "$dirty" | head -20
-      exit 1
-    fi
-  '''
+// Build-scoped image directory under FINN_CI_NFS_ROOT, or '' in local fallback.
+String buildDockerImageDir() {
+  String parent = finnDockerImagesDir(finnCiJobKey())
+  if (!parent) { return '' }
+  return "${parent}/${env.BUILD_NUMBER}"
 }
 
-// finally is load-bearing so failed stages still publish their JUnit XML.
+// Other agents docker-load this image instead of rebuilding. Tag derives from
+// `./run-docker.sh print-tag`. The build-scoped imageDir keeps cross-build
+// readers away from in-progress writes; the flock guards a same-build retry.
+void publishSharedDockerImage(String imageDir) {
+  def tag = sh(returnStdout: true, script: './run-docker.sh print-tag').trim()
+  if (!tag || tag.contains('\n')) {
+    error "run-docker.sh print-tag must emit exactly one Docker tag line; got: ${tag}"
+  }
+  sh "mkdir -p ${shellQuote(imageDir)}"
+  // bash for set -o pipefail (Jenkins sh defaults to dash). flock on a
+  // numeric fd avoids nested-quote gymnastics; the lock releases on shell exit.
+  sh """#!/bin/bash
+set -eo pipefail
+image_dir=${shellQuote(imageDir)}
+tag=${shellQuote(tag)}
+build=${shellQuote(env.BUILD_NUMBER ?: '')}
+tmp_img="\${image_dir}/finn-docker-image.tar.gz.tmp-\${build}"
+tmp_tag="\${image_dir}/finn-docker-tag.txt.tmp-\${build}"
+final_img="\${image_dir}/finn-docker-image.tar.gz"
+final_tag="\${image_dir}/finn-docker-tag.txt"
+exec 9>"\${image_dir}/.publish.lock"
+flock -x 9
+rm -f "\$tmp_img" "\$tmp_tag"
+if command -v pigz >/dev/null 2>&1; then
+  docker save "\$tag" | pigz -p \$(nproc) > "\$tmp_img"
+else
+  docker save "\$tag" | gzip > "\$tmp_img"
+fi
+printf '%s\\n' "\$tag" > "\$tmp_tag"
+sync "\$tmp_img" "\$tmp_tag"
+mv "\$tmp_img" "\$final_img"
+mv "\$tmp_tag" "\$final_tag"
+"""
+}
+
+
+// ============================================================================
+// Run-Tests stage helpers
+// ============================================================================
+
+Map<String, Closure> buildParallelStageMap() {
+  def branches = [:]
+  eachActiveShard { row, id ->
+    String stage = shardStageName(row, id)
+    String stash = shardStashName(row, id)
+    branches[stage] = { runShard(row, id, stage, stash) }
+  }
+  if (paramBool('local_setup')) {
+    branches['Local Setup (non-Docker) with Vivado'] = { runLocalSetupTest() }
+  }
+  return branches
+}
+
+void runParallelOrFail(Map<String, Closure> branches) {
+  if (!branches) {
+    error "No CI stages selected. STAGES=${paramString('STAGES')}, " +
+          "ENABLED_PARAMS=${ENABLED_PARAMS}, STAGE_FILTER='${resolveStageFilter()}'"
+  }
+  parallel(branches)
+}
+
+// rowIsActive / eachActiveShard / shardStageName / shardStashName are the
+// single source of truth for "which rows run" used by the parallel-stage
+// builder and the result-aggregation helpers.
+
+boolean rowIsActive(Map row) {
+  return ENABLED_PARAMS.contains(row.param as String)
+}
+
+String resolveStageFilter() { return paramString('STAGE_FILTER') }
+
+void eachActiveShard(Closure body) {
+  String filter = resolveStageFilter()
+  for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
+    Map row = PARALLEL_SHARDS[rowIdx]
+    if (!rowIsActive(row)) { continue }
+    int numShards = row.shards as int
+    // C-style for-loop: groovy.lang.IntRange is not Serializable and
+    // breaks CPS persistence when it survives into parallel(...).
+    for (int id = 0; id < numShards; id++) {
+      String stage = shardStageName(row, id)
+      if (filter && !stage.contains(filter)) { continue }
+      body.call(row, id)
+    }
+  }
+}
+
+String shardStageName(Map row, int id) {
+  return row.shards == 1 ? row.stage : "${row.stage} (${id + 1}/${row.shards})"
+}
+
+String shardStashName(Map row, int id) {
+  String base = row.stage.toLowerCase().replaceAll(/[^a-z0-9]+/, '_').replaceAll(/^_|_$/, '')
+  return row.shards == 1 ? base : "${base}_${id + 1}"
+}
+
 void runShard(Map row, int shardIdx, String stageName, String stashName) {
   node('finn-build') {
     withAgentNfsEnv {
@@ -579,8 +452,8 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
   }
 }
 
-// Inner try/catch surfaces tool logs + tarballs them for Blue Ocean triage
-// before the outer catchError marks the stage red.
+// Inner try/catch surfaces tool logs and tarballs them for Blue Ocean
+// triage before the outer catchError marks the stage red.
 void runShardBody(Map row, int shardIdx, String stageName, String stashName, String buildDir, String startMarker) {
   try {
     Map opts = [
@@ -614,11 +487,9 @@ void runShardBody(Map row, int shardIdx, String stageName, String stashName, Str
   }
 }
 
-// Pinned to a local-build host because finn-build hosts are not
-// guaranteed to have the apt/python3.10 prerequisites that setup-local.sh expects. Run
-// scripts/install-system-deps.sh on the agent once before enabling.
-// pip and XDG caches go to /scratch/jenkins because /home/cse-jenkins is
-// small and a cold pip install overflows it.
+// Pinned to a local-build host because finn-build hosts may not have the
+// apt/python3.10 prerequisites setup-local.sh expects. pip and XDG caches
+// go to /scratch/jenkins because /home/cse-jenkins is small.
 void runLocalSetupTest() {
   node('finn-local-build') {
     withAgentNfsEnv {
@@ -662,75 +533,52 @@ source scripts/finn-env.sh
   }
 }
 
-// catchError keeps a stash hiccup from masking pytest's own pass/fail. The
-// SW form stashes the full per-shard sidecar set, see _common.groovy.
-void safeStashReport(String stashName) { loadCommonOnce().safeStashShardReport(stashName) }
-
-// Swallowing the missing-stash exception lets aggregation still see the rest.
-void unstashIfPresent(String stashName) { loadCommonOnce().unstashIfPresent(stashName) }
-
-void archiveStageFolder(String folder) {
-  catchError(buildResult: null, stageResult: null,
-             message: "archiveArtifacts(${folder}) failed, non-fatal") {
-    archiveArtifacts artifacts: "${folder}/**/*", allowEmptyArchive: true
+// FINN_CI_MARKER passes the marker via env to dodge shell injection.
+// FINN_CI_TIMINGS_FILE is optional: when no snapshot is available the
+// conftest plugin falls back to deterministic round-robin sharding.
+void runPytest(Map opts) {
+  def parts = ["python -m pytest -m \"\$FINN_CI_MARKER\""]
+  if (opts.workers) {
+    parts << "-n ${opts.workers} --dist ${opts.distMode ?: 'worksteal'}"
   }
+  int numShards = (opts.numShards ?: 0) as int
+  if (numShards > 0) {
+    parts << "--num-shards ${numShards} --shard-id ${opts.shardId}"
+  }
+  parts << "--junitxml=${opts.stash}.xml --html=${opts.stash}.html --self-contained-html"
+  if (opts.extraArgs) { parts << opts.extraArgs }
+  def cmd = parts.join(' ')
+  echo "runPytest[${opts.stash}]: FINN_CI_MARKER='${opts.marker}' cmd=${cmd}"
+  String timingsFile = ''
+  if (FINN_CI_TIMINGS_SNAPSHOT && fileExists(FINN_CI_TIMINGS_SNAPSHOT)) {
+    timingsFile = "${opts.stash}.timings_input.json"
+    sh "cp ${shellQuote(FINN_CI_TIMINGS_SNAPSHOT)} ${shellQuote(timingsFile)}"
+  } else if (FINN_CI_TIMINGS_SNAPSHOT) {
+    echo "runPytest[${opts.stash}]: ${FINN_CI_TIMINGS_SNAPSHOT} not visible on ${env.NODE_NAME}, falling back to round-robin sharding"
+  }
+  def envLines = [
+      "export FINN_CI_MARKER=${shellQuote(opts.marker as String)}",
+      "export FINN_CI_STAGE=${shellQuote(opts.stage as String)}",
+      "export FINN_CI_STASH=${shellQuote(opts.stash as String)}",
+      "export FINN_CI_JOB_NAME=${shellQuote(env.JOB_NAME ?: '')}",
+      "export FINN_CI_BUILD_NUMBER=${shellQuote(env.BUILD_NUMBER ?: '')}",
+      "export FINN_CI_TIMINGS_FILE=${shellQuote(timingsFile)}",
+  ]
+  // run-tests.sh sits at workspace root; each parallel branch gets its own
+  // @N workspace from Jenkins so two shards on the same agent never race.
+  writeFile file: 'run-tests.sh', text:
+      "#!/bin/bash\nset -o pipefail\n${envLines.join('\n')}\n${cmd}\n"
+  sh 'chmod 755 run-tests.sh'
+  runDockerCommand('./run-docker.sh ./run-tests.sh')
 }
 
-// Per-tool run counts + hosts so Blue Ocean shows LSF fan-out. Body lives
-// in docker/jenkins/scripts/lsf_summary.sh so it can be shellcheck'd.
-void printLsfSummary(String buildDir, String stashName) {
-  catchError(buildResult: null, stageResult: null,
-             message: "printLsfSummary(${stashName}) failed, non-fatal") {
-    sh "docker/jenkins/scripts/lsf_summary.sh " +
-       "${shellQuote(buildDir)} ${shellQuote(env.NODE_NAME ?: '')} ${shellQuote(stashName)}"
-  }
-}
 
-// Per-test failure summary from JUnit XML. Covers cases printFailureTails
-// misses when no tool log exists (notebook timeouts, asserts, fixture errors).
-// Body lives in docker/jenkins/scripts/print_pytest_failures.py so it is
-// flake8-lintable.
-void printPytestFailures(String stashName, int linesPerFailure, int maxFailures) {
-  catchError(buildResult: null, stageResult: null,
-             message: "printPytestFailures(${stashName}) failed, non-fatal") {
-    String xml = "${stashName}.xml"
-    if (!fileExists(xml)) {
-      echo "[pytest-failures ${stashName}] no JUnit XML at ${xml}"
-      return
-    }
-    sh "python3 docker/jenkins/scripts/print_pytest_failures.py " +
-       "${shellQuote(xml)} ${shellQuote(stashName)} ${linesPerFailure} ${maxFailures}"
-  }
-}
+// ============================================================================
+// Check-Stage-Results stage helpers
+// ============================================================================
 
-// Tail every tool log with an ERROR: marker so the Jenkins console shows
-// the actual error without downloading the artifact tarball. Body lives in
-// docker/jenkins/scripts/failure_tails.sh so it can be shellcheck'd.
-void printFailureTails(String buildDir, String stashName, int tailLines) {
-  catchError(buildResult: null, stageResult: null,
-             message: "printFailureTails(${stashName}) failed, non-fatal") {
-    sh "docker/jenkins/scripts/failure_tails.sh " +
-       "${shellQuote(buildDir)} ${shellQuote(stashName)} ${tailLines}"
-  }
-}
-
-// One tarball per failed shard, keyed on stashName to avoid archive
-// collisions. Body lives in docker/jenkins/scripts/archive_failure_logs.sh
-// so it can be shellcheck'd. The script reads FINN_LSF_NFS_STAGING from
-// the environment because LSF staging logs live outside the build dir.
-void archiveFailureLogs(String buildDir, String stashName, String startMarker) {
-  catchError(buildResult: null, stageResult: null,
-             message: "archiveFailureLogs(${stashName}) failed, non-fatal") {
-    String tarball = "failure_logs/${stashName}.tar.gz"
-    String absTarball = "${env.WORKSPACE}/${tarball}"
-    sh "docker/jenkins/scripts/archive_failure_logs.sh " +
-       "${shellQuote(buildDir)} ${shellQuote(absTarball)} ${shellQuote(startMarker)}"
-    archiveArtifacts artifacts: tarball, allowEmptyArchive: true
-  }
-}
-
-// junit first (workspace-local, never flakes). html merge/archive after,
-// because agent-to-controller tar transfer can flake on large globs.
+// junit first (workspace-local, never flakes); html merge and artifact
+// archive after, because agent-to-controller transfer can flake on large globs.
 void aggregateReports() {
   sh 'mkdir -p reports'
   cleanPreviousBuildFiles('reports')
@@ -763,9 +611,8 @@ void aggregateReports() {
   }
 }
 
-// Sole writer of currentBuild.description on the SW pipeline. The HW pipeline
-// owns its own currentBuild.description via archiveBuildInfo, the two never
-// share a build.
+// Sole writer of currentBuild.description on the build pipeline (the HW
+// pipeline owns its own via archiveBuildInfo).
 void publishStageMap() {
   catchError(buildResult: null, stageResult: null,
              message: 'publishStageMap failed, non-fatal') {
@@ -780,7 +627,6 @@ void publishStageMap() {
   }
 }
 
-// Warns when a shard exceeds 1.5x its family median wall clock.
 void echoShardTimings() {
   catchError(buildResult: null, stageResult: null,
              message: 'echoShardTimings failed, non-fatal') {
@@ -797,20 +643,14 @@ void mergeShardMaps() {
   }
 }
 
-// Soft check that every active row declaring zipArtifacts produced its
-// READY marker this build. Reads the canonical boardZipPath rather than
-// workspace dirs, so it catches a row that silently failed to write the
-// zip even though pytest itself passed. Marks the build UNSTABLE so HW
-// pipeline operators see the regression without losing the per-board
-// fallback to the previous READY. In local fallback mode (no shared
-// artifact tree) this is a no-op: the Validate banner already explained
-// that handoff is disabled.
+// Marks UNSTABLE when an active row declared zipArtifacts but no READY
+// was produced. Local fallback is a no-op (banner already flagged it).
 void assertZipArtifactsEmitted() {
   catchError(buildResult: null, stageResult: null,
              message: 'assertZipArtifactsEmitted failed, non-fatal') {
     if (!finnArtifactsRoot()) {
       if (hasActiveArtifactRows()) {
-        unstable "FINN_CI_NFS_ROOT unset: SW->HW handoff not staged this build (rows that would publish: " +
+        unstable "FINN_CI_NFS_ROOT unset: build-to-HW handoff not staged this build (rows that would publish: " +
                  activeArtifactRowSummary() + "). Set FINN_CI_NFS_ROOT to enable handoff."
       } else {
         echo "assertZipArtifactsEmitted: local fallback mode (no shared artifact tree), skipping"
@@ -818,7 +658,6 @@ void assertZipArtifactsEmitted() {
       return
     }
     def missing = []
-    // CPS: see eachActiveShard for the IntRange/closure-serialisation caveat.
     for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
       Map row = PARALLEL_SHARDS[rowIdx]
       if (!rowIsActive(row)) { continue }
@@ -859,97 +698,18 @@ boolean shouldUpdatePersistentTimingState() {
   return result == 'SUCCESS' && paramString('STAGES') == 'full' && !resolveStageFilter()
 }
 
-// Derived from PARALLEL_SHARDS so adding a new row auto-includes it here.
 List<String> expectedStashes() {
   def stashes = []
   eachActiveShard { row, id -> stashes << shardStashName(row, id) }
   return stashes
 }
 
-// Pre-create as the unprivileged user so Docker's -v doesn't bind as root.
-// Hard-fail on root-owned residue so an admin can sudo rm. Thin wrapper so
-// the call sites stay short; helper body lives in _common.groovy.
-void cleanPreviousBuildFiles(String buildDir) {
-  loadCommonOnce().cleanPreviousBuildFiles(buildDir)
-}
-
-// Fail fast on low scratch space so pytest does not hit ENOSPC mid-run.
-void checkAgentFreeSpace(int minFreeGB) {
-  if (minFreeGB <= 0) { return }
-  String target = env.FINN_HOST_BUILD_DIR ?: '/scratch'
-  // Climb to the nearest existing ancestor because df on a missing path
-  // returns empty and the shard's own dir is not yet mkdir'd.
-  def raw = sh(returnStdout: true, script: """
-d='${target}'
-while [ ! -d "\$d" ] && [ "\$d" != '/' ]; do d=\$(dirname "\$d"); done
-df -BG "\$d" | awk 'NR==2 {print \$4}' | tr -d 'G'
-""").trim()
-  int freeGB = raw.isInteger() ? raw.toInteger() : -1
-  echo "checkAgentFreeSpace[${env.NODE_NAME}]: ${freeGB} GB free (probed ${target}, threshold ${minFreeGB} GB)"
-  if (freeGB < 0) {
-    echo "checkAgentFreeSpace[${env.NODE_NAME}]: could not parse df output (${raw.take(80)}), skipping precheck"
-    return
-  }
-  if (freeGB < minFreeGB) {
-    error "agent ${env.NODE_NAME} has only ${freeGB} GB free on ${target} (< ${minFreeGB} GB threshold), aborting shard to avoid mid-run disk exhaustion."
-  }
-}
-
-// Marker via env var to prevent shell injection. Wrapper script stops
-// run-docker.sh re-tokenising the -m argv. Exit-5 mapping lives in
-// tests/conftest.py pytest_sessionfinish so the shell wrapper does not
-// need to know about pytest exit codes.
-//
-// run-tests.sh is written at workspace root: that is concurrency-safe
-// because each parallel branch runs inside its own node('finn-build') {
-// stage(...) } block, and Jenkins gives each concurrent stage on the same
-// agent a workspace suffixed with @2/@3/... so two shards never share the
-// same workspace path.
-void runPytest(Map opts) {
-  def parts = ["python -m pytest -m \"\$FINN_CI_MARKER\""]
-  if (opts.workers) {
-    parts << "-n ${opts.workers} --dist ${opts.distMode ?: 'worksteal'}"
-  }
-  int numShards = (opts.numShards ?: 0) as int
-  if (numShards > 0) {
-    parts << "--num-shards ${numShards} --shard-id ${opts.shardId}"
-  }
-  parts << "--junitxml=${opts.stash}.xml --html=${opts.stash}.html --self-contained-html"
-  if (opts.extraArgs) { parts << opts.extraArgs }
-  def cmd = parts.join(' ')
-  echo "runPytest[${opts.stash}]: FINN_CI_MARKER='${opts.marker}' cmd=${cmd}"
-  // FINN_CI_TIMINGS_FILE is optional: when no snapshot is available
-  // (cold-start, FINN_CI_NFS_ROOT unset, NFS unreachable, etc) the
-  // conftest plugin falls back to deterministic round-robin shard
-  // assignment.
-  String timingsFile = ''
-  if (FINN_CI_TIMINGS_SNAPSHOT && fileExists(FINN_CI_TIMINGS_SNAPSHOT)) {
-    timingsFile = "${opts.stash}.timings_input.json"
-    sh "cp ${shellQuote(FINN_CI_TIMINGS_SNAPSHOT)} ${shellQuote(timingsFile)}"
-  } else if (FINN_CI_TIMINGS_SNAPSHOT) {
-    echo "runPytest[${opts.stash}]: ${FINN_CI_TIMINGS_SNAPSHOT} not visible on ${env.NODE_NAME}, falling back to round-robin sharding"
-  }
-  def envLines = [
-      "export FINN_CI_MARKER=${shellQuote(opts.marker as String)}",
-      "export FINN_CI_STAGE=${shellQuote(opts.stage as String)}",
-      "export FINN_CI_STASH=${shellQuote(opts.stash as String)}",
-      "export FINN_CI_JOB_NAME=${shellQuote(env.JOB_NAME ?: '')}",
-      "export FINN_CI_BUILD_NUMBER=${shellQuote(env.BUILD_NUMBER ?: '')}",
-      "export FINN_CI_TIMINGS_FILE=${shellQuote(timingsFile)}",
-  ]
-  writeFile file: 'run-tests.sh', text:
-      "#!/bin/bash\nset -o pipefail\n${envLines.join('\n')}\n${cmd}\n"
-  sh 'chmod 755 run-tests.sh'
-  runDockerCommand('./run-docker.sh ./run-tests.sh')
-}
-
-void runDockerCommand(String command) { loadCommonOnce().runDockerCommand(command) }
-
+// One canonical board zip per (testType, board) across all active rows.
+// Iterates a LinkedHashSet so per-board parallel order is stable.
 void aggregatePublishedBoardZips() {
   catchError(buildResult: null, stageResult: null,
              message: 'aggregatePublishedBoardZips failed, non-fatal') {
     def pairs = new LinkedHashSet<String>()
-    // CPS: see eachActiveShard for the IntRange/closure-serialisation caveat.
     for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
       Map row = PARALLEL_SHARDS[rowIdx]
       if (!rowIsActive(row)) { continue }
@@ -969,6 +729,8 @@ void aggregatePublishedBoardZips() {
   }
 }
 
+// Atomic rename-then-touch: the .READY sibling appears only after the zip
+// is in place, so HW never observes a half-written zip.
 void publishBoardZip(String testType, String board) {
   String artifactRoot = artifactBuildRoot()
   if (!artifactRoot) {
@@ -1003,9 +765,9 @@ void publishBoardZip(String testType, String board) {
   }
 }
 
-// Silent no-op when hw_deployment_* is absent or local-fallback mode is
-// active. Each shard stages its deployment tree separately, and
-// aggregateReports() publishes the one canonical board zip.
+// Each shard stages its deployment tree under deployments/<testType>/<board>/<shard>/;
+// aggregateReports() then publishes one canonical board zip per (testType, board).
+// No-op when hw_deployment_* is absent or the artifact tree is unavailable.
 void findCopyZip(String testType, String board, String findDir, String copyDir) {
   if (!testType) {
     error "findCopyZip(${board}): row has zipArtifacts.boards but no zipArtifacts.hwTestType"
@@ -1042,3 +804,189 @@ EOF
   """
   echo "findCopyZip(${testType}/${board}): staged deployments under ${stageDir}"
 }
+
+
+// ============================================================================
+// Cross-cutting helpers
+// ============================================================================
+
+// Cold start so stale outputs do not mask ordering bugs in a reused
+// workspace. Post-clean status check hard-fails on root-owned residue.
+void wipeStaleWorkspace() {
+  sh '''
+    git clean -ffdx
+    dirty=$(git status --porcelain)
+    if [ -n "$dirty" ]; then
+      n=$(echo "$dirty" | wc -l)
+      echo "wipeStaleWorkspace: ${n} dirty path(s) after git clean -ffdx (showing first 20):"
+      echo "$dirty" | head -20
+      exit 1
+    fi
+  '''
+}
+
+// Must run after node binding so ${NODE_NAME} resolves before
+// FINN_DOCKER_EXTRA is interpolated. Hostname pin is unconditional: bsub's
+// gethostbyname() on the default finn_dev_<user> fails with "Error 0".
+void withAgentNfsEnv(Closure body) {
+  String node = env.NODE_NAME ?: 'localhost'
+  String dockerExtra = "${env.FINN_DOCKER_EXTRA ?: ''} --hostname ${node}"
+  List<String> envList = []
+  String cachesDir = finnAgentCachesDir(node)
+  if (cachesDir) {
+    sh "mkdir -p ${shellQuote(cachesDir + '/xrt')} " +
+       "${shellQuote(cachesDir + '/finn_cache')} " +
+       "${shellQuote(cachesDir + '/vivado_ip_cache')}"
+    dockerExtra += " -v ${cachesDir}/vivado_ip_cache:/tmp/vivado_ip_cache"
+    envList << "FINN_XRT_PATH=${cachesDir}/xrt"
+    envList << "FINN_DOCKER_CACHE_DIR=${cachesDir}/finn_cache"
+  }
+  envList << "FINN_DOCKER_EXTRA=${dockerExtra}"
+  String imageDir = buildDockerImageDir()
+  if (imageDir) {
+    envList << "FINN_DOCKER_SHARED_IMAGE_DIR=${imageDir}"
+  } else {
+    envList << "FINN_DOCKER_PREBUILT=0"
+  }
+  withEnv(envList) { body() }
+}
+
+// jobKey sanitisation lives in ci_sharding.py so build and HW pipelines
+// cannot diverge. Populated eagerly by loadStageConfig() during Validate.
+String finnCiJobKey() {
+  if (!FINN_CI_JOB_KEY) {
+    error "finnCiJobKey: FINN_CI_JOB_KEY is unset. loadStageConfig() must run before any helper that reads it."
+  }
+  return FINN_CI_JOB_KEY
+}
+
+String artifactBuildRoot() {
+  String base = finnArtifactsRoot()
+  if (!base) { return '' }
+  return "${base}/ci_runs/${finnCiJobKey()}/${env.BUILD_NUMBER}"
+}
+
+// Canonical build-to-HW handoff path. The build pipeline writes the zip
+// plus a sibling READY here, HW resolves per (testType, board) to the
+// newest READY zip. Errors in local fallback so a caller cannot accidentally
+// fileExists() in the agent workspace; callers MUST gate on finnArtifactsRoot().
+String boardZipPath(String testType, String board) {
+  String root = artifactBuildRoot()
+  if (!root) {
+    error "boardZipPath(${testType}/${board}): artifact tree unavailable. " +
+          "Callers must gate on finnArtifactsRoot() before invoking."
+  }
+  return "${root}/zips/${testType}/${board}.zip"
+}
+
+boolean hasActiveArtifactRows() {
+  for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
+    Map row = PARALLEL_SHARDS[rowIdx]
+    if (!rowIsActive(row)) { continue }
+    if (row.zipArtifacts) { return true }
+  }
+  return false
+}
+
+String activeArtifactRowSummary() {
+  def parts = []
+  for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
+    Map row = PARALLEL_SHARDS[rowIdx]
+    if (!rowIsActive(row)) { continue }
+    Map zipArt = row.zipArtifacts as Map
+    if (!zipArt) { continue }
+    parts << "${row.stage} -> ${(zipArt.boards ?: []).join(',')}"
+  }
+  return parts.join('; ')
+}
+
+// Per-shard scratch under ${WORKSPACE}/tmp. The workspace is per-agent
+// (NFS-shared on lab build hosts, local SSD elsewhere); git clean handles
+// rotation between runs.
+String finnCiPerBuildRoot() {
+  if (!env.BUILD_NUMBER) { error "BUILD_NUMBER is unset" }
+  String ws = env.WORKSPACE
+  if (!ws) { error "WORKSPACE is unset" }
+  return "${ws}/tmp/ci_runs/${env.BUILD_NUMBER}"
+}
+
+// Fail fast on low scratch space so pytest does not hit ENOSPC mid-run.
+void checkAgentFreeSpace(int minFreeGB) {
+  if (minFreeGB <= 0) { return }
+  String target = env.FINN_HOST_BUILD_DIR ?: '/scratch'
+  // Climb to the nearest existing ancestor so df works on a path that has
+  // not yet been mkdir'd.
+  def raw = sh(returnStdout: true, script: """
+d='${target}'
+while [ ! -d "\$d" ] && [ "\$d" != '/' ]; do d=\$(dirname "\$d"); done
+df -BG "\$d" | awk 'NR==2 {print \$4}' | tr -d 'G'
+""").trim()
+  int freeGB = raw.isInteger() ? raw.toInteger() : -1
+  echo "checkAgentFreeSpace[${env.NODE_NAME}]: ${freeGB} GB free (probed ${target}, threshold ${minFreeGB} GB)"
+  if (freeGB < 0) {
+    echo "checkAgentFreeSpace[${env.NODE_NAME}]: could not parse df output (${raw.take(80)}), skipping precheck"
+    return
+  }
+  if (freeGB < minFreeGB) {
+    error "agent ${env.NODE_NAME} has only ${freeGB} GB free on ${target} (< ${minFreeGB} GB threshold), aborting shard to avoid mid-run disk exhaustion."
+  }
+}
+
+void archiveStageFolder(String folder) {
+  catchError(buildResult: null, stageResult: null,
+             message: "archiveArtifacts(${folder}) failed, non-fatal") {
+    archiveArtifacts artifacts: "${folder}/**/*", allowEmptyArchive: true
+  }
+}
+
+void printLsfSummary(String buildDir, String stashName) {
+  catchError(buildResult: null, stageResult: null,
+             message: "printLsfSummary(${stashName}) failed, non-fatal") {
+    sh "docker/jenkins/scripts/lsf_summary.sh " +
+       "${shellQuote(buildDir)} ${shellQuote(env.NODE_NAME ?: '')} ${shellQuote(stashName)}"
+  }
+}
+
+void printPytestFailures(String stashName, int linesPerFailure, int maxFailures) {
+  catchError(buildResult: null, stageResult: null,
+             message: "printPytestFailures(${stashName}) failed, non-fatal") {
+    String xml = "${stashName}.xml"
+    if (!fileExists(xml)) {
+      echo "[pytest-failures ${stashName}] no JUnit XML at ${xml}"
+      return
+    }
+    sh "python3 docker/jenkins/scripts/print_pytest_failures.py " +
+       "${shellQuote(xml)} ${shellQuote(stashName)} ${linesPerFailure} ${maxFailures}"
+  }
+}
+
+void printFailureTails(String buildDir, String stashName, int tailLines) {
+  catchError(buildResult: null, stageResult: null,
+             message: "printFailureTails(${stashName}) failed, non-fatal") {
+    sh "docker/jenkins/scripts/failure_tails.sh " +
+       "${shellQuote(buildDir)} ${shellQuote(stashName)} ${tailLines}"
+  }
+}
+
+// FINN_LSF_NFS_STAGING (used inside the helper for the LSF staging tails)
+// is read from the environment because the staging dir lives outside the
+// per-build dir.
+void archiveFailureLogs(String buildDir, String stashName, String startMarker) {
+  catchError(buildResult: null, stageResult: null,
+             message: "archiveFailureLogs(${stashName}) failed, non-fatal") {
+    String tarball = "failure_logs/${stashName}.tar.gz"
+    String absTarball = "${env.WORKSPACE}/${tarball}"
+    sh "docker/jenkins/scripts/archive_failure_logs.sh " +
+       "${shellQuote(buildDir)} ${shellQuote(absTarball)} ${shellQuote(startMarker)}"
+    archiveArtifacts artifacts: tarball, allowEmptyArchive: true
+  }
+}
+
+// Thin wrappers over docker/jenkins/_common.groovy.
+void safeStashReport(String stashName)        { loadCommonOnce().safeStashShardReport(stashName) }
+void unstashIfPresent(String stashName)       { loadCommonOnce().unstashIfPresent(stashName) }
+void cleanPreviousBuildFiles(String buildDir) { loadCommonOnce().cleanPreviousBuildFiles(buildDir) }
+void runDockerCommand(String command)         { loadCommonOnce().runDockerCommand(command) }
+boolean paramBool(String name)                { return loadCommonOnce().paramBool(name) }
+String  paramString(String name)              { return loadCommonOnce().paramString(name) }
+String  shellQuote(String s)                  { return loadCommonOnce().shellQuote(s) }

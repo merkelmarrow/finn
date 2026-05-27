@@ -81,8 +81,7 @@ RUN apt-get update && \
     g++-10 \
     cmake \
     tcsh
-# tcsh: LSF esub scripts ship with a `#!/bin/csh -f` shebang, so any
-# bsub from inside this container fails without it.
+# tcsh: required by LSF esub scripts (they ship with a /bin/csh shebang).
 RUN echo "StrictHostKeyChecking no" >> /etc/ssh/ssh_config
 RUN locale-gen "en_US.UTF-8"
 

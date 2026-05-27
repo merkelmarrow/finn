@@ -1,11 +1,7 @@
-// Shared utilities for docker/jenkins/Jenkinsfile and docker/jenkins/Jenkinsfile_HW.
-// Loaded via load() in each Jenkinsfile once the SCM checkout has dropped the
-// repo onto the active node, then accessed through thin top-level wrappers in
-// the calling Jenkinsfile so existing call sites read the same as before.
-//
-// Adding a helper here keeps both pipelines from drifting. Helpers that are
-// genuinely pipeline-specific (e.g. PARALLEL_SHARDS, HW_SHARDS, the various
-// printLsfSummary helpers) stay in their owning Jenkinsfile.
+// Shared helpers loaded by both Jenkinsfile (build pipeline) and Jenkinsfile_HW.
+// Helpers that genuinely diverge between the two pipelines (e.g. safeStash,
+// cleanPreviousBuildFiles) expose distinct entry points instead of being
+// parameterised here.
 
 boolean paramBool(String name) {
   def v = params.get(name)
@@ -23,9 +19,8 @@ String shellQuote(String s) {
   return "'" + (s ?: '').replace("'", "'\"'\"'") + "'"
 }
 
-// Hints run-docker.sh with FINN_DOCKER_PREBUILT=1 when a shared image is
-// configured so non-builder agents docker-load from NFS instead of rebuilding.
-// Falls through to a local image build in local-fallback mode.
+// Sets FINN_DOCKER_PREBUILT=1 when a shared image is configured so non-builder
+// agents load the image from NFS instead of rebuilding.
 void runDockerCommand(String command) {
   if (env.FINN_DOCKER_SHARED_IMAGE_DIR) {
     withEnv(['FINN_DOCKER_PREBUILT=1']) {
@@ -44,9 +39,8 @@ void unstashIfPresent(String stashName) {
   }
 }
 
-// SW form: stashes the full per-shard report sidecar set (xml, html,
-// timings.json, shardmap.*, stagemap). allowEmpty=true because not every
-// shard produces every sidecar.
+// Build pipeline stashes the full per-shard report sidecar set; some are missing
+// when a shard fails early, so allowEmpty is true.
 void safeStashShardReport(String stashName) {
   catchError(buildResult: null, stageResult: null,
              message: "safeStashReport(${stashName}) failed, aggregation may be partial") {
@@ -57,9 +51,8 @@ void safeStashShardReport(String stashName) {
   }
 }
 
-// HW form: stash only when the JUnit XML exists, with a different filename
-// pattern from the stashName (HW tests file their reports under
-// "${testType}_hw_${board}" while the stash is keyed on "${testType}_${board}").
+// HW pipeline files reports under ${testType}_hw_${board} but stashes them
+// keyed on ${testType}_${board}, so fileBase is passed explicitly.
 void safeStashHwReport(String stashName, String fileBase) {
   catchError(buildResult: null, stageResult: null,
              message: "safeStashReport(${stashName}) failed, aggregation may be partial") {
@@ -71,8 +64,8 @@ void safeStashHwReport(String stashName, String fileBase) {
   }
 }
 
-// SW form: rm with tolerance, hard-fail on root-owned residue, then mkdir.
-// Pre-create as the unprivileged user so docker's -v doesn't bind as root.
+// Build pipeline form: tolerant rm, hard-fail on root-owned residue, then
+// pre-create as the unprivileged user so docker -v does not bind the mount as root.
 void cleanPreviousBuildFiles(String buildDir) {
   if (!buildDir || buildDir.empty) { return }
   String q = shellQuote(buildDir)
@@ -87,30 +80,19 @@ void cleanPreviousBuildFiles(String buildDir) {
   """
 }
 
-// HW form: rm with optional sudo when HW credentials are bound, and an
-// optional sibling sweep (e.g. cleaning KV260_SOM/ also sweeps KV260_SOM.zip).
-// Targets are enumerated explicitly so the next maintainer does not have to
-// derive the behaviour from glob-expansion semantics.
-void cleanPreviousBuildFilesHw(String buildDir, boolean includeSiblings) {
+// HW form: always rm both the build dir and its sibling .zip. Every HW caller
+// wants both gone; sudo is added only when HW credentials are bound (the board
+// agents can leave root-owned residue behind).
+void cleanPreviousBuildFilesHw(String buildDir) {
   if (!buildDir || buildDir.empty) { return }
   String prefix = env.USER_CREDENTIALS ? 'echo "$USER_CREDENTIALS_PSW" | sudo -S ' : ''
-  String targets = includeSiblings
-      ? "${shellQuote(buildDir)} ${shellQuote(buildDir + '.zip')}"
-      : shellQuote(buildDir)
-  sh "${prefix}rm -rf ${targets}"
+  sh "${prefix}rm -rf ${shellQuote(buildDir)} ${shellQuote(buildDir + '.zip')}"
 }
 
-// FINN_CI_NFS_ROOT is the only env var operators set. Every shared tree
-// derives from it. Returning '' means "no NFS available" and callers
-// MUST handle the fallback (skip cache mounts, skip image publish, skip
-// artifact handoff, skip persistent timing master). Local fallback is a
-// degraded but functional mode for software-only debug runs.
+// All shared NFS subtrees derive from FINN_CI_NFS_ROOT. Returning '' from any
+// resolver means "no NFS available"; callers must handle that as a fallback.
 String finnCiNfsRoot() { return (env.FINN_CI_NFS_ROOT ?: '').trim() }
 
-// Shared "anchor a subtree under FINN_CI_NFS_ROOT" helper so every callsite
-// shares the same '' fallback semantics. Empty suffix segments collapse out
-// so finnAgentCachesDir('') (missing NODE_NAME) returns '' rather than a
-// dangling /agent_caches/ path.
 String finnSubdir(String... segments) {
   String r = finnCiNfsRoot()
   if (!r) { return '' }

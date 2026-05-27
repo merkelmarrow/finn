@@ -182,7 +182,7 @@ class CreateVitisXO(Transformation):
         # create a shell script and call Vivado
         package_xo_sh = vivado_proj_dir + "/gen_xo.sh"
         working_dir = os.environ["PWD"]
-        vivado_cmd = resolve_xilinx_tool("vivado", "FINN_VIVADO_OVERRIDE")
+        vivado_cmd = resolve_xilinx_tool("vivado")
         with open(package_xo_sh, "w") as f:
             f.write("#!/bin/bash \n")
             f.write("cd {}\n".format(vivado_proj_dir))
@@ -419,7 +419,7 @@ class VitisLink(Transformation):
         # create a shell script and call Vitis
         script = link_dir + "/run_vitis_link.sh"
         working_dir = os.environ["PWD"]
-        vxx_cmd = resolve_xilinx_tool("v++", "FINN_VXX_OVERRIDE")
+        vxx_cmd = resolve_xilinx_tool("v++")
         with open(script, "w") as f:
             f.write("#!/bin/bash \n")
             f.write("cd {}\n".format(link_dir))
@@ -450,7 +450,7 @@ class VitisLink(Transformation):
         # run Vivado to gen xml report
         gen_rep_xml_sh = link_dir + "/gen_report_xml.sh"
         working_dir = os.environ["PWD"]
-        vivado_cmd = resolve_xilinx_tool("vivado", "FINN_VIVADO_OVERRIDE")
+        vivado_cmd = resolve_xilinx_tool("vivado")
         with open(gen_rep_xml_sh, "w") as f:
             f.write("#!/bin/bash \n")
             f.write("cd {}\n".format(link_dir))

@@ -26,14 +26,11 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import errno
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.custom_op.registry import getCustomOp
 from qonnx.util.basic import gen_finn_dt_tensor, roundup_to_integer_multiple
@@ -174,29 +171,6 @@ def make_build_dir(prefix=""):
         )
 
 
-def robust_rmtree(path, retries=6, initial_delay=0.1, backoff=2.0):
-    """Remove a directory tree, retrying transient NFS ``ENOTEMPTY`` races.
-
-    Does NOT retry ``EBUSY`` on ``.nfsXXXX`` files: that signals an open fd
-    in the current process, which sleeping cannot release.
-    """
-    if not path or not os.path.exists(path):
-        return
-
-    delay = initial_delay
-    for attempt in range(retries):
-        try:
-            shutil.rmtree(path)
-            return
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            if exc.errno != errno.ENOTEMPTY or attempt == retries - 1:
-                raise
-            time.sleep(delay)
-            delay *= backoff
-
-
 class CppBuilder:
     """Builds the g++ compiler command to produces the executable of the c++ code
     in code_gen_dir which is passed to the function build() of this class."""
@@ -288,17 +262,27 @@ def which(program):
     return None
 
 
-def resolve_xilinx_tool(default_name, override_env_var):
+# Map a Xilinx tool name to its override env var. The env var lets an out-of-band
+# dispatcher (e.g. an LSF wrapper) intercept the call without a PATH shim.
+_XILINX_TOOL_OVERRIDES = {
+    "vivado": "FINN_VIVADO_OVERRIDE",
+    "v++": "FINN_VXX_OVERRIDE",
+    "vitis_hls": "FINN_VITIS_HLS_OVERRIDE",
+    "vitis-run": "FINN_VITIS_RUN_OVERRIDE",
+    "xelab": "FINN_XELAB_OVERRIDE",
+}
+
+
+def resolve_xilinx_tool(default_name):
     """Return the Xilinx-tool command to embed in generated bash scripts.
 
-    Honours ``<override_env_var>`` so an out-of-band dispatcher can intercept
-    the call at a narrower point than a PATH shim. The returned string is
-    written verbatim into the script, so a bare name or absolute path both work.
-    """
-    tool = os.environ.get(override_env_var, default_name)
+    Honours the registered override env var so a bare name or absolute path
+    both work in the script."""
+    override_env_var = _XILINX_TOOL_OVERRIDES.get(default_name)
+    tool = os.environ.get(override_env_var, default_name) if override_env_var else default_name
     assert which(tool) is not None, "%s not found in PATH (override=%s)" % (
         tool,
-        override_env_var,
+        override_env_var or "<none>",
     )
     return tool
 

@@ -46,8 +46,7 @@ from finn.transformation.qonnx.convert_qonnx_to_finn import ConvertQONNXtoFINN
 from finn.util.test import get_test_model_trained
 
 
-# Per-test tmp_path keeps xdist workers from racing on a shared filename,
-# so concurrent shards in Sanity UT do not delete each other's exports.
+# tmp_path so concurrent xdist workers do not race on a shared export path
 @pytest.mark.transform
 def test_batchnorm_to_affine_cnv_w1a1(tmp_path):
     export_onnx_path = str(tmp_path / "test_output_bn2affine.onnx")

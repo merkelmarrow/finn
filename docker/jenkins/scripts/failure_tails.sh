@@ -3,7 +3,6 @@
 #
 # Tail every tool log with an ERROR: marker so the Jenkins console shows the
 # actual error without downloading the artifact tarball.
-# Best-effort: set +e on purpose.
 set +e
 
 if [ "$#" -ne 3 ]; then

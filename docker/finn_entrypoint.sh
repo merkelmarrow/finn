@@ -28,8 +28,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
-# Fail-fast so a partial deps/ tree is caught here, not hours later as
-# ModuleNotFoundError during pytest collection.
+# Fail-fast so a partial deps/ tree is caught here, not hours later.
 set -e
 
 export HOME=/tmp/home_dir
@@ -58,9 +57,7 @@ recho () {
 }
 
 # qonnx pyproject.toml workaround for https://github.com/pypa/pip/issues/7953.
-# Trap restores the file if pip install aborts under `set -e`. Paths are
-# captured into locals before the trap so an unset-FINN_ROOT mid-script
-# cannot strand the rename in /deps/qonnx.
+# The trap restores the file if pip install aborts under `set -e`.
 _qonnx_pyproj_toml="${FINN_ROOT}/deps/qonnx/pyproject.toml"
 _qonnx_pyproj_tmp="${FINN_ROOT}/deps/qonnx/pyproject.tmp"
 mv "$_qonnx_pyproj_toml" "$_qonnx_pyproj_tmp"
@@ -121,7 +118,6 @@ else
     gecho "Found existing finn_xsi at ${FINN_ROOT}/finn_xsi/xsi.so"
   else
     gecho "Building finn_xsi using finn.xsi.setup..."
-    # if/else keeps "log and continue" semantics under `set -e`.
     if python -m finn.xsi.setup --quiet; then
       gecho "finn_xsi built successfully"
     else

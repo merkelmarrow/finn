@@ -29,11 +29,12 @@ import pytest
 
 import numpy as np
 import os
+import shutil
 import subprocess
 from qonnx.core.datatype import DataType
 from qonnx.util.basic import gen_finn_dt_tensor
 
-from finn.util.basic import make_build_dir, robust_rmtree
+from finn.util.basic import make_build_dir
 
 
 @pytest.mark.util
@@ -112,5 +113,5 @@ g++ -o test_npy2vectorstream test.cpp $FINN_ROOT/deps/cnpy/cnpy.cpp \
     # only delete generated code if test has passed
     # useful for debug otherwise
     if success:
-        robust_rmtree(test_dir)
+        shutil.rmtree(test_dir)
     assert success

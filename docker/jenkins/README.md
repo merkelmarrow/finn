@@ -1,29 +1,40 @@
 # FINN Jenkins CI maintainer guide
 
-One env var to set: `FINN_CI_NFS_ROOT`, in the Jenkins job DSL. Everything else derives from it. If unset the pipeline still runs end-to-end and produces pass/fail per shard. What is degraded is the cross-build state: no shared Docker image cache (each agent rebuilds locally), no SW->HW artifact handoff (the HW pipeline will have nothing to test against this build), no persistent timing master (sharding falls back to deterministic round-robin), and no per-agent NFS caches. Any SW build that would normally publish board artifacts marks itself UNSTABLE with a clear message at aggregate time rather than failing the entire build. HW jobs still hard-fail without `FINN_CI_NFS_ROOT` because they have nothing to read otherwise. The validation job [`finn_ci_speedup.dsl`](../../../jenkins-deploy/jenkins/xirengvm092015.xilinx.com/jobs/finn_ci_speedup.dsl) is the reference DSL for this branch.
+## TL;DR for contributors
 
-Every parallel stage is defined by one row of `STAGES` in [`ci_sharding.py`](./ci_sharding.py). The [`Jenkinsfile`](./Jenkinsfile) loads the entire config bundle during Validate with a single `python3 docker/jenkins/ci_sharding.py validate-config --choice <STAGES> --job-name <JOB_NAME>` call (which runs `validate_boards()` first), and the pytest plugin in [`tests/conftest.py`](../../tests/conftest.py) imports the same module for shard assignment and `--which-shard` lookup. Test selection is the standard `-m <marker>` expression, and shard splitting is the `--num-shards` / `--shard-id` plugin. Ordinary local pytest collection remains unchanged unless the CI sharding options are used.
+- Run a PR build: click *Build with Parameters*, leave `STAGES=sanity`, hit *Build*.
+- Debug just one family: set `STAGES=fpgadataflow` or `STAGES=end2end`.
+- Find which shard a test runs on: `pytest --collect-only --which-shard <substring>` locally, or grep `reports/shard_map.txt` on an archived build.
+- Add a new test: decorate it with the existing marker (e.g. `@pytest.mark.fpgadataflow`). The next CI run picks it up.
 
-The HW-tethered [`Jenkinsfile_HW`](./Jenkinsfile_HW) follows the same broad pattern with a separate `HW_SHARDS` table.
+The rest of this doc is the maintainer-facing detail behind those four lines.
+
+## Where the knobs live
+
+`FINN_CI_NFS_ROOT` is the only env var operators set, in the Jenkins job DSL; everything else derives from it. When unset the pipeline still runs end-to-end and produces pass/fail per shard, with the following features degraded: no shared Docker image cache (each agent rebuilds locally), no build-to-HW artifact handoff (the HW pipeline cannot test against this build), no persistent timing master (sharding falls back to deterministic round-robin), no per-agent NFS caches. Any build that would normally publish board artifacts marks itself UNSTABLE at aggregate time rather than failing the whole build. HW jobs hard-fail without `FINN_CI_NFS_ROOT` because they have nothing to read otherwise. The validation job [`finn_ci_speedup.dsl`](../../../jenkins-deploy/jenkins/xirengvm092015.xilinx.com/jobs/finn_ci_speedup.dsl) is the reference DSL.
+
+Every parallel stage is defined by one row of `STAGES` in [`ci_sharding.py`](./ci_sharding.py). The [`Jenkinsfile`](./Jenkinsfile) loads the entire config bundle during Validate with a single `python3 docker/jenkins/ci_sharding.py validate-config --choice <STAGES> --job-name <JOB_NAME>` call (which runs `validate_boards()` first), and the pytest plugin in [`tests/conftest.py`](../../tests/conftest.py) imports the same module for shard assignment and `--which-shard` lookup. Test selection is the standard `-m <marker>` expression, and shard splitting is the `--num-shards` / `--shard-id` plugin. Local pytest collection is unchanged unless the CI sharding options are used.
+
+The HW-tethered [`Jenkinsfile_HW`](./Jenkinsfile_HW) follows the same broad pattern with a separate `HW_SHARDS` table derived from `BOARDS`.
 
 ## Dynamic timing state
 
-There is no checked-in seed file. Cold start (master absent) and snapshot-unreachable both fall through to deterministic round-robin shard assignment, so the pipeline keeps working even without persistent timings. The persistent master is refreshed only by trusted full-matrix builds (`STAGES=full`, no `STAGE_FILTER`, successful build); partial sanity/debug builds still write an archived `reports/ci_timings_master.json` preview, but they do not update the shared master or advance garbage collection.
+There is no checked-in seed file. Cold start (master absent) and snapshot-unreachable both fall through to deterministic round-robin shard assignment, so the pipeline keeps working without persistent timings. The persistent master is refreshed only by trusted full-matrix builds (`STAGES=full`, no `STAGE_FILTER`, successful build); partial sanity/debug builds still write an archived `reports/ci_timings_master.json` preview, but do not update the shared master or advance garbage collection.
 
-The master schema per group is `{samples: [last MAX_SAMPLES observations], count, consecutive_rejections, last_seen_*}`. Per-group weights consumed by the bin packer are the median of `samples`, so a single anomalous observation only moves one slot in a five-element window and the median is unaffected.
+The master schema is `{"version": 1, "groups": {<name>: {"samples": [last MAX_SAMPLES observations], count, consecutive_rejections, last_seen_*}}}`. Per-group weights consumed by the bin packer are the median of `samples`, so a single anomalous observation only moves one slot in a five-element window and the median is unaffected.
 
 Two layers of anomaly protection live in `ci_sharding.update_master`:
 
-1. **Per-group rolling median + outlier rejection.** A new observation must fall within `[OUTLIER_LOW_RATIO, OUTLIER_HIGH_RATIO]` times the current median to be accepted. The crash-floor rule additionally rejects suspiciously-low observations against historically-large medians (the "shard crashed before any real test ran" pattern). Trusted full-matrix updates can force-accept after repeated rejections so real regressions (test legitimately becomes 10x slower) eventually propagate.
-2. **Build-wide anomaly veto.** When at least `MIN_ELIGIBLE_FOR_ANOMALY_VETO` observations are eligible and more than `BUILD_WIDE_ANOMALY_RATIO` of them are out-of-band in the same direction, the entire persistent update is vetoed. This catches LSF / NFS-storm days where every shard is uniformly slower and would otherwise poison every group's `consecutive_rejections` counter at once.
+1. **Per-group rolling median + outlier rejection.** A new observation must fall within `[OUTLIER_LOW_RATIO, OUTLIER_HIGH_RATIO]` times the current median to be accepted. The crash-floor rule additionally rejects suspiciously-low observations against historically-large medians (the "shard crashed before any real test ran" pattern). Trusted full-matrix updates can force-accept after `FORCE_ACCEPT_AFTER` rejections so real regressions eventually propagate.
+2. **Build-wide anomaly veto.** When at least `MIN_ELIGIBLE_FOR_ANOMALY_VETO` observations have a prior median and more than `BUILD_WIDE_ANOMALY_RATIO` of them are out-of-band, the entire persistent update is vetoed. This catches LSF / NFS-storm days where every shard is uniformly slower and would otherwise poison every group's `consecutive_rejections` counter at once.
 
-Garbage collection drops groups not observed in the last `GC_BUILDS_UNSEEN` trusted full-matrix updates, so renamed or removed tests do not leak into the master forever. Sanity/debug builds do not advance this counter.
+Garbage collection drops groups not observed in the last `GC_BUILDS_UNSEEN` trusted full-matrix updates so renamed or removed tests do not leak into the master forever. Sanity/debug builds do not advance this counter.
 
-All tunable thresholds live at the top of [`ci_sharding.py`](./ci_sharding.py). If an existing master contains older `{seconds: float}` entries, the first observation against that entry upgrades it to a one-element samples series.
+All tunable thresholds live at the top of [`ci_sharding.py`](./ci_sharding.py).
 
-## SW-to-HW zip handoff
+## Build-to-HW zip handoff
 
-The SW pipeline stages board deployment directories per shard, then Check Stage Results aggregates those staged deployments into one board bitstream zip plus a sibling `.READY` marker in the canonical per-build directory:
+The build pipeline stages board deployment directories per shard, then Check Stage Results aggregates those staged deployments into one board bitstream zip plus a sibling `.READY` marker in the canonical per-build directory:
 
     ${FINN_CI_NFS_ROOT}/artifacts/ci_runs/<jobKey>/<BUILD>/
       zips/<hwTestType>/<board>.zip
@@ -31,42 +42,42 @@ The SW pipeline stages board deployment directories per shard, then Check Stage 
       BUILD_INFO.txt
       deployments/<hwTestType>/<board>/<stash>/<board>/<model>/
 
-The `.READY` marker is the SW-to-HW handshake. It is touched only after the aggregated zip has been renamed into place, so a half-written zip or an aborted shard never leaves a READY pointing at incomplete bytes. HW resolves each `(testType, board)` pair independently to the newest build under `ci_runs/<jobKey>/` whose `<board>.zip.READY` sibling is present. A board whose build failed has no READY this build, so HW can fall back to that board's previous READY. Fallback is measured against the newest numeric SW build directory, not just the newest selected READY zip, and marks the HW build unstable unless `allow_fallback=true` is set on the HW job. There is no global READY marker and no build-wide "is this build good?" decision. The handoff has no JSON schema, no version field, no symlink: the directory layout is the contract. The persistent timing master is JSON, but lives in a separate `_ci_state/` tree under `FINN_CI_NFS_ROOT` and is not part of the SW-to-HW channel.
+The `.READY` marker is the build-to-HW handshake. It is touched only after the aggregated zip has been renamed into place, so a half-written zip or an aborted shard never leaves a READY pointing at incomplete bytes. HW resolves each `(testType, board)` pair independently to the newest build under `ci_runs/<jobKey>/` whose `<board>.zip.READY` sibling is present. A board whose build failed has no READY this build, so HW falls back to that board's previous READY. Fallback is measured against the newest numeric build directory, not just the newest selected READY zip, and marks the HW build unstable unless `allow_fallback=true` is set on the HW job. There is no global READY marker and no build-wide "is this build good?" decision; the directory layout is the contract. The persistent timing master is JSON but lives in a separate `_ci_state/` tree under `FINN_CI_NFS_ROOT` and is not part of the build-to-HW channel.
 
-`FINN_CI_NFS_ROOT` is required by the HW pipeline (which has nothing to read otherwise) and is recommended for any SW run that you expect to feed HW (rows with `zipArtifacts`). SW runs without it still complete, with handoff steps no-oping and an UNSTABLE marker at aggregate time so HW operators see the build was not a full feeder. A `STAGES` row that produces these zips declares a `zipArtifacts` nested key:
+`FINN_CI_NFS_ROOT` is required by the HW pipeline and recommended for any build run that you expect to feed HW (rows with `zipArtifacts`). Builds without it still complete, with handoff steps no-oping and an UNSTABLE marker at aggregate time so HW operators see the build was not a full feeder. A `STAGES` row that produces these zips declares a `zipArtifacts` nested key:
 
 ```python
 "zipArtifacts": {"hwTestType": "bnn_build_full", "boards": ["U250"]}
 ```
 
-`hwTestType` (today `bnn_build_sanity` or `bnn_build_full`) selects which HW pipeline category the zip feeds. `boards` is the list of board zips the row produces. The nested shape means the pair is either present or absent, so no separate pairing assertion is needed in Validate.
+`hwTestType` (today `bnn_build_sanity` or `bnn_build_full`) selects which HW pipeline category the zip feeds. `boards` lists the board zips the row produces. The nested shape means the pair is either present or absent.
 
-Operators pin to a specific SW build for debugging by setting the `sw_build_dir` parameter on the HW job (full path to a single SW build directory, forces every board through that one directory). `sw_job_name` (default `finn`) selects which job's `ci_runs/<jobKey>/` tree to scan for per-board READY zips.
+Operators pin to a specific build for debugging by setting the `build_dir` parameter on the HW job (full path to a single build directory, forces every board through that one directory). `build_job_name` (default `finn`) selects which job's `ci_runs/<jobKey>/` tree to scan for per-board READY zips.
 
-`BUILD_INFO.txt` is plain `KEY=VALUE` per line. It is never parsed by code, just `cat` it to find out the job/build/commit/branch/date/enabled-params/timings-snapshot/docker-image-dir/validate-node for any given build directory. The HW pipeline archives the BUILD_INFO.txt of every distinct SW build it pulled a zip from, named `sw_build_info_<N>.txt`, and lists the per-board source builds in the HW build description.
+`BUILD_INFO.txt` is plain `KEY=VALUE` per line. It is never parsed by code; `cat` it for the job/build/commit/branch/date/enabled-params/timings-snapshot/docker-image-dir/validate-node of any given build directory. The HW pipeline archives each distinct source build's BUILD_INFO.txt as `build_info_<N>.txt` and lists the per-board source builds in the HW build description.
 
 There is no operator-controlled promotion knob. The Jenkinsfile updates the persistent timing master only for successful full-matrix builds, while every build archives a preview for inspection.
 
 ## Per-build storage and retention
 
-Set `FINN_CI_NFS_ROOT` once on the Jenkins controller (in the job DSL) and the SW pipeline derives every shared subtree from it. There are no other CI storage env vars to set. If `FINN_CI_NFS_ROOT` is unset the pipeline runs in local fallback mode; Validate prints a banner listing the disabled features (no shared Docker image, no SW->HW handoff, no persistent timing master, no per-agent NFS caches) and the build completes with handoff steps no-oping. `assertZipArtifactsEmitted` marks the build UNSTABLE at aggregate time if the selected rows would normally have published board artifacts, so the operator sees the regression without a fatal stop.
+Set `FINN_CI_NFS_ROOT` once on the Jenkins controller (in the job DSL) and the build pipeline derives every shared subtree from it. There are no other CI storage env vars to set. If `FINN_CI_NFS_ROOT` is unset the pipeline runs in local fallback mode; Validate prints a banner listing the disabled features and the build completes with handoff steps no-oping. `assertZipArtifactsEmitted` marks the build UNSTABLE at aggregate time if the selected rows would normally have published board artifacts.
 
-| Tree | Path under `FINN_CI_NFS_ROOT` | Subcommand | Policy |
+| Tree | Path under `FINN_CI_NFS_ROOT` | Subcommand | Retention |
 | --- | --- | --- | --- |
 | Per-agent caches | `agent_caches/<NODE>/{xrt,finn_cache,vivado_ip_cache}` | n/a (long-lived) | n/a |
-| Shared Docker image | `docker_images/<jobKey>/<BUILD>/` | `prune-images` | `TRANSIENT_RETENTION` (retain=3, ageDays=14) |
-| SW-to-HW handoff | `artifacts/ci_runs/<jobKey>/<BUILD>/` | `prune-artifacts` | `HANDOFF_RETENTION` (retain=30, ageDays=30) |
+| Shared Docker image | `docker_images/<jobKey>/<BUILD>/` | `prune-images` | retain=3, ageDays=14 |
+| Build-to-HW handoff | `artifacts/ci_runs/<jobKey>/<BUILD>/` | `prune-artifacts` | retain=30, ageDays=30 |
 | Timing master + snapshots | `_ci_state/<jobKey>/` | n/a (in-place updates) | n/a |
 
-Per-shard scratch lives at `${WORKSPACE}/tmp/ci_runs/<BUILD>/<stash>` regardless of `FINN_CI_NFS_ROOT`: the workspace is per-agent (NFS-mounted via `remote_fs` on lab build hosts, local SSD elsewhere) and `git clean -ffdx` between runs handles rotation, so no explicit prune subcommand is needed for it.
+Per-shard scratch lives at `${WORKSPACE}/tmp/ci_runs/<BUILD>/<stash>` regardless of `FINN_CI_NFS_ROOT`. The workspace is per-agent (NFS-mounted via `remote_fs` on lab build hosts, local SSD elsewhere); `git clean -ffdx` between runs handles rotation.
 
-When a shared Docker image directory is configured, non-build stages run `run-docker.sh` with `FINN_DOCKER_PREBUILT=1`. In that mode `run-docker.sh` treats `FINN_DOCKER_SHARED_IMAGE_DIR` (set by the Jenkinsfile, not by the operator) as authoritative, always verifies or loads that build-scoped image even when a same-tag local image exists, and fails fast if the shared image is missing, unusable, or tagged differently. In local fallback mode, the Jenkinsfile forces `FINN_DOCKER_PREBUILT=0` so each agent can build locally.
+When a shared Docker image directory is configured, non-build stages run `run-docker.sh` with `FINN_DOCKER_PREBUILT=1`. In that mode `run-docker.sh` treats `FINN_DOCKER_SHARED_IMAGE_DIR` (set by the Jenkinsfile, not by the operator) as authoritative, always verifies or loads that build-scoped image even when a same-tag local image exists, and fails fast if the shared image is missing, unusable, or tagged differently. In local fallback mode the Jenkinsfile forces `FINN_DOCKER_PREBUILT=0` so each agent can build locally.
 
-Validate rotates the image and artifact trees via the single `rotateBuildTrees()` helper in [`Jenkinsfile`](./Jenkinsfile). Each rotation keeps the newest N numeric subdirs and the current build, and deletes older subdirs whose mtime exceeds M days. Both subcommands skip silently when their parent directory does not exist, and the Python side tolerates concurrent rmtree races (a second CI run pruning the same parent will not abort the rotation).
+Validate rotates the image and artifact trees via the single `rotateBuildTrees()` helper in [`Jenkinsfile`](./Jenkinsfile). Each rotation keeps the newest N numeric subdirs and the current build, and deletes older subdirs whose mtime exceeds M days. Both subcommands skip silently when their parent directory does not exist, and the Python side tolerates concurrent rmtree races.
 
-`jobKey` is `JOB_NAME` sanitised by `ci_sharding.job_key()` to one path segment, leading/trailing dots stripped so `JOB_NAME=".."` cannot escape into the parent directory. The SW pipeline reads the sanitised value out of the `validate-config` payload during Validate; `Jenkinsfile_HW` still shells out via the standalone `python3 docker/jenkins/ci_sharding.py job-key <name>` subcommand because it does not load the full config bundle. Either way the sanitisation rule has one source of truth. The retention values live in the `RETENTION` dict at the top of [`ci_sharding.py`](./ci_sharding.py) and ride out via the same `validate-config` payload, so tuning is a one-file change.
+`jobKey` is `JOB_NAME` sanitised by `ci_sharding.job_key()` to one path segment, leading and trailing dots stripped so `JOB_NAME=".."` cannot escape into the parent directory. The build pipeline reads the sanitised value out of the `validate-config` payload; `Jenkinsfile_HW` shells out via the standalone `job-key` subcommand because it does not load the full bundle. Either way the sanitisation rule has one source of truth. Retention values live in the `RETENTION` dict at the top of [`ci_sharding.py`](./ci_sharding.py) and ride out via the same `validate-config` payload, so tuning is a one-file change.
 
-Artifact-tree pruning is safe because HW resolves per board to the newest `.READY` zip remaining. Deleting an older build directory just makes HW fall through to the next-oldest READY on its next collect pass. Artifact retention is sized to outlast the longest single-board failure streak; HW falling back to a build older than this window indicates a separate problem (not a tuning issue).
+Artifact-tree pruning is safe because HW resolves per board to the newest `.READY` zip remaining. Deleting an older build directory just makes HW fall through to the next-oldest READY on its next collect pass. Artifact retention is sized to outlast the longest realistic single-board failure streak.
 
 A corrupt master timing file is renamed aside (`ci_timings_master.json.corrupt-<epoch>`) before the in-progress run writes its replacement, so a one-off NFS hiccup never loses the historical timing data silently.
 
@@ -107,28 +118,29 @@ Edit the `_BNN_WBITS`, `_BNN_ABITS`, and `_BNN_TOPOLOGY` constants in `tests/end
 `ci_sharding.STAGES` rows carry a `param` field that maps onto the `STAGES` Jenkins choice. To add a new family (say `quantization`):
 
 1. Add `STAGES` rows with `"param": "quantization"`.
-2. Run `python3 docker/jenkins/ci_sharding.py stage-choices-json` and mirror the generated list in [`Jenkinsfile`](./Jenkinsfile)'s declarative `choice` block.
+2. Run `python3 docker/jenkins/ci_sharding.py stage-choices-json` and mirror the generated list in [`Jenkinsfile`](./Jenkinsfile)'s declarative `choice` block. The `test_jenkinsfile_stage_choices_match_python_source` test catches drift.
+3. Add a row to the `STAGES` table further down in this README. The `test_readme_stages_table_matches_python_source` test catches drift.
 
 `enabled_params_for_choice` is dynamic and picks up the new name automatically.
 
 ### Trigger a build for a contribution PR?
 
-The `STAGES` choice param drives the matrix. The defaults are documented in the Jenkins job UI; the short summary is:
+`STAGES` is the only knob most contributors touch. The short summary:
 
 | `STAGES` value | Rows that run | Use when | Needs `FINN_CI_NFS_ROOT`? |
 |----------------|---------------|----------|---------------------------|
 | `sanity` (default) | Sanity rows only | Per-PR quick check | Recommended (publishes `bnn_build_sanity` zips for HW handoff) |
 | `full` | Every CI row | Nightly / pre-merge full matrix | Yes (otherwise no handoff and no timing master update) |
-| `fpgadataflow` | fpgadataflow row(s) only | Pure SW debug, no HW handoff produced | No |
+| `fpgadataflow` | fpgadataflow row(s) only | Pure build-side debug, no HW handoff produced | No |
 | `end2end` | end2end + BNN rows only | Debugging just the end2end family | Recommended (BNN rows publish `bnn_build_full` zips) |
 
-If `FINN_CI_NFS_ROOT` is unset, any row that would publish board artifacts no-ops at handoff time and the aggregate stage marks the build UNSTABLE with a per-board summary, so a local-only debug run still completes and an operator can see exactly what they lost.
+If `FINN_CI_NFS_ROOT` is unset, any row that would publish board artifacts no-ops at handoff time and the aggregate stage marks the build UNSTABLE with a per-board summary.
 
-`local_setup` is an orthogonal opt-in for the non-Docker Vivado setup test. `STAGE_FILTER` is a substring filter for debugging a single shard within whichever rows `STAGES` selected.
+Other narrower knobs: `local_setup` is an orthogonal opt-in for the non-Docker Vivado setup test. `STAGE_FILTER` is a substring filter for debugging a single shard within whichever rows `STAGES` selected. The HW job exposes `build_job_name`, `build_dir`, and `allow_fallback` for handoff overrides.
 
 ### Debug one stage without running the whole pipeline?
 
-Trigger a build with the matching `STAGES` value plus a `STAGE_FILTER` substring. `STAGE_FILTER` is substring-matched against the shard's display name (`<row.stage>` for `shards=1` rows, `<row.stage> (<i>/<N>)` for sharded rows), so a literal substring of the stage name works without escaping. Example: to rerun only the U250 BNN shards, set `STAGES=end2end` and `STAGE_FILTER=BNN U250`.
+Trigger a build with the matching `STAGES` value plus a `STAGE_FILTER` substring. `STAGE_FILTER` is substring-matched against the shard's display name (`<row.stage>` for `shards=1` rows, `<row.stage> (<i>/<N>)` for sharded rows). Example: to rerun only the U250 BNN shards, set `STAGES=end2end` and `STAGE_FILTER=BNN U250`.
 
 ### Pin a flaky test to a specific shard?
 
@@ -157,17 +169,17 @@ Open `reports/ci_timings_master.json` from any archived build. The `last_update`
 - `reports/ci_timings_master.json` archived timing preview from this build. Its `last_update` field records the accepted/rejected/force_accepted/anomaly counts and whether the shared master was updated.
 - `coverage_<stash>/` per row with `coverage: true`.
 - `${FINN_CI_NFS_ROOT}/artifacts/ci_runs/<jobKey>/<BUILD_NUMBER>/zips/<hwTestType>/<board>.zip` per row with a `zipArtifacts` entry. `aggregateReports()` runs `assertZipArtifactsEmitted()` which marks the build UNSTABLE (non-fatal) when an active row declared `zipArtifacts` but no `.READY` was written.
-- `${FINN_CI_NFS_ROOT}/artifacts/ci_runs/<jobKey>/<BUILD_NUMBER>/zips/<hwTestType>/<board>.zip.READY` per-board handshake marker, touched only after the zip is in place. Publishing is idempotent for same-build retries: a replay rewrites the zip atomically and leaves or refreshes READY instead of requiring a manual tree wipe. HW resolves per board to the newest build with this marker.
+- `${FINN_CI_NFS_ROOT}/artifacts/ci_runs/<jobKey>/<BUILD_NUMBER>/zips/<hwTestType>/<board>.zip.READY` per-board handshake marker, touched only after the zip is in place. Publishing is idempotent for same-build retries.
 - `${FINN_CI_NFS_ROOT}/artifacts/ci_runs/<jobKey>/<BUILD_NUMBER>/BUILD_INFO.txt` for human traceability.
 
 ## HW pipeline
 
-[`Jenkinsfile_HW`](./Jenkinsfile_HW) runs the board-tethered tests. It is structured around `HW_SHARDS` and `HW_TEST_TYPES` (`bnn_build_sanity` plus `bnn_build_full`). Offline boards are gated by `isNodeOnline(label)` so the pipeline never enters `node(offlineLabel)`, and an offline board with a READY zip marks the HW build unstable instead of silently passing. Board+testType pairs with no READY zip resolved by `resolveSwBoardZipPaths()` are skipped, so HW jobs run cleanly against partial software-CI runs and a regressed single board does not block the others.
+[`Jenkinsfile_HW`](./Jenkinsfile_HW) runs the board-tethered tests. It is structured around `HW_SHARDS` (derived from `BOARDS` in `ci_sharding.py`) and `HW_TEST_TYPES` (`bnn_build_sanity` plus `bnn_build_full`). Offline boards are gated by `isNodeOnline(label)` so the pipeline never enters `node(offlineLabel)`, and an offline board with a READY zip marks the HW build unstable instead of silently passing. Board+testType pairs with no READY zip resolved by `resolveBuildBoardZipPaths()` are skipped, so HW jobs run cleanly against partial build runs.
 
-The Collect stage populates a `SW_BOARD_ZIP_PATHS` map keyed by `<testType>_<board>`. Every later step (`buildHwStageMap`, `stashBuildArtifacts`, `expectedStashes`) is a pure map lookup, no filesystem stats run outside the Collect node.
+The Collect stage populates a `BUILD_BOARD_ZIP_PATHS` map keyed by `<testType>_<board>`. Every later step is a pure map lookup, no filesystem stats run outside the Collect node.
 
-SW-build resolution is automatic via `sw_job_name` (default `finn`), see "SW-to-HW zip handoff" above. `sw_build_dir` is an optional explicit override (full path to a single SW build directory) for off-Jenkins recovery or pinning a specific build.
+Build resolution is automatic via `build_job_name` (default `finn`); see "Build-to-HW zip handoff" above. `build_dir` is an optional explicit override (full path to a single build directory) for off-Jenkins recovery or pinning a specific build.
 
-Board zips are retrieved by direct filesystem read from each board's resolved SW build directory on the `finn-build` aggregator agent, then `stash`/`unstash`'d to the board agents. Boards whose zip has no `.READY` sibling are skipped from the per-board stash and per-shard branch maps. If a whole HW stage has no READY zips, the stage marks the build unstable with a clear message instead of calling `parallel` with an empty branch map.
+Board zips are retrieved by direct filesystem read from each board's resolved build directory on the `finn-build` aggregator agent, then `stash`/`unstash`'d to the board agents. Boards whose zip has no `.READY` sibling are skipped from the per-board stash and per-shard branch maps. If a whole HW stage has no READY zips, the stage marks the build unstable with a clear message instead of calling `parallel` with an empty branch map.
 
-Shared Groovy helpers (`paramBool`, `paramString`, `shellQuote`, `safeStashShardReport` / `safeStashHwReport`, `unstashIfPresent`, `cleanPreviousBuildFiles` / `cleanPreviousBuildFilesHw`) live in [`_common.groovy`](./_common.groovy). Each Jenkinsfile loads it once via `load 'docker/jenkins/_common.groovy'` and exposes thin top-level wrappers so call sites stay readable. `safeStash*` and `cleanPreviousBuildFiles*` are split into two names because the SW and HW pipelines genuinely disagree on what to include/exclude (HW takes an explicit `fileBase` and stashes only XML+HTML, SW stashes the full sidecar set; HW also sudos and optionally sweeps a sibling `.zip`, SW hard-fails on root-owned residue and recreates the directory). `aggregateReports` stays inline in each Jenkinsfile because the SW form does many more things than the HW form.
+Shared Groovy helpers live in [`_common.groovy`](./_common.groovy). Each Jenkinsfile loads it once via `load 'docker/jenkins/_common.groovy'` and exposes thin top-level wrappers. `safeStash*` and `cleanPreviousBuildFiles*` split into build-pipeline and HW forms because the two pipelines genuinely disagree on what to include and how to clean: HW takes an explicit `fileBase` (its reports use a different basename from its stash name) and uses sudo when board credentials are bound; the build pipeline stashes the full sidecar set and pre-creates the dir as the unprivileged user so docker `-v` does not bind it as root. `aggregateReports` stays inline in each Jenkinsfile because the build-pipeline form does many more things than the HW form.

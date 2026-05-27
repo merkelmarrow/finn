@@ -369,8 +369,8 @@ def deploy_based_on_board(model, model_title, topology, wbits, abits, board):
 
 
 # Each scenario carries one marker so pytest -m <marker> picks the shard.
-# Sanity is a fixed 4-tuple (one per board). -m bnn_<board> selects the
-# 12-scenario matrix per-board.
+# Sanity is a fixed 4-tuple (one per board); -m bnn_<board> selects the
+# 12-scenario matrix for that board.
 _SANITY_BNN_CONFIGS = [
     (1, 1, "lfc", "Pynq-Z1"),
     (1, 2, "cnv", "KV260_SOM"),
@@ -391,14 +391,12 @@ _BNN_TOPOLOGY = ["lfc", "tfc", "cnv"]
 
 
 def _bnn_scenarios():
-    """Return a list of (id, kwargs, marks) tuples covering every scenario."""
-    # xdist_group names embed the parameters directly (not an index) so a
-    # future edit to _BNN_WBITS/_BNN_ABITS/_BNN_TOPOLOGY does not silently
-    # renumber every existing group and invalidate the timing master's
-    # accumulated samples for those tests. Board names with hyphens (e.g.
-    # ``Pynq-Z1``) are deliberately allowed here; the strictly-validated
-    # ``MARKER_SAFE_PATTERN`` in the Jenkinsfile applies only to pytest -m
-    # marker expressions, not to xdist_group names.
+    """Return a list of (id, kwargs, marks) tuples covering every scenario.
+
+    xdist_group names embed parameter values so editing _BNN_WBITS / _BNN_ABITS
+    / _BNN_TOPOLOGY does not renumber existing groups and invalidate the
+    timing master's accumulated samples.
+    """
     scenarios = []
     for w, a, top, board in _SANITY_BNN_CONFIGS:
         scenarios.append(

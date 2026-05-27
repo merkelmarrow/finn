@@ -1,9 +1,7 @@
 #!/bin/bash
 # lsf_summary.sh <build_dir> <agent> <stash>
 #
-# Per-tool run counts and hosts so Blue Ocean shows LSF fan-out. Reads tool
-# logs directly because pytest captures the wrapper's stderr diagnostics.
-# Best-effort: set +e on purpose, missing-dir or missing-grep is benign.
+# Per-tool run counts and hosts so Blue Ocean shows LSF fan-out.
 set +e
 
 if [ "$#" -ne 3 ]; then
@@ -21,8 +19,8 @@ if [ ! -d "$bd" ]; then
   exit 0
 fi
 
-# vitis_hls writes "INFO: [HLS 200-10] ... on host '<host>'" and vivado writes
-# "# Running On: <host>," at log head. Both are tool-emitted, never shell.
+# vitis_hls log line: "INFO: [HLS 200-10] ... on host '<host>'"
+# vivado log header:  "# Running On: <host>,"
 hls_hosts=$(find "$bd" -name vitis_hls.log -exec grep -h "INFO: \[HLS 200-10\] .* on host '" {} + 2>/dev/null \
   | awk -F"on host '" '{print $2}' | awk -F"'" '{print $1}')
 viv_hosts=$(find "$bd" -name vivado.log -exec grep -h '^# Running On:' {} + 2>/dev/null \

@@ -6,9 +6,9 @@
 
 """Print a tail of every failed/errored testcase in a JUnit XML.
 
-Used by Jenkins to surface per-test failure context that ``printFailureTails``
-misses when there is no tool log (notebook timeouts, asserts, fixture errors).
-Pure stdlib so it runs on any agent.
+Used by Jenkins to surface per-test failure context when there is no tool
+log to tail (notebook timeouts, asserts, fixture errors). Pure stdlib so
+it runs on any agent.
 
 Usage: print_pytest_failures.py <junit_xml> <stash> <lines_per_failure> <max_failures>
 """

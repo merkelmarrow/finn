@@ -128,8 +128,8 @@ def _load_group_weights():
 
 
 def _weights_with_fallback():
-    # Fallback is the median of recorded weights (1.0 if the file is absent or
-    # has no positive entries) and is used for groups not yet timed.
+    # Fallback is the median of recorded weights (1.0 if absent) for
+    # groups not yet timed.
     weights_table = _load_group_weights()
     fallback = ci_sharding.weights_with_fallback(weights_table)
     return weights_table, fallback
@@ -138,11 +138,8 @@ def _weights_with_fallback():
 def _assignment_details(groups, num_shards):
     """Resolve shard pins, then delegate to ``ci_sharding.assign_groups_to_shards``.
 
-    Each xdist_group must agree on a single ``@pytest.mark.shard(N)`` value,
-    otherwise sibling tests would split across shards and break chained
-    ``load_test_checkpoint_or_skip`` steps. Returns the tuple
-    ``(assignment, source, shard_load, weights_table, fallback)`` so callers
-    don't recompute the median weight.
+    Every xdist_group must agree on a single @pytest.mark.shard(N) value;
+    otherwise chained checkpoint tests would split across shards.
     """
     pins = {}
     for key, members in groups.items():
@@ -168,7 +165,7 @@ def _assign_groups_to_shards(groups, num_shards):
 
 
 def _marker_tokens(marker_expr):
-    # STAGES.marker is constrained to bare 'a or b ...' by MARKER_SAFE_PATTERN.
+    # STAGES.marker is constrained to "a or b ..." by MARKER_SAFE_PATTERN.
     return [t for t in marker_expr.split() if t != "or"]
 
 
@@ -291,8 +288,7 @@ def pytest_collection_modifyitems(config, items):
             "--shard-id=%d out of range for --num-shards=%d" % (shard_id, num_shards)
         )
     if not items:
-        # An empty selection under sharding is a silent-skip footgun (stale
-        # marker, typo). Fail loudly instead.
+        # Fail loud on a stale-marker typo so it does not silently green.
         raise pytest.UsageError(
             "no tests collected for this marker. CI shard configuration is "
             "out of sync with the test markers"
@@ -342,10 +338,6 @@ def pytest_collection_modifyitems(config, items):
     items[:] = kept
 
 
-# Per-shard timing observability: emit <stash>.timings.json next to the
-# junit XML when --num-shards is set, so aggregation can flag outliers
-# and operators can update the Jenkins timing state from a recent run.
-
 # Set on the controller in pytest_sessionstart, left None on xdist workers
 # so log-reports don't double-count.
 _TIMINGS = None
@@ -386,8 +378,7 @@ def pytest_collection_finish(session):
 def pytest_runtest_logreport(report):
     if _TIMINGS is None:
         return
-    # Accumulate setup+call+teardown per nodeid. xdist forwards worker reports
-    # here so summing covers the full session.
+    # Sum setup+call+teardown per nodeid; xdist forwards worker reports here.
     duration = float(getattr(report, "duration", 0.0) or 0.0)
     _TIMINGS["per_test_seconds"][report.nodeid] = (
         _TIMINGS["per_test_seconds"].get(report.nodeid, 0.0) + duration
@@ -395,22 +386,33 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_sessionfinish(session, exitstatus):
-    # Exit 5 ("no tests collected") is success for every sharding-aware
-    # invocation: --dry-run-shards and --which-shard finish their work by
-    # deselecting everything, and a real sharded run can legitimately end
-    # up empty when a shard's slice of the test set happens to be all
-    # deselected upstream (the empty-collection footgun is caught by the
-    # UsageError raised earlier in pytest_collection_modifyitems, so by
-    # the time we reach here exitstatus 5 is benign). Mapping the exit
-    # code here keeps run-tests.sh (and any future caller) free of
-    # pytest-version-coupled shell knowledge.
-    sharded = (
-        session.config.getoption("--num-shards") > 0
-        or session.config.getoption("--dry-run-shards")
-        or session.config.getoption("--which-shard")
-    )
-    if exitstatus == 5 and sharded:
-        session.exitstatus = 0
+    # --dry-run-shards / --which-shard deselect everything by design, so exit
+    # 5 ("no tests collected") is benign. For a real sharded run, exit 5 can
+    # also happen when this shard's slice is empty after group assignment;
+    # remap it but print a warning so an unbalanced split is visible in logs.
+    num_shards = session.config.getoption("--num-shards")
+    if exitstatus == 5:
+        if session.config.getoption("--dry-run-shards") or session.config.getoption(
+            "--which-shard"
+        ):
+            session.exitstatus = 0
+        elif num_shards > 0:
+            shard_id = session.config.getoption("--shard-id")
+            # Sidecar lets a build-level aggregator detect the empty shard
+            # without grepping stdout. Best-effort: an OSError here must not
+            # change exit status.
+            out_dir, stash, _ = _junit_output_info(session.config)
+            if out_dir and stash:
+                try:
+                    with open(os.path.join(out_dir, stash + ".empty-shard"), "w") as f:
+                        f.write("shard %d/%d collected 0 items\n" % (shard_id, num_shards))
+                except OSError:
+                    pass
+            print(
+                "[finn-sharding] WARNING: shard %d/%d collected 0 items after assignment"
+                % (shard_id, num_shards)
+            )
+            session.exitstatus = 0
     if _TIMINGS is None:
         return
     out_dir, stash, junitxml = _junit_output_info(session.config)

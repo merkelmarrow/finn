@@ -1,11 +1,10 @@
 #!/bin/bash
 # publish_board_zip_stage.sh <src_root> <work_board> <board> <test_type>
 #
-# Stages per-shard board deployments into a single work_board directory ahead
-# of zipping. Errors out on duplicate model names across shards (a real
-# conflict, not a transient race). Touches <work_board>/.NO_DEPLOYMENTS when
-# nothing was found so the Groovy caller can short-circuit cleanly without
-# distinguishing "empty" from "missing source".
+# Stages per-shard board deployments into work_board ahead of zipping.
+# Hard-fails on duplicate model names across shards (a real conflict).
+# Touches <work_board>/.NO_DEPLOYMENTS when nothing was found so the caller
+# can short-circuit cleanly.
 set -euo pipefail
 
 if [ "$#" -ne 4 ]; then

@@ -60,16 +60,15 @@ class CallHLS:
         match = re.search(r"\b(20\d{2})\.(1|2)\b", vivado_path)
         year, minor = int(match.group(1)), int(match.group(2))
         if (year, minor) > (2024, 2):
-            tool = resolve_xilinx_tool("vitis-run", "FINN_VITIS_RUN_OVERRIDE")
+            tool = resolve_xilinx_tool("vitis-run")
             vitis_cmd = "%s --mode hls --tcl %s\n" % (tool, self.tcl_script)
         else:
-            tool = resolve_xilinx_tool("vitis_hls", "FINN_VITIS_HLS_OVERRIDE")
+            tool = resolve_xilinx_tool("vitis_hls")
             vitis_cmd = "%s %s\n" % (tool, self.tcl_script)
         self.code_gen_dir = code_gen_dir
         self.ipgen_script = str(self.code_gen_dir) + "/ipgen.sh"
         working_dir = os.environ["PWD"]
-        # Per-call private TMPDIR so concurrent vitis_hls processes don't
-        # share /tmp. HOME stays shared so license/XDG caches keep working.
+        # private TMPDIR so concurrent vitis_hls processes don't race on /tmp
         priv_tmp = os.path.join(code_gen_dir, ".vitis_tmp")
         os.makedirs(priv_tmp, exist_ok=True)
         f = open(self.ipgen_script, "w")

@@ -174,8 +174,7 @@ def build_dataflow_cfg(model_filename, cfg: DataflowBuildConfig):
     # Add the file handler (only file output, no console output)
     log.addHandler(log_file_handler)
 
-    # close the fd on exit so callers can rmtree(output_dir) on NFS without
-    # hitting .nfsXXXX silly-rename / EBUSY on the still-open log file.
+    # close the fd on exit so cleanup rmtree(output_dir) works on NFS
     try:
         stdout_logger = StreamToLogger(log, logging.INFO)
         stderr_logger = StreamToLogger(log, logging.ERROR)

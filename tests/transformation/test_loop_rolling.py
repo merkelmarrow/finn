@@ -89,8 +89,7 @@ def export_model_to_qonnx(input_size=10, hidden_size=20, num_layers=4, output_si
     model(x)  # Initialise scale factors
     model.eval()
 
-    # Filename includes input_size so xdist workers running different
-    # parametrizations of the same test do not collide on this path.
+    # filename per parametrisation so concurrent workers do not collide
     onnx_path = (
         os.environ["FINN_BUILD_DIR"]
         + f"/simple_module_{num_layers}layers_{input_size}in.onnx"
@@ -125,9 +124,8 @@ def check_tensor_shape(model_wrapper, name, expected_shape):
 @pytest.mark.parametrize("input_size", [20, 30, 40])
 # num_layers
 @pytest.mark.parametrize("num_layers", [6, 12, 24])
-# Pin to one worker. Brevitas dynamo export caches compiled graphs in
-# $HOME/.cache and concurrent parametrizations race on it, producing
-# body subgraphs with shapes from the wrong parametrization.
+# Brevitas dynamo export caches compiled graphs in $HOME/.cache; pin all
+# parametrisations to one worker so they do not race on it.
 @pytest.mark.xdist_group(name="loop_rolling")
 @pytest.mark.transform
 def test_finn_loop(input_size, num_layers):

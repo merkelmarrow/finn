@@ -197,7 +197,7 @@ def test_prune_images_skips_when_parent_missing(tmp_path, capsys):
     assert "not present, skipping" in captured.out
 
 
-def _seed_sw_build(artifact_dir, job_key, build, test_type, board, ready=True):
+def _seed_build(artifact_dir, job_key, build, test_type, board, ready=True):
     build_dir = artifact_dir / "ci_runs" / job_key / build
     zip_dir = build_dir / "zips" / test_type
     zip_dir.mkdir(parents=True, exist_ok=True)
@@ -208,75 +208,75 @@ def _seed_sw_build(artifact_dir, job_key, build, test_type, board, ready=True):
     return zip_path, build_dir
 
 
-def test_resolve_sw_zips_picks_newest_ready_per_pair(tmp_path):
+def test_resolve_build_zips_picks_newest_ready_per_pair(tmp_path):
     art = tmp_path / "artifacts"
-    _seed_sw_build(art, "finn", "10", "bnn_build_full", "U250", ready=False)
-    _seed_sw_build(art, "finn", "11", "bnn_build_full", "U250", ready=True)
-    _seed_sw_build(art, "finn", "12", "bnn_build_full", "Pynq-Z1", ready=True)
+    _seed_build(art, "finn", "10", "bnn_build_full", "U250", ready=False)
+    _seed_build(art, "finn", "11", "bnn_build_full", "U250", ready=True)
+    _seed_build(art, "finn", "12", "bnn_build_full", "Pynq-Z1", ready=True)
 
-    out = ci_sharding.resolve_sw_zips(
+    out = ci_sharding.resolve_build_zips(
         str(art), "finn", ["bnn_build_full"], ["U250", "Pynq-Z1", "ZCU104"]
     )
 
     assert out["bnn_build_full"]["U250"]["zip"].endswith("/11/zips/bnn_build_full/U250.zip")
-    assert out["bnn_build_full"]["U250"]["swBuildDir"].endswith("/finn/11")
+    assert out["bnn_build_full"]["U250"]["buildDir"].endswith("/finn/11")
     assert out["bnn_build_full"]["Pynq-Z1"]["zip"].endswith("/12/zips/bnn_build_full/Pynq-Z1.zip")
     assert out["bnn_build_full"]["ZCU104"] == {}
 
 
-def test_resolve_sw_zips_falls_back_to_older_build_per_board(tmp_path):
+def test_resolve_build_zips_falls_back_to_older_build_per_board(tmp_path):
     # A new build that only succeeded for Pynq-Z1 must not strand U250 on the
     # older build it last produced a READY for. This is the per-board fallback
     # contract HW relies on.
     art = tmp_path / "artifacts"
-    _seed_sw_build(art, "finn", "20", "bnn_build_full", "U250", ready=True)
-    _seed_sw_build(art, "finn", "21", "bnn_build_full", "Pynq-Z1", ready=True)
+    _seed_build(art, "finn", "20", "bnn_build_full", "U250", ready=True)
+    _seed_build(art, "finn", "21", "bnn_build_full", "Pynq-Z1", ready=True)
 
-    out = ci_sharding.resolve_sw_zips(str(art), "finn", ["bnn_build_full"], ["U250", "Pynq-Z1"])
+    out = ci_sharding.resolve_build_zips(str(art), "finn", ["bnn_build_full"], ["U250", "Pynq-Z1"])
 
-    assert out["bnn_build_full"]["U250"]["swBuildDir"].endswith("/finn/20")
-    assert out["bnn_build_full"]["Pynq-Z1"]["swBuildDir"].endswith("/finn/21")
+    assert out["bnn_build_full"]["U250"]["buildDir"].endswith("/finn/20")
+    assert out["bnn_build_full"]["Pynq-Z1"]["buildDir"].endswith("/finn/21")
     assert out["bnn_build_full"]["U250"]["fallback"] is True
     assert out["bnn_build_full"]["Pynq-Z1"]["fallback"] is False
-    assert out["bnn_build_full"]["U250"]["latestSwBuild"] == "21"
+    assert out["bnn_build_full"]["U250"]["latestBuild"] == "21"
 
 
-def test_resolve_sw_zips_marks_stale_when_newest_build_has_no_ready(tmp_path):
+def test_resolve_build_zips_marks_stale_when_newest_build_has_no_ready(tmp_path):
     art = tmp_path / "artifacts"
-    _seed_sw_build(art, "finn", "20", "bnn_build_full", "U250", ready=True)
+    _seed_build(art, "finn", "20", "bnn_build_full", "U250", ready=True)
     # Build 21 exists but produced no READY zips. HW must know it is falling
-    # back to stale SW artefacts rather than treating build 20 as latest.
+    # back to stale artefacts rather than treating build 20 as latest.
     (art / "ci_runs" / "finn" / "21").mkdir(parents=True)
 
-    out = ci_sharding.resolve_sw_zips(str(art), "finn", ["bnn_build_full"], ["U250"])
+    out = ci_sharding.resolve_build_zips(str(art), "finn", ["bnn_build_full"], ["U250"])
 
-    assert out["bnn_build_full"]["U250"]["swBuildDir"].endswith("/finn/20")
-    assert out["bnn_build_full"]["U250"]["latestSwBuild"] == "21"
+    assert out["bnn_build_full"]["U250"]["buildDir"].endswith("/finn/20")
+    assert out["bnn_build_full"]["U250"]["latestBuild"] == "21"
     assert out["bnn_build_full"]["U250"]["fallback"] is True
 
 
-def test_resolve_sw_zips_honours_explicit_sw_build_dir(tmp_path):
+def test_resolve_build_zips_honours_explicit_build_dir(tmp_path):
     art = tmp_path / "artifacts"
-    _seed_sw_build(art, "finn", "5", "bnn_build_full", "U250", ready=True)
-    _seed_sw_build(art, "finn", "6", "bnn_build_full", "U250", ready=True)
+    _seed_build(art, "finn", "5", "bnn_build_full", "U250", ready=True)
+    _seed_build(art, "finn", "6", "bnn_build_full", "U250", ready=True)
     explicit = art / "ci_runs" / "finn" / "5"
-    out = ci_sharding.resolve_sw_zips(
-        str(art), "finn", ["bnn_build_full"], ["U250"], sw_build_dir=str(explicit)
+    out = ci_sharding.resolve_build_zips(
+        str(art), "finn", ["bnn_build_full"], ["U250"], build_dir=str(explicit)
     )
-    assert out["bnn_build_full"]["U250"]["swBuildDir"] == str(explicit)
+    assert out["bnn_build_full"]["U250"]["buildDir"] == str(explicit)
     assert out["bnn_build_full"]["U250"]["fallback"] is False
 
 
-def test_resolve_sw_zips_returns_empty_when_no_ready_anywhere(tmp_path):
+def test_resolve_build_zips_returns_empty_when_no_ready_anywhere(tmp_path):
     art = tmp_path / "artifacts"
-    _seed_sw_build(art, "finn", "1", "bnn_build_full", "U250", ready=False)
+    _seed_build(art, "finn", "1", "bnn_build_full", "U250", ready=False)
 
-    out = ci_sharding.resolve_sw_zips(str(art), "finn", ["bnn_build_full"], ["U250"])
+    out = ci_sharding.resolve_build_zips(str(art), "finn", ["bnn_build_full"], ["U250"])
     assert out == {"bnn_build_full": {"U250": {}}}
 
 
-def test_resolve_sw_zips_skips_when_job_root_missing(tmp_path):
-    out = ci_sharding.resolve_sw_zips(
+def test_resolve_build_zips_skips_when_job_root_missing(tmp_path):
+    out = ci_sharding.resolve_build_zips(
         str(tmp_path / "absent"), "finn", ["bnn_build_full"], ["U250"]
     )
     assert out == {"bnn_build_full": {"U250": {}}}
@@ -323,10 +323,8 @@ def test_jenkins_stage_choices_list_is_sanity_full_then_bare_params():
 
 
 def test_jenkinsfile_stage_choices_match_python_source():
-    # Anchor on the STAGES choice block specifically so a future second
-    # ``choice(name: 'XYZ', ...)`` cannot match instead. Accept both
-    # single- and double-quoted Groovy string literals so a future edit
-    # in either style does not silently fall off the regex and read [].
+    # Anchor on the STAGES choice block so a future ``choice(name: 'XYZ', ...)``
+    # cannot match instead. Accept both single- and double-quoted Groovy strings.
     jenkinsfile = os.path.join(REPO_ROOT, "docker", "jenkins", "Jenkinsfile")
     text = open(jenkinsfile).read()
     match = re.search(
@@ -342,6 +340,50 @@ def test_jenkinsfile_stage_choices_match_python_source():
         choices,
         expected,
     )
+
+
+def test_readme_stages_table_matches_python_source():
+    readme = os.path.join(REPO_ROOT, "docker", "jenkins", "README.md")
+    text = open(readme).read()
+    # Parse the values column of the "| STAGES value | ... |" table.
+    table_rows = re.findall(r"^\|\s*`([a-z0-9_]+)`(?:\s*\(default\))?\s*\|", text, re.MULTILINE)
+    expected = ci_sharding.jenkins_stage_choices()
+    assert (
+        table_rows == expected
+    ), "README STAGES table %r drifted from ci_sharding.jenkins_stage_choices() %r" % (
+        table_rows,
+        expected,
+    )
+
+
+def test_marker_safe_pattern_rejects_and_not_and_double_space():
+    # The conftest plugin's _marker_tokens treats every whitespace-separated
+    # token as an `or` disjunct, so the regex must forbid and/not and the
+    # double-space shape that would create an empty token.
+    jenkinsfile = os.path.join(REPO_ROOT, "docker", "jenkins", "Jenkinsfile")
+    text = open(jenkinsfile).read()
+    match = re.search(r"MARKER_SAFE_PATTERN\s*=\s*~/([^/]+)/", text)
+    assert match is not None, "could not locate MARKER_SAFE_PATTERN in Jenkinsfile"
+    pattern = re.compile(match.group(1))
+    # Every current STAGES marker must be accepted.
+    for row in ci_sharding.STAGES:
+        assert pattern.match(row["marker"]), (
+            "MARKER_SAFE_PATTERN rejects STAGES marker %r" % row["marker"]
+        )
+    # And the foot-guns the conftest plugin would silently misinterpret
+    # must be rejected.
+    for bad in ("foo and bar", "not slow", "foo  or bar", "foo or", "or foo"):
+        assert not pattern.match(bad), "MARKER_SAFE_PATTERN should reject %r" % bad
+
+
+def test_multi_shard_rows_use_loadgroup_dist_mode():
+    # worksteal across xdist_group siblings breaks chained checkpoint tests,
+    # so every multi-shard row must opt in to loadgroup explicitly.
+    for row in ci_sharding.STAGES:
+        if int(row["shards"]) > 1:
+            assert (
+                row.get("distMode") == "loadgroup"
+            ), "STAGES row %r has shards>1 but distMode=%r" % (row["stage"], row.get("distMode"))
 
 
 def test_enabled_params_rejects_unknown_choice_loudly():
@@ -406,7 +448,7 @@ def test_validate_config_rejects_orphan_zipartifact_board(monkeypatch):
 
 def test_active_artifact_rows_present_for_sanity_and_end2end_choices():
     # Mirrors the Groovy hasActiveArtifactRows() decision: in local-fallback
-    # mode the SW->HW handoff is silently skipped for these choices (yellow
+    # mode the build-to-HW handoff is silently skipped for these choices (yellow
     # build via aggregateReports), and absent for fpgadataflow.
     def has_artifact_rows(choice):
         enabled = set(ci_sharding.enabled_params_for_choice(choice))
@@ -714,12 +756,12 @@ def test_locked_update_backs_up_corrupt_master(tmp_path):
     master.write_text("{ this is not json")
 
     updated = ci_sharding.locked_update(
-        str(master), lambda cur: {"version": 1, "groups": {"k": {"seconds": 1.0}}}
+        str(master), lambda cur: {"version": 1, "groups": {"k": {"samples": [1.0]}}}
     )
 
-    assert updated["groups"]["k"]["seconds"] == 1.0
+    assert updated["groups"]["k"]["samples"] == [1.0]
     fresh = json.loads(master.read_text())
-    assert fresh["groups"]["k"]["seconds"] == 1.0
+    assert fresh["groups"]["k"]["samples"] == [1.0]
 
     backups = sorted(p.name for p in tmp_path.iterdir() if ".corrupt-" in p.name)
     assert len(backups) == 1
@@ -1044,69 +1086,22 @@ def test_update_master_preview_does_not_gc_unobserved_groups(tmp_path):
     assert preview["last_update"]["gc_dropped"] == 0
 
 
-def test_update_master_gc_keeps_old_entries_without_build_seq(tmp_path):
-    reports = tmp_path / "reports"
-    reports.mkdir()
-    master = tmp_path / "master.json"
-    out = reports / "ci_timings_master.json"
-    write_json(
-        master,
-        {
-            "version": 1,
-            "build_seq": ci_sharding.GC_BUILDS_UNSEEN + 50,
-            "groups": {
-                "old": {"seconds": 25.0, "count": 1},
-                "fresh": {
-                    "samples": [10.0],
-                    "last_seen_build_seq": ci_sharding.GC_BUILDS_UNSEEN + 40,
-                },
-            },
-        },
-    )
-    _write_observation(reports, "stage", "fresh", 10.0)
-    ci_sharding.update_master(
-        str(reports), str(master), str(out), update_persistent=True, run_gc=True
-    )
-    persisted = json.loads(master.read_text())
-    assert "old" in persisted["groups"]
-    assert "fresh" in persisted["groups"]
-    assert persisted["last_update"]["gc_dropped"] == 0
-
-
-def test_update_master_auto_upgrades_old_seconds_only_entry(tmp_path):
-    # Older master files can have ``{seconds: float}`` entries. The first
-    # observation against such an entry treats seconds
-    # as a one-element samples series and immediately migrates the schema.
-    reports = tmp_path / "reports"
-    reports.mkdir()
-    master = tmp_path / "master.json"
-    out = reports / "ci_timings_master.json"
-    write_json(master, {"version": 1, "groups": {"g": {"seconds": 25.0, "count": 1}}})
-    _write_observation(reports, "stage", "g", 30.0)
-    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
-    persisted = json.loads(master.read_text())
-    assert persisted["groups"]["g"]["samples"] == [25.0, 30.0]
-    # seconds key is no longer the source of truth
-    assert "samples" in persisted["groups"]["g"]
-
-
-def test_load_group_weights_handles_new_samples_schema(tmp_path):
+def test_load_group_weights_returns_median_of_samples(tmp_path):
     master = tmp_path / "master.json"
     write_json(
         master,
         {
             "version": 1,
-            "groups": {
-                "g_samples": {"samples": [10.0, 20.0, 30.0]},
-                "g_old_dict": {"seconds": 7.5},
-                "g_old_flat": 4.2,
-            },
+            "groups": {"g": {"samples": [10.0, 20.0, 30.0]}},
         },
     )
     weights = ci_sharding.load_group_weights(str(master))
-    assert weights["g_samples"] == 20.0  # median of [10, 20, 30]
-    assert weights["g_old_dict"] == 7.5
-    assert weights["g_old_flat"] == 4.2
+    assert weights["g"] == 20.0
+
+
+def test_normalise_master_rejects_unknown_schema_version():
+    with pytest.raises(ValueError, match="unsupported master schema version"):
+        ci_sharding.normalise_master({"version": 2, "groups": {}})
 
 
 def test_pytest_plugin_writes_timings_for_successful_sharded_run(pytester):

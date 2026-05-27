@@ -86,11 +86,8 @@ DOCKER_INTERACTIVE=""
 # Catch FINN_DOCKER_EXTRA options being passed in without a trailing space
 FINN_DOCKER_EXTRA+=" "
 
-# print-tag prints the Docker image tag and exits. Used by the Jenkins
-# publish step so the tag string has one source of truth (here, in
-# FINN_DOCKER_TAG) rather than being duplicated across files. Extra args
-# are rejected so a fat-fingered `./run-docker.sh print-tag > out.txt`
-# fails loudly instead of writing a misleading file.
+# print-tag emits the Docker image tag and exits. Used by the Jenkins publish
+# step so the tag string has one source of truth (here, in FINN_DOCKER_TAG).
 if [ "$1" = "print-tag" ]; then
   if [ "$#" -ne 1 ]; then
     echo "Usage: $0 print-tag" >&2
@@ -196,9 +193,8 @@ if [ "$FINN_DOCKER_NO_CACHE" = "1" ]; then
   FINN_DOCKER_BUILD_EXTRA+="--no-cache "
 fi
 
-# If the image isn't available locally, try loading from shared storage. In
-# prebuilt mode, always verify/load the build-scoped shared image instead of
-# trusting a same-tag local image left by an older build.
+# If a shared-image dir is configured, load from there. In prebuilt mode
+# the shared image is authoritative and any same-tag local image is ignored.
 if [ -n "$FINN_DOCKER_SHARED_IMAGE_DIR" ] && \
    { [ "$FINN_DOCKER_PREBUILT" = "1" ] || ! docker image inspect "$FINN_DOCKER_TAG" > /dev/null 2>&1; }; then
   SHARED_DIR="$FINN_DOCKER_SHARED_IMAGE_DIR"
@@ -212,8 +208,7 @@ if [ -n "$FINN_DOCKER_SHARED_IMAGE_DIR" ] && \
       gecho "ERROR: Shared Docker tag $SHARED_TAG does not match requested tag $FINN_DOCKER_TAG"
       exit 1
     fi
-    # /tmp lock serialises loads on the same host (do not move to NFS).
-    # Pass SHARED_IMG as $1 so the inner shell does not have to interpolate it.
+    # local /tmp lock to serialise concurrent loads on the same host
     if flock /tmp/finn-docker-load.lock \
          bash -c 'set -o pipefail; gunzip -c "$1" | docker load' _ "$SHARED_IMG"; then
       SHARED_LOADED="1"
@@ -292,8 +287,8 @@ DOCKER_EXEC+="-e LD_PRELOAD=/lib/x86_64-linux-gnu/libudev.so.1 "
 # https://adaptivesupport.amd.com/s/article/63253?language=en_US
 DOCKER_EXEC+="-e XILINX_LOCAL_USER_DATA=no "
 # Optional host cache for torch.hub / huggingface weights to avoid CDN 504s
-# on parallel CI runs. Mount is /finn_cache (NOT under $HOME — Docker creates
-# bind parents as root, which would break pip install --user).
+# on parallel CI runs. Bind target is /finn_cache (NOT $HOME, because docker
+# creates bind parents as root and that would break pip install --user).
 : ${FINN_DOCKER_CACHE_DIR=""}
 if [ -n "$FINN_DOCKER_CACHE_DIR" ]; then
   mkdir -p "$FINN_DOCKER_CACHE_DIR/torch" "$FINN_DOCKER_CACHE_DIR/huggingface"

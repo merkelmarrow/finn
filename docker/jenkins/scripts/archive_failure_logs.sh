@@ -1,12 +1,9 @@
 #!/bin/bash
 # archive_failure_logs.sh <build_dir> <tarball_path> [start_marker]
 #
-# One tarball of tool logs per failed shard. Excludes HLS compiler
-# intermediates. LSF staging logs live outside the build dir
-# (FINN_LSF_NFS_STAGING) so they need a separate find rooted there, scoped to
-# files touched since the fixed shard-start marker.
-# Best-effort: missing build dir is benign, the caller passes
-# allowEmptyArchive=true to archiveArtifacts.
+# One tarball of tool logs per failed shard. LSF staging logs live outside
+# the build dir under FINN_LSF_NFS_STAGING; they are scoped to files newer
+# than the start_marker if provided.
 set +e
 
 if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
@@ -24,21 +21,16 @@ if [ ! -d "$bd" ]; then
   exit 0
 fi
 
-# tar reads the file list from stdin, and the find on the left of the pipe
-# runs in its own subshell, so emit absolute paths so tar (right of the pipe)
-# can stat them from its own cwd. The pre-extraction heredoc emitted relative
-# "./..." paths after a `cd`, which tar then could not find, and the resulting
-# tarballs were silently empty (allowEmptyArchive=true masked it).
+# Use absolute paths so tar can stat them from its own cwd.
 abs_bd=$(cd "$bd" && pwd)
 newer_ref=$bd
 if [ -n "$start_marker" ] && [ -e "$start_marker" ]; then
   newer_ref=$start_marker
 fi
 
-# Collect to a temp file first so we can both count (visibility for the
-# operator) and tar (the actual archive). The previous shape piped find
-# straight into tar and emitted an allowEmptyArchive zero-byte tarball
-# indistinguishable from a healthy "no candidates" run.
+# Collect to a temp file so we can both count and tar, and so a healthy
+# "no candidates" run does not produce an empty tarball indistinguishable
+# from a tar failure.
 list=$(mktemp)
 trap 'rm -f "$list"' EXIT
 {
