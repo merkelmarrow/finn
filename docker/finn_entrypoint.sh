@@ -67,13 +67,13 @@ mv "$_qonnx_pyproj_tmp" "$_qonnx_pyproj_toml"
 trap - EXIT
 
 # finn-experimental
-pip install --user -e ${FINN_ROOT}/deps/finn-experimental
+pip install --user -e "${FINN_ROOT}/deps/finn-experimental"
 # brevitas
-pip install --user -e ${FINN_ROOT}/deps/brevitas
+pip install --user -e "${FINN_ROOT}/deps/brevitas"
 
 if [ -f "${FINN_ROOT}/setup.py" ];then
   # run pip install for finn
-  pip install --user -e ${FINN_ROOT}
+  pip install --user -e "${FINN_ROOT}"
 else
   recho "Unable to find FINN source code in ${FINN_ROOT}"
   recho "Ensure you have passed -v <path-to-finn-repo>:<path-to-finn-repo> to the docker run command"

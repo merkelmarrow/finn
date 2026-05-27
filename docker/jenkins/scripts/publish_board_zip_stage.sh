@@ -5,8 +5,10 @@
 # Hard-fails on duplicate model names across shards (a real conflict).
 # Touches <work_board>/.NO_DEPLOYMENTS when nothing was found so the caller
 # can short-circuit cleanly.
-# NOT best-effort: a half-staged board zip is worse than no zip, so strict
+# NOT best-effort. A half-staged board zip is worse than no zip, so strict
 # mode is on and any error aborts the publish step.
+# See also: find_copy_zip.sh, which produced the per-shard staged trees
+# this script aggregates.
 set -euo pipefail
 
 if [ "$#" -ne 4 ]; then

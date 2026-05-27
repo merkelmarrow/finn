@@ -124,7 +124,7 @@ def check_tensor_shape(model_wrapper, name, expected_shape):
 @pytest.mark.parametrize("input_size", [20, 30, 40])
 # num_layers
 @pytest.mark.parametrize("num_layers", [6, 12, 24])
-# Brevitas dynamo export caches compiled graphs in $HOME/.cache; pin all
+# Brevitas dynamo export caches compiled graphs in $HOME/.cache. Pin all
 # parametrisations to one worker so they do not race on it.
 @pytest.mark.xdist_group(name="loop_rolling")
 @pytest.mark.transform

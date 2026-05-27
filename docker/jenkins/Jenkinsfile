@@ -59,17 +59,18 @@ int FINN_CI_MIN_FREE_GB = 120
 Map RETENTION = [:]
 
 // Jenkins agent label every non-board stage runs on. Hoisted so a relabel
-// only touches one line; mirrored in node(...) and the budget probe below.
+// only touches one line. Mirrored in node(...) and the budget probe below.
 @Field
 static final String FINN_BUILD_LABEL = 'finn-build'
 
 // Optional setup-local.sh stage agent label and cache root are read via
 // helpers (not @Field) so env. resolution happens inside the running pipeline,
 // not at script-load. FINN_LOCAL_BUILD_LABEL defaults to FINN_BUILD_LABEL so
-// single-label installs need no extra wiring; override on agents that need an
-// apt/python3.10-equipped host distinct from the main build pool.
-// FINN_CI_LOCAL_CACHE_ROOT defaults to WORKSPACE_TMP so a fresh install needs
-// no extra wiring; override on agents whose home/scratch layout matters.
+// single-label installs need no extra wiring. Override on agents that need
+// an apt/python3.10-equipped host distinct from the main build pool.
+// FINN_CI_LOCAL_CACHE_ROOT defaults to WORKSPACE_TMP so a fresh install
+// needs no extra wiring. Override on agents whose home/scratch layout
+// matters.
 String finnLocalBuildLabel() { return (env.FINN_LOCAL_BUILD_LABEL ?: FINN_BUILD_LABEL) }
 String finnCiLocalCacheRoot() {
   return (env.FINN_CI_LOCAL_CACHE_ROOT ?: "${env.WORKSPACE_TMP ?: '/tmp'}/finn-ci-cache")
@@ -77,7 +78,7 @@ String finnCiLocalCacheRoot() {
 
 // STAGES row markers are interpolated into a shell command. Only the
 // 'a or b or c' shape passes here so the conftest plugin's mini-evaluator
-// stays sound; the Python side enforces the same pattern via
+// stays sound. The Python side enforces the same pattern via
 // ci_sharding.MARKER_SAFE_PATTERN.
 @Field
 java.util.regex.Pattern MARKER_SAFE_PATTERN = ~/^[A-Za-z0-9_]+( or [A-Za-z0-9_]+)*$/
@@ -86,7 +87,7 @@ java.util.regex.Pattern MARKER_SAFE_PATTERN = ~/^[A-Za-z0-9_]+( or [A-Za-z0-9_]+
 // ============================================================================
 // NFS layout
 // ============================================================================
-// FINN_CI_NFS_ROOT is the only env var operators set; every shared subtree
+// FINN_CI_NFS_ROOT is the only env var operators set. Every shared subtree
 // derives from it. When unset the pipeline degrades to local fallback: per-
 // agent Docker builds, no build-to-HW handoff staged, no persistent timing master,
 // no per-agent NFS caches. The HW pipeline hard-requires FINN_CI_NFS_ROOT.
@@ -96,10 +97,10 @@ java.util.regex.Pattern MARKER_SAFE_PATTERN = ~/^[A-Za-z0-9_]+( or [A-Za-z0-9_]+
 //   artifacts/ci_runs/<jobKey>/<BUILD>/                    build-to-HW handoff + BUILD_INFO
 //   _ci_state/<jobKey>/                                    timing master + snapshots
 //
-// Per-shard scratch lives at ${WORKSPACE}/tmp/ci_runs/<BUILD>/<stash>; the
+// Per-shard scratch lives at ${WORKSPACE}/tmp/ci_runs/<BUILD>/<stash>. The
 // workspace is per-agent and `git clean -ffdx` between runs handles rotation.
 //
-// All resolvers return '' in local fallback mode; callers MUST handle that.
+// All resolvers return '' in local fallback mode. Callers MUST handle that.
 
 String finnCiNfsRoot()                    { return loadCommonOnce().finnCiNfsRoot() }
 String finnAgentCachesDir(String node)    { return loadCommonOnce().finnAgentCachesDir(node) }
@@ -181,7 +182,7 @@ void announceCiMode() {
   if (root) {
     echo "[finn-ci] FINN_CI_NFS_ROOT=${root} (full operation)"
   } else {
-    echo "[finn-ci] FINN_CI_NFS_ROOT is unset; running in local fallback mode."
+    echo "[finn-ci] FINN_CI_NFS_ROOT is unset. Running in local fallback mode."
     echo "[finn-ci]   - no shared Docker images (each agent builds locally)"
     echo "[finn-ci]   - no build-to-HW artifact handoff (HW pipeline will fail against this build)"
     echo "[finn-ci]   - no persistent timing master (cold-start round-robin each build)"
@@ -277,7 +278,7 @@ void prepareTimingState() {
   }
 }
 
-// Per-build traceability file. Never parsed by code; `cat` it for the
+// Per-build traceability file. Never parsed by code. `cat` it for the
 // human-readable summary of what produced a given build directory.
 void writeBuildInfo() {
   String enabled = ENABLED_PARAMS.join(',')
@@ -352,15 +353,15 @@ String buildDockerImageDir() {
 
 // Other agents docker-load this image instead of rebuilding. Tag derives from
 // `./run-docker.sh print-tag`. The build-scoped imageDir keeps cross-build
-// readers away from in-progress writes; the flock guards a same-build retry.
+// readers away from in-progress writes. The flock guards a same-build retry.
 void publishSharedDockerImage(String imageDir) {
   def tag = sh(returnStdout: true, script: './run-docker.sh print-tag').trim()
   if (!tag || tag.contains('\n')) {
-    error "run-docker.sh print-tag must emit exactly one Docker tag line; got: ${tag}"
+    error "run-docker.sh print-tag must emit exactly one Docker tag line. Got: ${tag}"
   }
   sh "mkdir -p ${shellQuote(imageDir)}"
   // bash for set -o pipefail (Jenkins sh defaults to dash). flock on a
-  // numeric fd avoids nested-quote gymnastics; the lock releases on shell exit.
+  // numeric fd avoids nested-quote gymnastics. The lock releases on shell exit.
   sh """#!/bin/bash
 set -eo pipefail
 image_dir=${shellQuote(imageDir)}
@@ -441,6 +442,9 @@ String shardStageName(Map row, int id) {
   return row.shards == 1 ? row.stage : "${row.stage} (${id + 1}/${row.shards})"
 }
 
+// mirrored in ci_sharding.stash_name(). The cross-check test
+// test_pytest_plugin_writes_timings_for_successful_sharded_run relies
+// on the two implementations agreeing.
 String shardStashName(Map row, int id) {
   String base = row.stage.toLowerCase().replaceAll(/[^a-z0-9]+/, '_').replaceAll(/^_|_$/, '')
   return row.shards == 1 ? base : "${base}_${id + 1}"
@@ -517,10 +521,10 @@ void runShardBody(Map row, int shardIdx, String stageName, String stashName, Str
 }
 
 // Agent label and cache root come from FINN_LOCAL_BUILD_LABEL and
-// FINN_CI_LOCAL_CACHE_ROOT (see helpers near the top of the file); both
+// FINN_CI_LOCAL_CACHE_ROOT (see helpers near the top of the file). Both
 // default sensibly so a single-label install needs no extra wiring.
-// setup-local.sh expects apt + python3.10 on the agent; override the label
-// when the main build pool lacks those.
+// setup-local.sh expects apt + python3.10 on the agent. Override the
+// label when the main build pool lacks those.
 void runLocalSetupTest() {
   node(finnLocalBuildLabel()) {
     withAgentNfsEnv {
@@ -578,9 +582,10 @@ source scripts/finn-env.sh
 // marker shape is already validated against MARKER_SAFE_PATTERN at
 // loadStageConfig time, so the echoed value here is guaranteed to be
 // the 'a or b or c' form and safe to surround with double-quotes in the
-// pytest command. FINN_CI_TIMINGS_FILE is optional: when no snapshot is
-// available the conftest plugin falls back to deterministic round-robin
-// sharding.
+// pytest command.
+//
+// FINN_CI_TIMINGS_FILE is optional. When no snapshot is available the
+// conftest plugin falls back to deterministic round-robin sharding.
 void runPytest(Map opts) {
   def parts = ["python -m pytest -m \"\$FINN_CI_MARKER\""]
   // Skip -n entirely for single-worker rows: xdist still spawns a worker
@@ -617,10 +622,12 @@ void runPytest(Map opts) {
   if (opts.coverageFile) {
     envLines << "export COVERAGE_FILE=${shellQuote(opts.coverageFile as String)}"
   }
-  // run-tests.sh sits at workspace root; each parallel branch gets its own
+  // run-tests.sh sits at workspace root. Each parallel branch gets its own
   // @N workspace from Jenkins so two shards on the same agent never race.
+  // set -e so a non-zero export line fails fast rather than silently
+  // running pytest with the wrong env.
   writeFile file: 'run-tests.sh', text:
-      "#!/bin/bash\nset -o pipefail\n${envLines.join('\n')}\n${cmd}\n"
+      "#!/bin/bash\nset -eo pipefail\n${envLines.join('\n')}\n${cmd}\n"
   sh 'chmod 755 run-tests.sh'
   runDockerCommand('./run-docker.sh ./run-tests.sh')
 }
@@ -630,7 +637,7 @@ void runPytest(Map opts) {
 // Check-Stage-Results stage helpers
 // ============================================================================
 
-// junit first (workspace-local, never flakes); html merge and artifact
+// junit first (workspace-local, never flakes). html merge and artifact
 // archive after, because agent-to-controller transfer can flake on large globs.
 void aggregateReports() {
   // cleanPreviousBuildFiles wipes then recreates 'reports', so no mkdir first.
@@ -688,7 +695,7 @@ for f in reports/*.coverage; do
   n=$((n+1))
 done
     '''
-    // pytest-cov ships its own coverage; run via the same docker image so
+    // pytest-cov ships its own coverage. Run via the same docker image so
     // the merge uses the same Python/library versions as the per-shard runs.
     runDockerCommand("./run-docker.sh bash -c 'cd coverage_data && coverage combine && " +
                      "coverage html -d ../coverage_combined'")
@@ -731,7 +738,7 @@ void mergeShardMaps() {
 // Walks every active row that declares zipArtifacts, calling body with the
 // row, the hwTestType, and one board per invocation. Single source of truth
 // for the four checks that all phrase themselves as "for each active
-// (row, board) that publishes a zip"; tweaking the active-row predicate or
+// (row, board) that publishes a zip". Tweaking the active-row predicate or
 // the board flattening now happens here once.
 void eachActiveZipArtifact(Closure body) {
   for (int rowIdx = 0; rowIdx < PARALLEL_SHARDS.size(); rowIdx++) {
@@ -777,7 +784,7 @@ void assertZipArtifactsEmitted() {
 
 void updateTimingState() {
   catchError(buildResult: null, stageResult: 'UNSTABLE',
-             message: 'updateTimingState failed; persistent master may be stale') {
+             message: 'updateTimingState failed. Persistent master may be stale') {
     if (!fileExists('reports')) { return }
     String masterArg = FINN_CI_TIMINGS_MASTER ? "--master ${shellQuote(FINN_CI_TIMINGS_MASTER)}" : ''
     String updateArg = shouldUpdatePersistentTimingState() ? '--update-master --allow-force-accept --gc' : ''
@@ -931,7 +938,7 @@ String artifactBuildRoot() {
 // Canonical build-to-HW handoff path. The build pipeline writes the zip
 // plus a sibling READY here, HW resolves per (testType, board) to the
 // newest READY zip. Errors in local fallback so a caller cannot accidentally
-// fileExists() in the agent workspace; callers MUST gate on finnArtifactsRoot().
+// fileExists() in the agent workspace. Callers MUST gate on finnArtifactsRoot().
 String boardZipPath(String testType, String board) {
   String root = artifactBuildRoot()
   if (!root) {
@@ -970,7 +977,7 @@ String activeArtifactRowSummary() {
 }
 
 // Per-shard scratch under ${WORKSPACE}/tmp. The workspace is per-agent
-// (NFS-shared on lab build hosts, local SSD elsewhere); git clean handles
+// (NFS-shared on lab build hosts, local SSD elsewhere). git clean handles
 // rotation between runs.
 String finnCiPerBuildRoot() {
   if (!env.BUILD_NUMBER) { error "BUILD_NUMBER is unset" }

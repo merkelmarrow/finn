@@ -80,13 +80,9 @@ SCRIPTPATH=$(dirname "$SCRIPT")
 : ${FINN_XRT_PATH=""}
 : ${FINN_DOCKER_NO_CACHE="0"}
 
-DOCKER_INTERACTIVE=""
-
-# Catch FINN_DOCKER_EXTRA options being passed in without a trailing space
-FINN_DOCKER_EXTRA+=" "
-
 # print-tag emits the Docker image tag and exits. Used by the Jenkins publish
 # step so the tag string has one source of truth (here, in FINN_DOCKER_TAG).
+# Run before any side effects so a print-tag invocation is purely read-only.
 if [ "$1" = "print-tag" ]; then
   if [ "$#" -ne 1 ]; then
     echo "Usage: $0 print-tag" >&2
@@ -95,6 +91,11 @@ if [ "$1" = "print-tag" ]; then
   echo "$FINN_DOCKER_TAG"
   exit 0
 fi
+
+DOCKER_INTERACTIVE=""
+
+# Catch FINN_DOCKER_EXTRA options being passed in without a trailing space
+FINN_DOCKER_EXTRA+=" "
 
 if [ -z "$FINN_XILINX_PATH" ];then
   recho "Please set the FINN_XILINX_PATH environment variable to the path to your Xilinx tools installation directory (e.g. /opt/Xilinx)."
@@ -230,7 +231,7 @@ if [ -n "$FINN_DOCKER_SHARED_IMAGE_DIR" ] && \
     fi
   fi
   if [ "$SHARED_LOADED" != "1" ] && [ "$FINN_DOCKER_PREBUILT" != "1" ]; then
-    gecho "WARNING: No usable shared Docker image found at FINN_DOCKER_SHARED_IMAGE_DIR=$SHARED_DIR; falling back to local build"
+    gecho "WARNING: No usable shared Docker image found at FINN_DOCKER_SHARED_IMAGE_DIR=$SHARED_DIR. Falling back to local build"
   fi
   if [ "$FINN_DOCKER_PREBUILT" = "1" ] && [ "$SHARED_LOADED" != "1" ]; then
     recho "FINN_DOCKER_PREBUILT=1 but no usable shared Docker image at FINN_DOCKER_SHARED_IMAGE_DIR=$SHARED_DIR (expected finn-docker-image.tar.gz and finn-docker-tag.txt)"

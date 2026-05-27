@@ -4,8 +4,10 @@
 # Walks <find_dir> for per-shard hw_deployment_*/<board>/* directories and
 # stages each model dir under <stage_dir>/<board>/. The Jenkinsfile calls
 # this once per (testType, board) shard from runShardBody.
-# NOT best-effort: a half-staged deployment tree would silently lose models
+# NOT best-effort. A half-staged deployment tree would silently lose models
 # at aggregate time, so strict mode is on and any error aborts the step.
+# See also: publish_board_zip_stage.sh, which performs the matching
+# aggregate-time walk over the staged trees this script produced.
 set -euo pipefail
 
 if [ "$#" -ne 4 ]; then
@@ -24,8 +26,8 @@ if [ ! -d "$find_dir" ]; then
 fi
 
 mkdir -p "$stage_dir/$board"
-# u+w so a previous run's read-only residue can be removed; ignore failures
-# on a freshly-created dir
+# u+w so a previous run's read-only residue can be removed. Ignore failures
+# on a freshly-created dir.
 chmod -R u+w "$stage_dir/$board" 2>/dev/null || true
 rm -rf "${stage_dir:?}/${board:?}"/*
 

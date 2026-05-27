@@ -118,8 +118,8 @@ def test_update_master_preserves_unseen_and_replaces_seen(tmp_path):
 
     persisted = json.loads(master.read_text())
     merged = json.loads(out.read_text())
-    # seen's prior median is 1.0, observed 3.5 -- ratio 3.5 is within [0.25, 4.0]
-    # so it's accepted and appended to samples.
+    # seen's prior median is 1.0, observed 3.5. Ratio 3.5 is within
+    # [0.25, 4.0] so it's accepted and appended to samples.
     assert persisted["groups"]["seen"]["samples"] == [1.0, 3.5]
     assert persisted["groups"]["unseen"]["samples"] == [7.0]
     assert merged["groups"]["seen"]["samples"] == [1.0, 3.5]
@@ -387,7 +387,7 @@ def test_multi_shard_rows_use_loadgroup_dist_mode():
 
 
 def test_validate_stage_row_rejects_multi_shard_without_loadgroup():
-    row = {"stage": "X", "marker": "x", "shards": 2, "workers": 1}
+    row = {"param": "p", "stage": "X", "marker": "x", "shards": 2, "workers": 1}
     with pytest.raises(ValueError, match="must set distMode='loadgroup'"):
         ci_sharding.validate_stage_row(row)
 
@@ -417,7 +417,7 @@ def test_enabled_params_full_on_synthetic_stages_picks_up_new_params():
 
 
 def test_validate_config_single_invocation_returns_full_payload(capsys):
-    # The Jenkinsfile collapsed three sh calls into this one; the contract
+    # The Jenkinsfile collapsed three sh calls into this one. The contract
     # is "all four keys present, well-formed, ready for readJSON". If this
     # subcommand ever silently changes shape, loadStageConfig() loses a
     # field and the rest of Validate degrades quietly.
@@ -622,7 +622,7 @@ def test_prune_numeric_builds_canonicalises_leading_zeros(tmp_path):
         tag="t",
     )
     # newest ("0125") kept by retain_n, current build ("0123" via int(123))
-    # kept by the current-build guard; "0124" is the only one pruned.
+    # kept by the current-build guard. "0124" is the only one pruned.
     assert matched == 1
     surviving = sorted(p.name for p in parent.iterdir())
     assert surviving == ["0123", "0125"]
@@ -795,7 +795,7 @@ def test_prune_numeric_builds_tolerates_concurrent_delete(tmp_path, monkeypatch)
         tag="t",
     )
     assert matched == 2
-    # build '3' is kept (retain_n=1, newest); '2' got rmtreed for real;
+    # build '3' is kept (retain_n=1, newest), '2' got rmtreed for real,
     # '1' was the simulated race victim and we tolerated it
     surviving = sorted(p.name for p in parent.iterdir())
     assert "3" in surviving
@@ -805,7 +805,7 @@ def test_prune_numeric_builds_tolerates_concurrent_delete(tmp_path, monkeypatch)
 def test_prune_numeric_builds_tolerates_concurrent_delete_in_age_check(tmp_path, monkeypatch):
     parent = tmp_path / "p"
     parent.mkdir()
-    # retain_n=1 keeps the newest ('3'); '1' and '2' are both deletion
+    # retain_n=1 keeps the newest ('3'). '1' and '2' are both deletion
     # candidates. age cutoff is in the past so both qualify on mtime.
     for build in ("1", "2", "3"):
         (parent / build).mkdir()
@@ -1253,7 +1253,7 @@ def test_ok():
 
 def test_pytest_plugin_writes_empty_shard_sidecar_when_slice_collected_zero(pytester):
     # Two single-test groups round-robin onto shards 0 and 1 (sorted by
-    # nodeid); shard 1 therefore gets one item, shard 0 gets the other.
+    # nodeid). Shard 1 therefore gets one item, shard 0 gets the other.
     # If we then ask for shard 0 with a marker that only matches the
     # second test, the slice is empty and the plugin must:
     #  - remap exit 5 to 0 so the build does not fail spuriously
@@ -1617,11 +1617,50 @@ def test_validate_stage_row_accepts_each_live_row():
 @pytest.mark.parametrize(
     "bad,match",
     [
-        ({"stage": "X", "marker": "a and b", "shards": 1, "workers": 1}, "unsafe marker"),
-        ({"stage": "X", "marker": "a", "shards": 0, "workers": 1}, "invalid shards"),
-        ({"stage": "X", "marker": "a", "shards": 1, "workers": 0}, "invalid workers"),
         (
-            {"stage": "X", "marker": "a", "shards": 1, "workers": 1, "distMode": "bogus"},
+            {"stage": "X", "marker": "a", "shards": 1, "workers": 1},
+            "missing param",
+        ),
+        (
+            {"stage": "X", "param": "", "marker": "a", "shards": 1, "workers": 1},
+            "missing param",
+        ),
+        (
+            {"stage": "X", "param": 7, "marker": "a", "shards": 1, "workers": 1},
+            "missing param",
+        ),
+        (
+            {"stage": "X", "param": "p", "marker": "a and b", "shards": 1, "workers": 1},
+            "unsafe marker",
+        ),
+        (
+            {"stage": "X", "param": "p", "marker": "a", "shards": 0, "workers": 1},
+            "invalid shards",
+        ),
+        (
+            {"stage": "X", "param": "p", "marker": "a", "shards": 1, "workers": 0},
+            "invalid workers",
+        ),
+        (
+            {
+                "stage": "X",
+                "param": "p",
+                "marker": "a",
+                "shards": 1,
+                "workers": 1,
+                "coverage": "yes",
+            },
+            "invalid coverage",
+        ),
+        (
+            {
+                "stage": "X",
+                "param": "p",
+                "marker": "a",
+                "shards": 1,
+                "workers": 1,
+                "distMode": "bogus",
+            },
             "invalid distMode",
         ),
     ],
@@ -1629,6 +1668,20 @@ def test_validate_stage_row_accepts_each_live_row():
 def test_validate_stage_row_rejects_bad_input(bad, match):
     with pytest.raises(ValueError, match=match):
         ci_sharding.validate_stage_row(bad)
+
+
+def test_validate_stage_row_accepts_explicit_coverage_bool():
+    row = {
+        "param": "p",
+        "stage": "X",
+        "marker": "a",
+        "shards": 1,
+        "workers": 1,
+        "coverage": True,
+    }
+    ci_sharding.validate_stage_row(row)
+    row["coverage"] = False
+    ci_sharding.validate_stage_row(row)
 
 
 def test_validate_config_runs_validate_stage_row_for_every_entry(monkeypatch, capsys):

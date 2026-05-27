@@ -107,7 +107,7 @@ from finn.util.test import (
 )
 
 # ci_sharding lives under docker/jenkins/, so its parent must be on sys.path.
-# tests/conftest.py also inserts it before collection; this local guard keeps
+# tests/conftest.py also inserts it before collection. This local guard keeps
 # the import resolvable in tools that load the file directly (e.g. IDE
 # inspection, isolated test reruns). The non-import statements below force
 # isort to treat the trailing import as positionally fixed.
@@ -386,7 +386,7 @@ def deploy_based_on_board(model, model_title, topology, wbits, abits, board):
 
 
 # Each scenario carries one marker so pytest -m <marker> picks the shard.
-# Sanity is a fixed 4-tuple (one per board); -m bnn_<board> selects the
+# Sanity is a fixed 4-tuple (one per board). -m bnn_<board> selects the
 # 12-scenario matrix for that board.
 _SANITY_BNN_CONFIGS = [
     (1, 1, "lfc", "Pynq-Z1"),

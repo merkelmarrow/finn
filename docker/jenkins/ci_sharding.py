@@ -29,7 +29,7 @@ import time
 # Configuration knobs
 # =============================================================================
 # Sharding policy and anomaly-protection thresholds for the timing master.
-# Tune here; the rest of the file should not need editing for a knob change.
+# Tune here. The rest of the file should not need editing for a knob change.
 
 # Per-group rolling window for the timing master. Median over the window
 # absorbs single anomalous observations while still tracking real changes.
@@ -67,7 +67,7 @@ CORRUPT_BACKUP_RETAIN = 5
 SLOW_FACTOR = 1.5
 
 # Per-tree retention for the prune-images / prune-artifacts / prune-snapshots
-# CLI subcommands. Images are cheap to rebuild; artifacts double as the
+# CLI subcommands. Images are cheap to rebuild. Artifacts double as the
 # per-board fallback when an individual board's most recent build regressed,
 # so the artifact window is deep enough to outlast the longest realistic
 # single-board streak. Snapshots are kB-sized per build but accumulate
@@ -174,7 +174,7 @@ HW_TEST_TYPE_LABELS = {
 #                 loadgroup is load-bearing for any row whose tests chain via
 #                 load_test_checkpoint_or_skip across xdist_group siblings
 #   zipArtifacts: optional, {"hwTestType": ..., "boards": [...]} declaring the
-#                 build-to-HW handoff zips this row publishes; hwTestType must
+#                 build-to-HW handoff zips this row publishes. hwTestType must
 #                 have a HW_TEST_TYPE_LABELS entry
 STAGES = [
     {
@@ -189,8 +189,8 @@ STAGES = [
         },
     },
     # distMode: loadgroup is load-bearing for any row whose tests chain via
-    # load_test_checkpoint_or_skip across xdist_group siblings; see the STAGES
-    # field doc above before dropping it from any row below.
+    # load_test_checkpoint_or_skip across xdist_group siblings. See the
+    # STAGES field doc above before dropping it from any row below.
     {
         "param": "sanity",
         "stage": "Sanity - Unit Tests",
@@ -264,11 +264,18 @@ def marker_tokens(marker_expr):
 def validate_stage_row(row):
     """Sanity-check a single STAGES row in isolation.
 
-    Catches a typo in marker / shards / workers / distMode at config-load
-    time so a malformed row cannot silently survive into Jenkins or the
-    conftest plugin.
+    Catches a typo in param / marker / shards / workers / coverage / distMode
+    at config-load time so a malformed row cannot silently survive into
+    Jenkins or the conftest plugin. A missing or empty ``param`` is the
+    sneakiest of these because the row would be skipped by every Groovy
+    helper that gates on ``rowIsActive`` without anything ever logging why.
     """
     stage = row.get("stage", "<unnamed>")
+    param = row.get("param")
+    if not isinstance(param, str) or not param:
+        raise ValueError(
+            "STAGES row %r has invalid or missing param=%r" % (stage, param)
+        )
     marker = row.get("marker", "")
     if not MARKER_SAFE_PATTERN.match(str(marker)):
         raise ValueError(
@@ -281,6 +288,11 @@ def validate_stage_row(row):
     workers = row.get("workers")
     if not isinstance(workers, int) or workers < 1:
         raise ValueError("STAGES row %r has invalid workers=%r" % (stage, workers))
+    if "coverage" in row and not isinstance(row["coverage"], bool):
+        raise ValueError(
+            "STAGES row %r has invalid coverage=%r (must be bool)"
+            % (stage, row["coverage"])
+        )
     dist_mode = row.get("distMode")
     if dist_mode not in VALID_DIST_MODES:
         raise ValueError(
@@ -340,8 +352,10 @@ def validate_config(stages=None, boards=None, hw_test_type_labels=None):
 
     Fails loud if a STAGES row references a board not declared in BOARDS, if
     a row's hwTestType has no HW_TEST_TYPE_LABELS entry, or if any single
-    row is malformed. The one entry point the Validate stage in Jenkins
-    delegates to.
+    row is malformed. Called by every CLI subcommand that consumes BOARDS,
+    STAGES, or HW_TEST_TYPE_LABELS (``validate-config``, ``hw-shards-json``,
+    ``hw-test-types-json``, ``hw-test-type-labels-json``) so a bad table
+    fails fast wherever it is first read.
     """
     stages = stages if stages is not None else STAGES
     boards = boards if boards is not None else BOARDS
@@ -959,8 +973,19 @@ def update_master(
 ):
     """Merge observed timings into a per-build preview and optionally the master.
 
-    Every call writes ``out_path``. Persistent master updates are opt-in:
-    only trusted full-matrix builds advance build_seq and run GC.
+    Every call writes ``out_path``. Persistent master updates are opt-in.
+    Only trusted full-matrix builds (``update_persistent=True``) advance
+    build_seq, run GC, and increment ``consecutive_rejections`` on rejected
+    observations. Force-accept after ``FORCE_ACCEPT_AFTER`` consecutive
+    rejections likewise only fires when both ``update_persistent`` and
+    ``allow_force_accept`` are set.
+
+    In non-persist (preview) mode the per-group entries written to
+    ``out_path`` reflect what a persistent write would do, including
+    ``last_seen_build_seq = master.build_seq + 1``. The on-disk persistent
+    master is untouched, so this delta only affects the per-build preview
+    artefact. Treat preview ``last_seen_*`` fields as a what-if rather than
+    a record of accepted state.
     """
     observed_raw = observed_groups_from_reports(reports_dir)
     metadata = metadata or {}
@@ -1108,7 +1133,7 @@ def _prune_corrupt_backups(master_path, retain=CORRUPT_BACKUP_RETAIN):
 
 
 def _backup_if_corrupt(master_path):
-    """Rename a non-empty unparseable master aside; returns True if backed up."""
+    """Rename a non-empty unparseable master aside. Returns True if backed up."""
     if not os.path.isfile(master_path):
         return False
     try:
@@ -1143,7 +1168,7 @@ def locked_update(master_path, update_fn):
     """Acquire an exclusive flock and apply ``update_fn`` to the master JSON.
 
     The lock file (``.<basename>.lock``) lives next to the master and is
-    intentionally never deleted; the dot prefix keeps it out of ``ls``
+    intentionally never deleted. The dot prefix keeps it out of ``ls``
     listings since operators ``cat`` the master.
     """
     if not master_path:
@@ -1178,7 +1203,7 @@ def resolve_build_zips(artifact_dir, job_key, test_types, boards, build_dir=""):
     board, the highest-numbered build whose ``zips/<testType>/<board>.zip.READY``
     sibling is present. Boards with no READY come back as ``{}``.
 
-    ``build_dir`` pins every pair to that single directory; a missing READY
+    ``build_dir`` pins every pair to that single directory. A missing READY
     there is reported per-board but does not abort the call.
     """
     out = {tt: {b: {} for b in boards} for tt in test_types}
@@ -1238,9 +1263,11 @@ def resolve_build_zips(artifact_dir, job_key, test_types, boards, build_dir=""):
 def prune_numeric_builds(parent, current_build, retain_n, max_age_days, dry_run, *, tag):
     """Delete numeric-named subdirs of ``parent`` outside the newest ``retain_n``.
 
-    Tolerant of concurrent rmtree on a shared NFS parent (vanished entries
-    are treated as already-pruned). ``current_build`` must be integer-like.
-    Returns the number of directories matched for deletion.
+    Tolerant of concurrent deletion on a shared NFS parent at both probe
+    sites: a vanished entry during the ``os.path.getmtime`` age check and
+    during ``shutil.rmtree`` is treated as already-pruned and skipped.
+    ``current_build`` must be integer-like. Returns the number of
+    directories matched for deletion.
     """
     retain_n = int(retain_n)
     max_age_days = int(max_age_days)
@@ -1331,7 +1358,7 @@ def prune_snapshots(state_root, job_key, current_build, retain_n, max_age_days, 
     """Rotate per-build timing snapshot files under ``_ci_state/<job_key>/``.
 
     Snapshots are named ``build_<N>_timings_input.json`` alongside the
-    persistent ``ci_timings_master.json``; only the build-numbered files
+    persistent ``ci_timings_master.json``. Only the build-numbered files
     are eligible for pruning. Tolerant of concurrent unlink on a shared
     NFS parent (vanished entries are treated as already-pruned).
     """

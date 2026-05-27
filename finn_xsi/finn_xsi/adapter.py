@@ -46,10 +46,12 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
         verilog_header_incl_str = " ".join(["--include " + x for x in verilog_headers])
 
         # *_pkg.{sv,v} must elaborate before modules that import them.
-        # The list comprehensions preserve relative ordering inside the
-        # package and non-package partitions (Python list comprehensions are
-        # stable iteration); the prior sorted(... key=...) form was
-        # equivalent.
+        # The prior sorted(..., key=...) form recognised only the substrings
+        # ``["swg_pkg", "mvu_pkg"]``, so any other ``*_pkg.sv`` (e.g. one
+        # introduced by a newer finn-hlslib package) elaborated after its
+        # importers and xelab failed. Switching to a basename-suffix match
+        # covers every package file uniformly. List comprehensions are
+        # stable, so relative ordering inside each partition is preserved.
         def _is_pkg_src(p):
             base = os.path.basename(p)
             return base.endswith("_pkg.sv") or base.endswith("_pkg.v")

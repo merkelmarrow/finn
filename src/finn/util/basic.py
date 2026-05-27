@@ -278,7 +278,7 @@ def resolve_xilinx_tool(default_name):
 
     Honours the registered override env var so a bare name or absolute path
     both work in the script. Raises FileNotFoundError when the resolved
-    command is not on PATH; assert is unsuitable here because the check
+    command is not on PATH. assert is unsuitable here because the check
     is runtime input, not an invariant, and would be stripped under -O.
     """
     override_env_var = _XILINX_TOOL_OVERRIDES.get(default_name)

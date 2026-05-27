@@ -1,6 +1,7 @@
 // Shared helpers loaded by both Jenkinsfile (build pipeline) and Jenkinsfile_HW.
 // Helpers that genuinely diverge between the two pipelines (e.g. safeStash,
-// cleanPreviousBuildFiles) expose distinct entry points instead of being
+// the directory-clean trio cleanPreviousBuildFiles / cleanBoardWorkdirHw /
+// cleanReportsDirHw) expose distinct entry points instead of being
 // parameterised here.
 
 boolean paramBool(String name) {
@@ -42,9 +43,9 @@ void unstashIfPresent(String stashName) {
   }
 }
 
-// Build pipeline stashes the full per-shard report sidecar set; some are missing
-// when a shard fails early, so allowEmpty is true. The .coverage entry only
-// exists on rows that opted into coverage in STAGES.
+// Build pipeline stashes the full per-shard report sidecar set. Some are
+// missing when a shard fails early, so allowEmpty is true. The .coverage
+// entry only exists on rows that opted into coverage in STAGES.
 void safeStashShardReport(String stashName) {
   catchError(buildResult: null, stageResult: null,
              message: "safeStashReport(${stashName}) failed, aggregation may be partial") {
@@ -91,21 +92,34 @@ void cleanPreviousBuildFiles(String buildDir) {
   sh "mkdir -p ${q}"
 }
 
-// HW form: always rm both the build dir and its sibling .zip. Every HW caller
-// wants both gone; sudo is added only when HW credentials are bound (the board
-// agents can leave root-owned residue behind). Hard-fails on residue so a
-// silently surviving root-owned tree cannot pollute the next shard.
-void cleanPreviousBuildFilesHw(String buildDir) {
+// HW per-board workdir form: rm both the build dir and its sibling .zip
+// (the unstashed bitstream zip the next shard would otherwise overwrite
+// without rotation). Sudo is added only when HW credentials are bound,
+// because board agents can leave root-owned residue behind. Hard-fails on
+// residue so a silently surviving root-owned tree cannot pollute the next
+// shard.
+void cleanBoardWorkdirHw(String buildDir) {
   if (!buildDir || buildDir.empty) { return }
   String prefix = env.USER_CREDENTIALS ? 'echo "$USER_CREDENTIALS_PSW" | sudo -S ' : ''
   String q = shellQuote(buildDir)
   String qZip = shellQuote(buildDir + '.zip')
   sh "${prefix}rm -rf ${q} ${qZip}"
-  _assertNoResidue('cleanPreviousBuildFilesHw', q)
+  _assertNoResidue('cleanBoardWorkdirHw', q)
+}
+
+// HW reports-dir form: rm the dir only. No sibling .zip semantics, because
+// the HW aggregator never produces a reports.zip alongside reports/. Sudo
+// when credentials are bound for symmetry with cleanBoardWorkdirHw.
+void cleanReportsDirHw(String dir) {
+  if (!dir || dir.empty) { return }
+  String prefix = env.USER_CREDENTIALS ? 'echo "$USER_CREDENTIALS_PSW" | sudo -S ' : ''
+  String q = shellQuote(dir)
+  sh "${prefix}rm -rf ${q}"
+  _assertNoResidue('cleanReportsDirHw', q)
 }
 
 // All shared NFS subtrees derive from FINN_CI_NFS_ROOT. Returning '' from any
-// resolver means "no NFS available"; callers must handle that as a fallback.
+// resolver means "no NFS available". Callers must handle that as a fallback.
 String finnCiNfsRoot() { return (env.FINN_CI_NFS_ROOT ?: '').trim() }
 
 String finnSubdir(String... segments) {

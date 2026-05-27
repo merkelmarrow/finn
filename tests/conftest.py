@@ -382,7 +382,7 @@ def pytest_collection_finish(session):
 def pytest_runtest_logreport(report):
     if _TIMINGS is None:
         return
-    # Sum setup+call+teardown per nodeid; xdist forwards worker reports here.
+    # sum setup+call+teardown per nodeid. xdist forwards worker reports here.
     duration = float(getattr(report, "duration", 0.0) or 0.0)
     _TIMINGS["per_test_seconds"][report.nodeid] = (
         _TIMINGS["per_test_seconds"].get(report.nodeid, 0.0) + duration

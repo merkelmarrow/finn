@@ -38,7 +38,7 @@ List<String> HW_TEST_TYPES = []
 @Field
 Map<String, String> HW_TEST_TYPE_LABELS = [:]
 
-// Keyed by agentLabel; populated by refreshNodeOnlineFlags().
+// Keyed by agentLabel. Populated by refreshNodeOnlineFlags().
 @Field
 Map<String, Boolean> NODE_ONLINE = [:]
 
@@ -87,7 +87,7 @@ pipeline {
       agent { label "${FINN_BUILD_LABEL}" }
       steps { script { collectBuildArtifacts() } }
     }
-    // One scripted stage per HW test type; the loop body adds a nested
+    // One scripted stage per HW test type. The loop body adds a nested
     // ``stage(name)`` per entry so each test type still shows up as its
     // own row in the Jenkins UI. Adding a new test type is a one-line edit
     // of HW_TEST_TYPE_LABELS in ci_sharding.py.
@@ -152,7 +152,7 @@ boolean isOnline(String agentLabel) {
   return v != null && v
 }
 
-// One reboot per restartPrep=true board; runReboot() skips offline ones.
+// One reboot per restartPrep=true board. runReboot() skips offline ones.
 Map<String, Closure> buildRebootMap() {
   def branches = [:]
   HW_SHARDS.each { row ->
@@ -205,7 +205,7 @@ void resolveBuildBoardZipPaths() {
   String override = paramString('build_dir').trim()
   String artifactDir = loadCommonOnce().finnArtifactsRoot()
   if (!artifactDir && !override) {
-    error "resolveBuildBoardZipPaths: FINN_CI_NFS_ROOT is unset; the HW pipeline cannot " +
+    error "resolveBuildBoardZipPaths: FINN_CI_NFS_ROOT is unset. The HW pipeline cannot " +
           "locate build artifacts. Set FINN_CI_NFS_ROOT in the HW job's environment " +
           "to the same path as the build job, or pass build_dir explicitly to pin a " +
           "single build directory (useful for off-NFS recovery)."
@@ -243,7 +243,7 @@ void resolveBuildBoardZipPaths() {
 }
 
 // Sole writer of currentBuild.description on the HW pipeline. Boards may
-// resolve to different builds when one board regressed; archive each
+// resolve to different builds when one board regressed. Archive each
 // distinct build's BUILD_INFO.txt for traceability.
 void archiveBuildInfo() {
   catchError(buildResult: null, stageResult: null,
@@ -346,7 +346,10 @@ String buildBoardZip(String testType, String board) {
   return entry?.zip ?: ''
 }
 
-// finally{} ensures junit XML on failure.
+// finally{} ensures junit XML on failure. chown runs before stash so any
+// root-owned ${testType}_hw_${board}.xml/html (created by sudo'd pytest on
+// Pynq boards under a restrictive umask) is owned by the Jenkins user
+// before stash reads it. Otherwise stash would silently see no XML.
 void runHwShard(Map row, String testType, String stageName) {
   if (!isOnline(row.agentLabel as String)) {
     error "${stageName} cannot run: agent ${row.agentLabel} is offline"
@@ -361,10 +364,10 @@ void runHwShard(Map row, String testType, String stageName) {
           }
         }
       } finally {
+        withHwCredentials(row) { cleanUpWorkspaceOwnership(row) }
         dir("${testType}/${row.board}") {
           safeStashReport(stash, "${testType}_hw_${row.board}")
         }
-        withHwCredentials(row) { cleanUpWorkspaceOwnership(row) }
       }
     }
   }
@@ -377,7 +380,7 @@ void runHwShard(Map row, String testType, String stageName) {
 // stale root-owned residue appears mysteriously on the next shard.
 void withHwCredentials(Map row, Closure body) {
   if (!row.credentialsId) {
-    echo "[hw] ${row.board}: no credentialsId bound; running without sudo wrapper"
+    echo "[hw] ${row.board}: no credentialsId bound. Running without sudo wrapper"
     body.call()
     return
   }
@@ -394,7 +397,7 @@ void withHwCredentials(Map row, Closure body) {
 void runHwTest(Map row, String testType) {
   sh "mkdir -p ${shellQuote(testType)}"
   dir("${testType}") {
-    cleanPreviousBuildFiles(row.board as String)
+    cleanBoardWorkdir(row.board as String)
     String zipName = "${row.board}.zip"
     unstash name: hwZipStashName(testType, row.board as String)
     sh "unzip -o ${shellQuote(zipName)}"
@@ -440,9 +443,9 @@ String hwZipStashName(String testType, String board) {
 
 // junit first (workspace-local, never flakes), then merge and archive.
 void aggregateReports() {
-  // clean must come first; otherwise we'd rm -rf the dir we just created
+  // clean must come first. Otherwise we'd rm -rf the dir we just created
   // and the subsequent unstash would land in a stale parent.
-  cleanPreviousBuildFiles('reports')
+  cleanReportsDir('reports')
   sh 'mkdir -p reports'
   dir('reports') {
     expectedStashes().each { name -> unstashIfPresent(name) }
@@ -529,7 +532,8 @@ String paramString(String name)               { return loadCommonOnce().paramStr
 String shellQuote(String s)                   { return loadCommonOnce().shellQuote(s) }
 void   runDockerCommand(String command)       { loadCommonOnce().runDockerCommand(command) }
 void   unstashIfPresent(String stashName)     { loadCommonOnce().unstashIfPresent(stashName) }
-void   cleanPreviousBuildFiles(String dir)    { loadCommonOnce().cleanPreviousBuildFilesHw(dir) }
+void   cleanBoardWorkdir(String buildDir)     { loadCommonOnce().cleanBoardWorkdirHw(buildDir) }
+void   cleanReportsDir(String dir)            { loadCommonOnce().cleanReportsDirHw(dir) }
 
 void safeStashReport(String stashName, String fileBase) {
   loadCommonOnce().safeStashHwReport(stashName, fileBase)

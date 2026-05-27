@@ -2,7 +2,7 @@
 # archive_failure_logs.sh <build_dir> <tarball_path> [start_marker]
 #
 # One tarball of tool logs per failed shard. LSF staging logs live outside
-# the build dir under FINN_LSF_NFS_STAGING; they are scoped to files newer
+# the build dir under FINN_LSF_NFS_STAGING. They are scoped to files newer
 # than the start_marker if provided.
 # Best-effort: failures are logged but never abort the pipeline (the real
 # test result is owned by pytest).
