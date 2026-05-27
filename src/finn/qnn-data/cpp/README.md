@@ -4,8 +4,8 @@ This directory contains C++ utilities for reading and writing NumPy files in HLS
 
 ## Files
 
-- `npy2apintstream.hpp` - Convert NumPy arrays to ap_int streams
-- `npy2vectorstream.hpp` - Convert NumPy arrays to HLS vector streams
+- `npy2apintstream.hpp` - Convert NumPy arrays to/from `ap_int` streams
+- `npy2vectorstream.hpp` - Convert NumPy arrays to/from HLS vector streams
 - `cnpy.h`, `cnpy.cpp` - NumPy file I/O library (MIT License)
 
 ## cnpy Library
@@ -13,12 +13,18 @@ This directory contains C++ utilities for reading and writing NumPy files in HLS
 The `cnpy.h` and `cnpy.cpp` files are derived from [rogersce/cnpy](https://github.com/rogersce/cnpy)
 (MIT License, Copyright Carl Rogers 2011).
 
-This version has been modified by Advanced Micro Devices, Inc. (Yaman Umuroglu) to add support
-for the Vitis HLS `half` datatype (float16). AMD modifications are licensed under BSD-3-Clause.
-
 See CNPY_LICENSE for the full MIT license text.
 
-### Modifications from Original
+### AMD Modifications from Original
 
-- Added `#include "ap_int.h"` to support HLS datatypes
-- Added `half` type support in `map_type()` function for float16 compatibility
+This version has been modified by Advanced Micro Devices, Inc.
+AMD modifications are licensed under BSD-3-Clause.
+
+- Removed NPZ (zip archive) support and the `zlib` dependency — FINN only uses single `.npy` files
+- Removed `FILE*`-based I/O in favour of `std::ifstream`/`std::fstream` for RAII-safe resource cleanup
+- Replaced runtime `map_type(const std::type_info&)` with a `constexpr` variable template `map_type<T>`
+- Added `half` type mapping for float16 compatibility
+- Factored `npy_save` into a non-template backing function (`npy_save0`) with thin template wrappers, keeping template code out of the `.cpp` file
+- Changed the save mode parameter from `std::string` (`"w"`, `"a"`) to `std::ios_base::openmode`
+- Made `NpyArray` fields private with const accessors; all members are `const`-initialized
+- Moved all internal helpers (`read_npy_header`, `create_npy_header`, `operator+=` overloads) into the `.cpp` file as `static` implementation details
