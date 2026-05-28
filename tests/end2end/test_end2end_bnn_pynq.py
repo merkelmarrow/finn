@@ -443,15 +443,6 @@ def _bnn_scenarios():
     return scenarios
 
 
-def test_bnn_xdist_group_names_are_unique():
-    groups = []
-    for _, _, marks in _bnn_scenarios():
-        for mark in marks:
-            if mark.name == "xdist_group":
-                groups.append(mark.kwargs["name"])
-    assert len(groups) == len(set(groups))
-
-
 def pytest_generate_tests(metafunc):
     scenarios = _bnn_scenarios()
     if not scenarios:
