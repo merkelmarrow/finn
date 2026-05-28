@@ -1228,7 +1228,20 @@ for name in (
     )
 
 
-def test_pytest_plugin_writes_timings_for_successful_sharded_run(pytester):
+def _scrub_xdist_env(monkeypatch):
+    """Drop PYTEST_XDIST_WORKER for the duration of a pytester sub-run.
+
+    Outer fpgadataflow / unit shards run with -n 8 --dist loadgroup, so every
+    worker has PYTEST_XDIST_WORKER=gwN set. pytester.runpytest is inline and
+    inherits that env, which makes the inner plugin's pytest_sessionstart
+    short-circuit on _is_xdist_worker() and never initialise _TIMINGS. The
+    inner timings.json never gets written and these tests false-fail.
+    """
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+
+
+def test_pytest_plugin_writes_timings_for_successful_sharded_run(pytester, monkeypatch):
+    _scrub_xdist_env(monkeypatch)
     _install_finn_ci_plugin(pytester)
     pytester.makepyfile(
         test_sample="""
@@ -1251,7 +1264,8 @@ def test_ok():
     assert data["groups"][0]["name"].endswith("test_sample.py::test_ok")
 
 
-def test_pytest_plugin_writes_empty_shard_sidecar_when_slice_collected_zero(pytester):
+def test_pytest_plugin_writes_empty_shard_sidecar_when_slice_collected_zero(pytester, monkeypatch):
+    _scrub_xdist_env(monkeypatch)
     # Two single-test groups round-robin onto shards 0 and 1 (sorted by
     # nodeid). Shard 1 therefore gets one item, shard 0 gets the other.
     # If we then ask for shard 0 with a marker that only matches the
@@ -1288,10 +1302,11 @@ def test_b():
     assert "0 items" in sidecar.read_text()
 
 
-def test_pytest_plugin_rejects_conflicting_shard_pins_within_xdist_group(pytester):
+def test_pytest_plugin_rejects_conflicting_shard_pins_within_xdist_group(pytester, monkeypatch):
     # Two tests share an xdist_group and disagree on @pytest.mark.shard(N).
     # _assignment_details must surface this as a UsageError rather than
     # silently splitting a chained checkpoint sequence across shards.
+    _scrub_xdist_env(monkeypatch)
     _install_finn_ci_plugin(pytester)
     pytester.makepyfile(
         test_sample="""
@@ -1322,9 +1337,10 @@ def test_second():
     assert "chain" in combined
 
 
-def test_pytest_plugin_dry_run_prints_per_shard_table_and_exits_zero(pytester):
+def test_pytest_plugin_dry_run_prints_per_shard_table_and_exits_zero(pytester, monkeypatch):
     # --dry-run-shards must print the header row and exit 0 without running
     # any test. We deselect everything by design so exit 5 is benign.
+    _scrub_xdist_env(monkeypatch)
     _install_finn_ci_plugin(pytester)
     pytester.makepyfile(
         test_sample="""
