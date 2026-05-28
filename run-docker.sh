@@ -177,10 +177,12 @@ if [ "$FINN_SKIP_DEP_REPOS" = "0" ]; then
   ./fetch-repos.sh
 fi
 
-# If xrt path given, copy .deb file to this repo
-# Be aware that we assume a certain name of the xrt deb version
-if [ -d "$FINN_XRT_PATH" ];then
-  cp $FINN_XRT_PATH/$XRT_DEB_VERSION.deb .
+# If xrt path given, copy .deb file to this repo. Gate on the .deb
+# itself, not the dir. Otherwise an empty cache dir trips LOCAL_XRT=1
+# without producing a build-context .deb, and the docker build then
+# fails because the wget branch is also skipped.
+if [ -f "$FINN_XRT_PATH/$XRT_DEB_VERSION.deb" ]; then
+  cp "$FINN_XRT_PATH/$XRT_DEB_VERSION.deb" .
   export LOCAL_XRT=1
 fi
 
