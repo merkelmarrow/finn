@@ -28,50 +28,24 @@ import time
 # =============================================================================
 # Configuration knobs
 # =============================================================================
-# Sharding policy and anomaly-protection thresholds for the timing master.
-# Tune here. The rest of the file should not need editing for a knob change.
+# Sharding policy. Tune here. The rest of the file should not need editing
+# for a knob change.
 
-# Per-group rolling window for the timing master. Median over the window
-# absorbs single anomalous observations while still tracking real changes.
+# Per-group rolling window for the timing master. The bin packer reads the
+# median of the window so a single anomalous observation is absorbed.
 MAX_SAMPLES = 5
-
-# A new observation must lie within these ratio bounds of the current median
-# to be accepted into the master. Normal CI variance stays well inside.
-OUTLIER_LOW_RATIO = 0.25
-OUTLIER_HIGH_RATIO = 4.0
-
-# A "shard crashed before any real test ran" looks like ~0s for a group that
-# was previously hundreds of seconds. CRASH_FLOOR_SECONDS is the observed
-# threshold and CRASH_PREVIOUS_FLOOR_SECONDS is the prior-median threshold.
-CRASH_FLOOR_SECONDS = 1.0
-CRASH_PREVIOUS_FLOOR_SECONDS = 10.0
-
-# After this many consecutive ratio rejections, force-accept the next
-# observation so a real regression eventually reaches the master.
-FORCE_ACCEPT_AFTER = 3
-
-# When at least MIN_ELIGIBLE_FOR_ANOMALY_VETO observed groups have a prior
-# median and more than this fraction are outliers, veto the entire build's
-# update (LSF/NFS-storm protection).
-BUILD_WIDE_ANOMALY_RATIO = 0.5
-MIN_ELIGIBLE_FOR_ANOMALY_VETO = 3
-
-# Evict groups not observed for this many trusted full-matrix builds. ~200
-# builds is roughly one month of CI activity.
-GC_BUILDS_UNSEEN = 200
-
-# Keep the newest N .corrupt-<epoch> backups of the master timing file.
-CORRUPT_BACKUP_RETAIN = 5
 
 # summarize-timings flags shards exceeding this multiple of the family median.
 SLOW_FACTOR = 1.5
 
 # Per-tree retention for the prune-images / prune-artifacts / prune-snapshots
-# CLI subcommands. Images are cheap to rebuild. Artifacts double as the
-# per-board fallback when an individual board's most recent build regressed,
-# so the artifact window is deep enough to outlast the longest realistic
-# single-board streak. Snapshots are kB-sized per build but accumulate
-# forever otherwise, so a tight window is sufficient.
+# CLI subcommands. Image and snapshot trees are cheap to rebuild. Artifacts
+# double as the per-board fallback when an individual board's most recent
+# build regressed, so the artifact window is deep enough to outlast the
+# longest realistic single-board streak.
+#
+# Disk budget: at ~80 GB per image and ~200 MB per board zip, the defaults
+# below cap shared storage at roughly 240 GB of image plus 5-10 GB of zips.
 RETENTION = {
     "image": {"retain": 3, "ageDays": 14},
     "artifact": {"retain": 30, "ageDays": 30},
@@ -273,9 +247,7 @@ def validate_stage_row(row):
     stage = row.get("stage", "<unnamed>")
     param = row.get("param")
     if not isinstance(param, str) or not param:
-        raise ValueError(
-            "STAGES row %r has invalid or missing param=%r" % (stage, param)
-        )
+        raise ValueError("STAGES row %r has invalid or missing param=%r" % (stage, param))
     marker = row.get("marker", "")
     if not MARKER_SAFE_PATTERN.match(str(marker)):
         raise ValueError(
@@ -290,8 +262,7 @@ def validate_stage_row(row):
         raise ValueError("STAGES row %r has invalid workers=%r" % (stage, workers))
     if "coverage" in row and not isinstance(row["coverage"], bool):
         raise ValueError(
-            "STAGES row %r has invalid coverage=%r (must be bool)"
-            % (stage, row["coverage"])
+            "STAGES row %r has invalid coverage=%r (must be bool)" % (stage, row["coverage"])
         )
     dist_mode = row.get("distMode")
     if dist_mode not in VALID_DIST_MODES:
@@ -301,24 +272,28 @@ def validate_stage_row(row):
         )
     if shards > 1 and dist_mode != "loadgroup":
         raise ValueError(
-            "STAGES row %r has shards=%r and must set distMode='loadgroup'"
-            % (stage, shards)
+            "STAGES row %r has shards=%r and must set distMode='loadgroup'" % (stage, shards)
         )
     zip_art = row.get("zipArtifacts")
     if zip_art is None:
         return
+    _validate_zip_artifact(stage, zip_art)
+
+
+def _validate_zip_artifact(stage, zip_art):
+    """Sanity-check the optional ``zipArtifacts`` block of one STAGES row."""
     if not isinstance(zip_art, dict):
         raise ValueError("STAGES row %r has invalid zipArtifacts=%r" % (stage, zip_art))
     hw_test_type = zip_art.get("hwTestType")
     if not isinstance(hw_test_type, str) or not hw_test_type:
-        raise ValueError(
-            "STAGES row %r has zipArtifacts without a non-empty hwTestType" % stage
-        )
+        raise ValueError("STAGES row %r has zipArtifacts without a non-empty hwTestType" % stage)
     boards = zip_art.get("boards")
-    if not isinstance(boards, list) or not boards or not all(isinstance(b, str) and b for b in boards):
-        raise ValueError(
-            "STAGES row %r has zipArtifacts without a non-empty boards list" % stage
-        )
+    if (
+        not isinstance(boards, list)
+        or not boards
+        or not all(isinstance(b, str) and b for b in boards)
+    ):
+        raise ValueError("STAGES row %r has zipArtifacts without a non-empty boards list" % stage)
 
 
 def validate_board_row(board, row):
@@ -375,9 +350,7 @@ def validate_config(stages=None, boards=None, hw_test_type_labels=None):
             referenced_test_types.add(str(hw_test_type))
     missing_boards = sorted(referenced_boards - set(boards))
     if missing_boards:
-        raise ValueError(
-            "STAGES references board(s) not declared in BOARDS: %r" % missing_boards
-        )
+        raise ValueError("STAGES references board(s) not declared in BOARDS: %r" % missing_boards)
     missing_labels = sorted(referenced_test_types - set(labels))
     if missing_labels:
         raise ValueError(
@@ -625,9 +598,7 @@ def which_shard(query, master_path="", marker_filter=None, stages=None):
         keys = list(weights.keys())
         if canonical not in keys:
             keys.append(canonical)
-        assignment, _src, _load, _fallback = assign_groups_to_shards(
-            keys, shards, weights=weights
-        )
+        assignment, _src, _load, _fallback = assign_groups_to_shards(keys, shards, weights=weights)
         shard_id = assignment[canonical]
         rows.append(
             {
@@ -788,21 +759,21 @@ def summarize_timings(reports_dir):
 # =============================================================================
 # Timing master state machine
 # =============================================================================
-# The persistent master at ${FINN_CI_NFS_ROOT}/_ci_state/<jobKey>/ci_timings_master.json
-# is refreshed only by trusted full-matrix builds. Schema v1:
+# The persistent master at
+# ${FINN_CI_NFS_ROOT}/_ci_state/<jobKey>/ci_timings_master.json holds the last
+# MAX_SAMPLES observations per group. Trusted full-matrix builds append; the
+# bin packer reads the median. Schema v2:
 #
-#   {"schema_version": 1, "build_seq": int, "updated_at": str,
-#    "last_update": {...},
+#   {"schema_version": 2, "updated_at": str, "last_update": {...},
 #    "groups": {<name>: {"samples": [s1, ..., sMAX_SAMPLES], "count": int,
-#                        "consecutive_rejections": int, "last_seen_*": ...}}}
+#                        "last_seen_*": ...}}}
 #
 # The per-build snapshot written by ``prepare_timing_snapshot`` is the same
-# shape so a snapshot can be inspected with the same tools as the master.
-# Read path: a snapshot with a missing or unrecognised ``schema_version`` is
-# logged and treated as empty, which makes old/corrupt state degrade to
-# round-robin sharding rather than crashing a build.
+# shape so a snapshot can be inspected with the same tools as the master. An
+# unrecognised schema_version is logged and treated as empty, which makes old
+# or corrupt state degrade to round-robin sharding rather than crashing.
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def normalise_master(data):
@@ -823,7 +794,6 @@ def normalise_master(data):
     return {
         "schema_version": SCHEMA_VERSION,
         "updated_at": data.get("updated_at"),
-        "build_seq": int(data.get("build_seq", 0) or 0),
         "groups": dict(groups),
     }
 
@@ -872,120 +842,29 @@ def observed_groups_from_reports(reports_dir):
     return observed
 
 
-def _classify_observation(observed_seconds, prior_samples):
-    """Return ``("accept"|"reject", reason)`` for a single observation."""
-    if not prior_samples:
-        return "accept", "cold-start"
-    median = _median_index(prior_samples)
-    if median <= 0.0:
-        return "accept", "cold-start"
-    if observed_seconds < CRASH_FLOOR_SECONDS and median > CRASH_PREVIOUS_FLOOR_SECONDS:
-        return "reject", "crash-suspect"
-    ratio = observed_seconds / median
-    if ratio < OUTLIER_LOW_RATIO or ratio > OUTLIER_HIGH_RATIO:
-        return "reject", "outlier"
-    return "accept", "in-band"
-
-
-def _is_build_wide_anomaly(observed, master_groups):
-    """Return ``(anomaly, eligible_count, outlier_count)`` for build-wide veto."""
-    eligible = 0
-    outlier = 0
-    for name, observed_seconds in observed.items():
-        prior = _samples_from_entry(master_groups.get(name))
-        if not prior:
-            continue
-        eligible += 1
-        verdict, _ = _classify_observation(observed_seconds, prior)
-        if verdict == "reject":
-            outlier += 1
-    if eligible < MIN_ELIGIBLE_FOR_ANOMALY_VETO:
-        return False, eligible, outlier
-    return (outlier / float(eligible)) >= BUILD_WIDE_ANOMALY_RATIO, eligible, outlier
-
-
-def _apply_per_group_update(
-    name, observed_seconds, current_entry, metadata, build_seq, *, allow_force_accept=False
-):
-    """Merge one observation into one master entry. Returns ``(new_entry, status, reason)``."""
+def _apply_per_group_update(name, observed_seconds, current_entry, metadata):
+    """Append the observation to ``current_entry`` and trim to MAX_SAMPLES."""
     current_entry = current_entry or {}
     prior_samples = _samples_from_entry(current_entry)
-    verdict, reason = _classify_observation(observed_seconds, prior_samples)
-    consecutive = int(current_entry.get("consecutive_rejections", 0) or 0)
-    forced = False
-    if allow_force_accept and verdict == "reject" and consecutive + 1 >= FORCE_ACCEPT_AFTER:
-        verdict = "accept"
-        forced = True
-        reason = "force-accept"
-    new_entry = {
-        "samples": list(prior_samples),
-        "count": int(current_entry.get("count", 0) or 0),
-        "consecutive_rejections": consecutive,
-        "last_seen_job": current_entry.get("last_seen_job"),
-        "last_seen_build": current_entry.get("last_seen_build"),
-        "last_seen_build_seq": int(current_entry.get("last_seen_build_seq", 0) or 0),
-        "last_seen_stage": current_entry.get("last_seen_stage"),
-        "last_seen_stash": current_entry.get("last_seen_stash"),
-        "updated_at": current_entry.get("updated_at"),
+    new_samples = (prior_samples + [round(float(observed_seconds), 3)])[-MAX_SAMPLES:]
+    return {
+        "samples": new_samples,
+        "count": metadata.get("count", int(current_entry.get("count", 0) or 0)),
+        "last_seen_job": metadata.get("last_seen_job"),
+        "last_seen_build": metadata.get("last_seen_build"),
+        "last_seen_stage": metadata.get("last_seen_stage"),
+        "last_seen_stash": metadata.get("last_seen_stash"),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    if verdict == "accept":
-        new_entry["samples"].append(round(float(observed_seconds), 3))
-        new_entry["samples"] = new_entry["samples"][-MAX_SAMPLES:]
-        new_entry["consecutive_rejections"] = 0
-        new_entry["last_seen_build_seq"] = build_seq
-        new_entry["last_seen_job"] = metadata.get("last_seen_job")
-        new_entry["last_seen_build"] = metadata.get("last_seen_build")
-        new_entry["last_seen_stage"] = metadata.get("last_seen_stage")
-        new_entry["last_seen_stash"] = metadata.get("last_seen_stash")
-        new_entry["count"] = metadata.get("count", new_entry["count"])
-        new_entry["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        status = "force-accepted" if forced else "accepted"
-        return new_entry, status, reason
-    new_entry["consecutive_rejections"] = consecutive + 1
-    return new_entry, "rejected", reason
 
 
-def _gc_stale_groups(groups, build_seq):
-    """Drop entries unseen for more than GC_BUILDS_UNSEEN builds."""
-    if build_seq <= GC_BUILDS_UNSEEN:
-        return 0
-    cutoff = build_seq - GC_BUILDS_UNSEEN
-    stale = []
-    for name, entry in groups.items():
-        if not isinstance(entry, dict):
-            continue
-        last_seen = int(entry.get("last_seen_build_seq", 0) or 0)
-        if last_seen > 0 and last_seen < cutoff:
-            stale.append(name)
-    for name in stale:
-        del groups[name]
-    return len(stale)
-
-
-def update_master(
-    reports_dir,
-    master_path,
-    out_path,
-    update_persistent=False,
-    allow_force_accept=False,
-    run_gc=False,
-    metadata=None,
-):
+def update_master(reports_dir, master_path, out_path, update_persistent=False, metadata=None):
     """Merge observed timings into a per-build preview and optionally the master.
 
-    Every call writes ``out_path``. Persistent master updates are opt-in.
-    Only trusted full-matrix builds (``update_persistent=True``) advance
-    build_seq, run GC, and increment ``consecutive_rejections`` on rejected
-    observations. Force-accept after ``FORCE_ACCEPT_AFTER`` consecutive
-    rejections likewise only fires when both ``update_persistent`` and
-    ``allow_force_accept`` are set.
-
-    In non-persist (preview) mode the per-group entries written to
-    ``out_path`` reflect what a persistent write would do, including
-    ``last_seen_build_seq = master.build_seq + 1``. The on-disk persistent
-    master is untouched, so this delta only affects the per-build preview
-    artefact. Treat preview ``last_seen_*`` fields as a what-if rather than
-    a record of accepted state.
+    Every call writes ``out_path``. Persistent master updates are opt-in via
+    ``update_persistent`` (trusted full-matrix builds only); preview mode
+    leaves the on-disk master untouched. Every observation in this build is
+    appended to its group's samples and the window is trimmed to MAX_SAMPLES.
     """
     observed_raw = observed_groups_from_reports(reports_dir)
     metadata = metadata or {}
@@ -994,64 +873,16 @@ def update_master(
 
     def apply(current, persist=False):
         master = normalise_master(current)
-        next_build_seq = master["build_seq"] + 1
-        build_seq = next_build_seq if persist else master["build_seq"]
         master["updated_at"] = now_iso
-        anomaly, eligible, outliers = _is_build_wide_anomaly(observed_seconds, master["groups"])
-        rejected_count = 0
-        accepted_count = 0
-        forced_count = 0
-        if anomaly:
-            print(
-                "ci_sharding update: build-wide anomaly: %d/%d observed groups out of band, "
-                "master unchanged" % (outliers, eligible),
-                file=sys.stderr,
+        for name, seconds in observed_seconds.items():
+            master["groups"][name] = _apply_per_group_update(
+                name, seconds, master["groups"].get(name), observed_raw[name]
             )
-        else:
-            for name, seconds in observed_seconds.items():
-                entry_metadata = observed_raw[name]
-                new_entry, status, reason = _apply_per_group_update(
-                    name,
-                    seconds,
-                    master["groups"].get(name),
-                    entry_metadata,
-                    next_build_seq,
-                    allow_force_accept=allow_force_accept and persist,
-                )
-                master["groups"][name] = new_entry
-                if status == "accepted":
-                    accepted_count += 1
-                elif status == "force-accepted":
-                    forced_count += 1
-                    print(
-                        "ci_sharding update: %s force-accepted after %d rejection(s) (%s)"
-                        % (name, FORCE_ACCEPT_AFTER, reason),
-                        file=sys.stderr,
-                    )
-                else:
-                    rejected_count += 1
-                    print(
-                        "ci_sharding update: %s rejected (%s, observed=%.3fs)"
-                        % (name, reason, seconds),
-                        file=sys.stderr,
-                    )
-        if persist and not anomaly:
-            master["build_seq"] = next_build_seq
-            build_seq = next_build_seq
-        dropped = _gc_stale_groups(master["groups"], build_seq) if (persist and run_gc) else 0
         master["last_update"] = {
             "job": metadata.get("job"),
             "build": metadata.get("build"),
             "persistent_update": bool(persist),
             "observed_groups": len(observed_seconds),
-            "accepted": accepted_count,
-            "rejected": rejected_count,
-            "force_accepted": forced_count,
-            "gc_dropped": dropped,
-            "anomaly": anomaly,
-            "anomaly_eligible": eligible,
-            "anomaly_outliers": outliers,
-            "build_seq": build_seq,
         }
         return master
 
@@ -1066,19 +897,37 @@ def update_master(
     if out_path:
         write_json_atomic(out_path, master)
     print(
-        "ci_sharding update: %d observed, %d accepted, %d rejected, %d force-accepted, "
-        "%d in master, anomaly=%s, persistent_update=%s"
-        % (
-            len(observed_seconds),
-            master.get("last_update", {}).get("accepted", 0),
-            master.get("last_update", {}).get("rejected", 0),
-            master.get("last_update", {}).get("force_accepted", 0),
-            len(master.get("groups", {})),
-            bool(master.get("last_update", {}).get("anomaly", False)),
-            persistent_updated,
-        )
+        "ci_sharding update: %d observed, %d in master, persistent_update=%s"
+        % (len(observed_seconds), len(master.get("groups", {})), persistent_updated)
     )
+    _report_regressions(master_path, observed_seconds)
     return 0
+
+
+# Visible canary now that anomaly-protection is gone: groups whose latest
+# observation is >=2x their prior median are flagged so a real regression
+# does not hide behind the median-of-five window's smoothing.
+REGRESSION_FACTOR = 2.0
+
+
+def _report_regressions(master_path, observed_seconds):
+    """Print one line per group whose latest observation >= REGRESSION_FACTOR x prior median."""
+    if not master_path or not observed_seconds:
+        return
+    prior = normalise_master(read_json(master_path, default={}))
+    flagged = []
+    for name, seconds in observed_seconds.items():
+        prior_median = _entry_median_seconds(prior["groups"].get(name))
+        if prior_median > 0.0 and seconds >= REGRESSION_FACTOR * prior_median:
+            flagged.append((name, seconds, prior_median))
+    if not flagged:
+        return
+    flagged.sort(key=lambda row: row[1] / row[2], reverse=True)
+    parts = ["%s=%.1fs vs %.1fs" % (name, sec, med) for name, sec, med in flagged]
+    print(
+        "ci_sharding update: regressions vs prior median (>=%.1fx): %s"
+        % (REGRESSION_FACTOR, "; ".join(parts))
+    )
 
 
 def prepare_timing_snapshot(master_path, snapshot_path):
@@ -1097,43 +946,13 @@ def prepare_timing_snapshot(master_path, snapshot_path):
     return 0
 
 
-def _prune_corrupt_backups(master_path, retain=CORRUPT_BACKUP_RETAIN):
-    """Keep only the newest ``retain`` ``<master>.corrupt-*`` siblings.
-
-    Sorts by the integer epoch suffix rather than lexicographically so a
-    digit-count rollover (or a clock-skewed agent's future-dated backup)
-    cannot mask a freshly-made one.
-    """
-    parent = os.path.dirname(os.path.abspath(master_path))
-    base = os.path.basename(master_path)
-    prefix = base + ".corrupt-"
-    try:
-        candidates = []
-        for name in os.listdir(parent):
-            if not name.startswith(prefix):
-                continue
-            suffix = name[len(prefix):]
-            try:
-                epoch = int(suffix)
-            except ValueError:
-                # non-numeric suffix: keep but treat as oldest so a real
-                # backup never gets evicted in favour of garbage
-                epoch = -1
-            candidates.append((epoch, name))
-    except OSError:
-        return
-    if len(candidates) <= retain:
-        return
-    candidates.sort()
-    for _, stale in candidates[:-retain]:
-        try:
-            os.unlink(os.path.join(parent, stale))
-        except OSError:
-            pass
-
-
 def _backup_if_corrupt(master_path):
-    """Rename a non-empty unparseable master aside. Returns True if backed up."""
+    """Rename a non-empty unparseable master aside. Returns True if backed up.
+
+    Keeps a single ``<master>.corrupt-<epoch>`` sibling per incident. If
+    corruption recurs across runs, each invocation leaves its own backup;
+    operators clean up by hand.
+    """
     if not os.path.isfile(master_path):
         return False
     try:
@@ -1154,7 +973,6 @@ def _backup_if_corrupt(master_path):
                 % (master_path, backup),
                 file=sys.stderr,
             )
-            _prune_corrupt_backups(master_path)
             return True
         except OSError as exc:
             print(
@@ -1321,9 +1139,7 @@ def _prune_subtree(parent, tag, current_build, retain_n, max_age_days, *, dry_ru
     if not os.path.isdir(parent):
         print("ci_sharding %s: %s not present, skipping" % (tag, parent))
         return 0
-    matched = prune_numeric_builds(
-        parent, current_build, retain_n, max_age_days, dry_run, tag=tag
-    )
+    matched = prune_numeric_builds(parent, current_build, retain_n, max_age_days, dry_run, tag=tag)
     print(
         "ci_sharding %s: done (parent=%s current=%s retain_n=%s "
         "max_age_days=%s dry_run=%s matched=%d)"
@@ -1461,8 +1277,6 @@ def _dispatch(argv):
     p.add_argument("--job", default="")
     p.add_argument("--build", default="")
     p.add_argument("--update-master", action="store_true")
-    p.add_argument("--allow-force-accept", action="store_true")
-    p.add_argument("--gc", action="store_true")
 
     p = sub.add_parser("merge-maps")
     p.add_argument("reports_dir")
@@ -1476,9 +1290,7 @@ def _dispatch(argv):
         help="Comma-separated HW test types (e.g. bnn_build_sanity,bnn_build_full)",
     )
     p.add_argument("--boards", required=True, help="Comma-separated board names")
-    p.add_argument(
-        "--build-dir", default="", help="Optional explicit build directory override"
-    )
+    p.add_argument("--build-dir", default="", help="Optional explicit build directory override")
 
     p = sub.add_parser("prune-images")
     p.add_argument("shared_dir")
@@ -1554,8 +1366,6 @@ def _dispatch(argv):
             args.master,
             args.out,
             update_persistent=args.update_master,
-            allow_force_accept=args.allow_force_accept,
-            run_gc=args.gc,
             metadata={
                 "job": args.job,
                 "build": args.build,
@@ -1566,9 +1376,7 @@ def _dispatch(argv):
     if args.cmd == "resolve-build-zips":
         tests = [t for t in args.tests.split(",") if t]
         boards = [b for b in args.boards.split(",") if b]
-        result = resolve_build_zips(
-            args.artifact_dir, args.job_key, tests, boards, args.build_dir
-        )
+        result = resolve_build_zips(args.artifact_dir, args.job_key, tests, boards, args.build_dir)
         print(json.dumps(result))
         return 0
     if args.cmd == "prune-images":
@@ -1599,9 +1407,7 @@ def _dispatch(argv):
             args.dry_run,
         )
     if args.cmd == "which-shard":
-        rows = which_shard(
-            args.query, master_path=args.timings, marker_filter=args.marker
-        )
+        rows = which_shard(args.query, master_path=args.timings, marker_filter=args.marker)
         print(json.dumps(rows, indent=2))
         return 0
     parser.print_help()

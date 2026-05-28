@@ -117,6 +117,17 @@ if [ -z "$V80PP_DEB_PACKAGE" ];then
   recho "This is required to be able to use the Alveo V80 card."
 fi
 
+# Mirror the Jenkinsfile's local-fallback banner, but only inside a real
+# Jenkins run (JENKINS_URL + BUILD_NUMBER) so unrelated CI systems and
+# developer shells that happen to export BUILD_NUMBER stay quiet.
+if [ -n "$JENKINS_URL" ] && [ -n "$BUILD_NUMBER" ] \
+   && [ -z "$FINN_CI_NFS_ROOT" ] && [ -z "$FINN_DOCKER_SHARED_IMAGE_DIR" ]; then
+  recho "FINN_CI_NFS_ROOT and FINN_DOCKER_SHARED_IMAGE_DIR are unset. Running in local-fallback mode."
+  recho "  - no shared Docker image cache (this agent will build locally)"
+  recho "  - no build-to-HW artifact handoff (the HW pipeline cannot test this build)"
+  recho "Set FINN_CI_NFS_ROOT in the Jenkins job DSL to enable the shared cache."
+fi
+
 if [ "$1" = "test" ]; then
   gecho "Running test suite (all tests)"
   DOCKER_CMD="pytest"

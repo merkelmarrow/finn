@@ -25,7 +25,10 @@ fi
 
 # Use absolute paths so tar can stat them from its own cwd.
 abs_bd=$(cd "$bd" && pwd)
-newer_ref=$bd
+# The LSF staging scan is only useful when scoped to files newer than the
+# real per-shard start. Without a marker the find would slurp the entire
+# shared staging dir, so we skip the LSF block entirely instead.
+newer_ref=
 if [ -n "$start_marker" ] && [ -e "$start_marker" ]; then
   newer_ref=$start_marker
 fi
@@ -35,24 +38,32 @@ fi
 # from a tar failure.
 list=$(mktemp)
 trap 'rm -f "$list"' EXIT
+
+# Filename-based capture in two passes. The first pass catches basenames
+# that are unambiguously FINN/Vitis artefacts wherever they land in the
+# build dir. The second pass uses a grep on the build-subdir families FINN
+# produces so generic names like config.txt only match inside those
+# subtrees. New Vitis internal layouts below _x/link/ stop silently
+# dropping logs because we no longer pin to a fixed path. Anchored to the
+# leading slash so 'myvitis_proj' cannot accidentally match 'vitis_proj'.
+build_subdirs='/(project_|finn_zynqbuild_|vitis_proj/|vivado_stitch_proj_|vitis_link_proj_)'
 {
   find "$abs_bd" -type f \( \
-      -name vitis_hls.log -o \
-      -name build_dataflow.log -o \
-      -path '*/project_*/sol1/impl/ip/vivado.log' -o \
-      -path '*/finn_zynqbuild_*/vivado.log' -o \
-      -path '*/vitis_proj/_x/logs/*.log' -o \
-      -path '*/vivado_stitch_proj_*/vivado.log' -o \
-      -path '*/vitis_link_proj_*/v++_a.log' -o \
-      -path '*/vitis_link_proj_*/v++.link_summary' -o \
-      -path '*/vitis_link_proj_*/run_vitis_link.sh' -o \
-      -path '*/vitis_link_proj_*/config.txt' -o \
-      -path '*/vitis_link_proj_*/_x/link/link.steps.log' -o \
-      -path '*/vitis_link_proj_*/_x/link/sys_link/_sysl/.cdb/*.fcnmap.xml' -o \
-      -path '*/vitis_link_proj_*/_x/link/sys_link/_sysl/.cdb/xd_ip_index.xml' -o \
-      -path '*/vitis_link_proj_*/_x/link/vivado/vpl/*runme.log' \
+      -name 'vitis_hls.log' -o \
+      -name 'build_dataflow.log' -o \
+      -name 'vivado.log' -o \
+      -name 'v++_a.log' -o \
+      -name 'v++.link_summary' -o \
+      -name 'link.steps.log' -o \
+      -name '*runme.log' \
     \) -print0 2>/dev/null
-  if [ -d "$lsf_staging" ]; then
+  find "$abs_bd" -type f \( \
+      -name 'config.txt' -o \
+      -name 'run_vitis_link.sh' -o \
+      -name '*.fcnmap.xml' -o \
+      -name 'xd_ip_index.xml' \
+    \) -print0 2>/dev/null | grep -zE "$build_subdirs"
+  if [ -n "$newer_ref" ] && [ -d "$lsf_staging" ]; then
     find "$lsf_staging" -mindepth 2 -maxdepth 3 -type f -newer "$newer_ref" \( \
         -name 'lsf.stdout' -o \
         -name 'lsf.stderr' -o \

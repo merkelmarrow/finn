@@ -36,6 +36,7 @@ import numpy as np
 # import pytorch before onnx, so we make sure to import onnx first
 import onnx  # NOQA
 import os
+import sys
 import torch
 import warnings
 from brevitas.export import export_qonnx
@@ -106,18 +107,14 @@ from finn.util.test import (
     load_test_checkpoint_or_skip,
 )
 
-# ci_sharding lives under docker/jenkins/, so its parent must be on sys.path.
-# tests/conftest.py also inserts it before collection. This local guard keeps
-# the import resolvable in tools that load the file directly (e.g. IDE
-# inspection, isolated test reruns). The non-import statements below force
-# isort to treat the trailing import as positionally fixed.
+# ci_sharding lives under docker/jenkins/. tests/conftest.py inserts its
+# parent on sys.path before collection; this guard keeps the import resolvable
+# when the file is loaded directly (IDE inspection, isolated reruns).
 _JENKINS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "docker",
     "jenkins",
 )
-import sys  # noqa: E402
-
 if _JENKINS_DIR not in sys.path:
     sys.path.insert(0, _JENKINS_DIR)
 

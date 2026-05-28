@@ -38,6 +38,12 @@ from typing import Dict, Optional, Tuple
 
 from finn.util.data_packing import finnpy_to_packed_bytearray
 
+# Test boards used for BNN pynq tests. The canonical list lives in
+# docker/jenkins/ci_sharding.TEST_BOARDS; the cross-check in
+# tests/util/test_bnn_board_config.py keeps the two in sync.
+test_board_map = ["Pynq-Z1", "KV260_SOM", "ZCU104", "U250"]
+
+
 # mapping from PYNQ board names to FPGA part names
 pynq_part_map = dict()
 pynq_part_map["Ultra96"] = "xczu3eg-sbva484-1-e"
@@ -156,16 +162,22 @@ def make_build_dir(prefix=""):
     Use this function instead of tempfile.mkdtemp to ensure any generated files
     will survive on the host after the FINN Docker container exits."""
     try:
-        tmpdir = tempfile.mkdtemp(prefix=prefix)
-        newdir = tmpdir.replace("/tmp", os.environ["FINN_BUILD_DIR"])
-        os.makedirs(newdir)
-        return newdir
+        build_dir = os.environ["FINN_BUILD_DIR"]
     except KeyError:
         raise Exception(
             """Environment variable FINN_BUILD_DIR must be set
         correctly. Please ensure you have launched the Docker contaier correctly.
         """
         )
+    # mkdtemp(dir=...) creates the unique dir atomically inside FINN_BUILD_DIR;
+    # the old replace("/tmp", ...) form left an orphan /tmp/<prefix>XXX on every
+    # call that nothing ever cleaned up.
+    os.makedirs(build_dir, exist_ok=True)
+    new_dir = tempfile.mkdtemp(prefix=prefix, dir=build_dir)
+    # mkdtemp creates 0700; restore umask-default 0755 so a sibling container
+    # or non-build UID can still read the FINN build tree on the host.
+    os.chmod(new_dir, 0o755)
+    return new_dir
 
 
 class CppBuilder:
@@ -218,26 +230,27 @@ class CppBuilder:
 def launch_process_helper(args, proc_env=None, cwd=None, check=False):
     """Helper function to launch a process in a way that facilitates logging
     stdout/stderr with Python loggers.
-    Returns (cmd_out, cmd_err). Raises :class:`subprocess.CalledProcessError`
-    when ``check`` is True and the process exits non-zero. Note that under
-    ``check=True`` the raised ``CalledProcessError``'s ``output`` and
-    ``stderr`` attributes carry pre-decoded ``str``, not the conventional
-    ``bytes``."""
+
+    Returns ``(cmd_out, cmd_err)`` as decoded UTF-8 strings. When ``check`` is
+    True and the process exits non-zero, raises :class:`subprocess.CalledProcessError`
+    with ``output`` and ``stderr`` populated as raw ``bytes`` so callers see
+    the conventional shape (subprocess.run-compatible).
+    """
     if proc_env is None:
         proc_env = os.environ.copy()
     with subprocess.Popen(
         args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=proc_env, cwd=cwd
     ) as proc:
-        (cmd_out, cmd_err) = proc.communicate()
+        (cmd_out_bytes, cmd_err_bytes) = proc.communicate()
         returncode = proc.returncode
+    cmd_out = cmd_out_bytes.decode("utf-8") if cmd_out_bytes is not None else None
+    cmd_err = cmd_err_bytes.decode("utf-8") if cmd_err_bytes is not None else None
     if cmd_out is not None:
-        cmd_out = cmd_out.decode("utf-8")
         sys.stdout.write(cmd_out)
     if cmd_err is not None:
-        cmd_err = cmd_err.decode("utf-8")
         sys.stderr.write(cmd_err)
     if check and returncode != 0:
-        raise subprocess.CalledProcessError(returncode, args, cmd_out, cmd_err)
+        raise subprocess.CalledProcessError(returncode, args, cmd_out_bytes, cmd_err_bytes)
     return (cmd_out, cmd_err)
 
 
@@ -262,8 +275,10 @@ def which(program):
     return None
 
 
-# Map a Xilinx tool name to its override env var. The env var lets an out-of-band
-# dispatcher (e.g. an LSF wrapper) intercept the call without a PATH shim.
+# Map a Xilinx tool name to its per-tool override env var. The env var lets
+# an out-of-band dispatcher (e.g. an LSF wrapper) intercept the call without
+# a PATH shim. FINN_TOOL_DIR_OVERRIDE is the directory shortcut that applies
+# to every registered tool at once; the per-tool var wins if both are set.
 _XILINX_TOOL_OVERRIDES = {
     "vivado": "FINN_VIVADO_OVERRIDE",
     "v++": "FINN_VXX_OVERRIDE",
@@ -272,30 +287,41 @@ _XILINX_TOOL_OVERRIDES = {
     "xelab": "FINN_XELAB_OVERRIDE",
 }
 
+_XILINX_TOOL_DIR_ENV = "FINN_TOOL_DIR_OVERRIDE"
+
 
 def resolve_xilinx_tool(default_name):
     """Return the Xilinx-tool command to embed in generated bash scripts.
 
-    Honours the registered override env var so a bare name or absolute path
-    both work in the script. Raises FileNotFoundError when the resolved
-    command is not on PATH. assert is unsuitable here because the check
-    is runtime input, not an invariant, and would be stripped under -O.
+    Resolution order: registered per-tool env var, then
+    ``FINN_TOOL_DIR_OVERRIDE/<name>``, then the bare ``default_name``.
+    Raises FileNotFoundError when the resolved command is not on PATH.
+    ``assert`` is unsuitable here because the check is runtime input, not an
+    invariant, and would be stripped under ``-O``.
     """
     override_env_var = _XILINX_TOOL_OVERRIDES.get(default_name)
-    override_value = os.environ.get(override_env_var) if override_env_var else None
-    tool = override_value if override_value else default_name
+    per_tool_override = os.environ.get(override_env_var) if override_env_var else None
+    dir_override = os.environ.get(_XILINX_TOOL_DIR_ENV)
+    if per_tool_override:
+        tool = per_tool_override
+    elif dir_override:
+        tool = os.path.join(dir_override, default_name)
+    else:
+        tool = default_name
     if which(tool) is None:
+        details = []
         if override_env_var:
-            override_state = (
-                "currently set to %r" % override_value
-                if override_value
-                else "currently unset; set to an absolute path to override"
+            details.append(
+                "%s=%r" % (override_env_var, per_tool_override)
+                if per_tool_override
+                else "%s=<unset>" % override_env_var
             )
-            raise FileNotFoundError(
-                "%s not found in PATH (override env var %s, %s)"
-                % (tool, override_env_var, override_state)
-            )
-        raise FileNotFoundError("%s not found in PATH (no override env var registered)" % tool)
+        details.append(
+            "%s=%r" % (_XILINX_TOOL_DIR_ENV, dir_override)
+            if dir_override
+            else "%s=<unset>" % _XILINX_TOOL_DIR_ENV
+        )
+        raise FileNotFoundError("%s not found in PATH (%s)" % (tool, ", ".join(details)))
     return tool
 
 

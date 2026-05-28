@@ -48,8 +48,10 @@ Map<String, Boolean> NODE_ONLINE = [:]
 @Field
 Map<String, Map> BUILD_BOARD_ZIP_PATHS = [:]
 
-// Jenkins agent label every non-board stage runs on. Keep in sync with
-// Jenkinsfile so relabelling build agents is a one-line change here too.
+// Jenkins agent label every non-board stage runs on. Mirrors the same
+// @Field in Jenkinsfile so a relabel is a one-line edit in both files.
+// Cannot be env-overridden because `env` is not bound during @Field
+// initialisation under Jenkins CPS.
 @Field
 static final String FINN_BUILD_LABEL = 'finn-build'
 
@@ -67,11 +69,13 @@ pipeline {
            description: 'Optional explicit path to a single build directory. Overrides build_job_name auto-discovery and forces every board to be read from this one directory. Use for off-Jenkins recovery or pinning a specific build.')
     booleanParam(name: 'allow_fallback', defaultValue: false,
                  description: 'Allow a board to test an older READY build when the newest build did not produce that board zip. Default false marks the HW build unstable if fallback is used.')
+    string(name: 'BOARD_FILTER', defaultValue: '',
+           description: 'Substring filter for debugging a single board. Matches against the board name. Leave empty for a normal build.')
   }
   stages {
     stage('Get node status') {
       agent { label "${FINN_BUILD_LABEL}" }
-      steps { script { loadHwShards(); refreshNodeOnlineFlags() } }
+      steps { script { loadHwShards(); validateBoardFilter(); refreshNodeOnlineFlags() } }
     }
     stage('Reboot Zynq platforms') {
       steps { script { parallel(buildRebootMap()) } }
@@ -79,7 +83,8 @@ pipeline {
     stage('Wait for Nodes to reboot') {
       options { skipDefaultCheckout() }
       agent { label "${FINN_BUILD_LABEL}" }
-      steps { sleep(time: "${env.REBOOT_SLEEP}", unit: 'MINUTES') }
+      // REBOOT_SLEEP minutes. Default 5; the job DSL may override.
+      steps { sleep(time: (env.REBOOT_SLEEP ?: '5').toInteger(), unit: 'MINUTES') }
     }
     // Default checkout is required so docker/jenkins/test_bnn_hw_pytest.py
     // is in the workspace for the bnn_test_files stash.
@@ -139,6 +144,19 @@ String hwTestTypeLabel(String testType) {
     error "hwTestTypeLabel: no HW_TEST_TYPE_LABELS entry for ${testType}"
   }
   return label
+}
+
+// Fails Get-node-status loudly with a candidate list when BOARD_FILTER
+// matches no board. Mirrors the build-side STAGE_FILTER pattern so a typo
+// cannot reach the parallel branches and silently degrade to "no shards run".
+void validateBoardFilter() {
+  String filter = paramString('BOARD_FILTER')
+  if (!filter) { return }
+  def matched = HW_SHARDS.findAll { (it.board as String).contains(filter) }
+  if (matched.isEmpty()) {
+    error "BOARD_FILTER='${filter}' matched no boards. Available: " +
+          HW_SHARDS.collect { it.board }.join(', ')
+  }
 }
 
 void refreshNodeOnlineFlags() {
@@ -309,10 +327,14 @@ void stashBuildArtifacts(String testType) {
 // Pure map lookup, no filesystem stats. Runs from the no-agent orchestrator.
 Map<String, Closure> buildHwStageMap(String testType) {
   String label = hwTestTypeLabel(testType)
+  String filter = paramString('BOARD_FILTER')
   def branches = [:]
   def offlineWithZip = []
   HW_SHARDS.each { row ->
     String board = row.board as String
+    if (filter && !board.contains(filter)) {
+      return
+    }
     if (!buildBoardZip(testType, board)) {
       echo "buildHwStageMap[${testType}]: no READY zip for ${board}, skipping"
       return
@@ -405,9 +427,9 @@ void runHwTest(Map row, String testType) {
       unstash name: 'bnn_test_files'
       createTestScript(row, "${testType}_hw_${row.board}")
       if (env.USER_CREDENTIALS) {
-        sh 'echo ${USER_CREDENTIALS_PSW} | sudo -S ./run-tests.sh'
+        sh 'echo ${USER_CREDENTIALS_PSW} | sudo -S bash run-tests.sh'
       } else {
-        sh './run-tests.sh'
+        sh 'bash run-tests.sh'
       }
     }
   }
@@ -425,7 +447,6 @@ void createTestScript(Map row, String testResultsFilename) {
       "--junitxml=${testResultsFilename}.xml --html=${testResultsFilename}.html " +
       "--self-contained-html\n"
   writeFile file: 'run-tests.sh', text: script
-  sh 'chmod 755 run-tests.sh'
 }
 
 String hwStashName(String testType, String board) {

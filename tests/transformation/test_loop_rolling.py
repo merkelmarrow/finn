@@ -91,8 +91,7 @@ def export_model_to_qonnx(input_size=10, hidden_size=20, num_layers=4, output_si
 
     # filename per parametrisation so concurrent workers do not collide
     onnx_path = (
-        os.environ["FINN_BUILD_DIR"]
-        + f"/simple_module_{num_layers}layers_{input_size}in.onnx"
+        os.environ["FINN_BUILD_DIR"] + f"/simple_module_{num_layers}layers_{input_size}in.onnx"
     )
     with torch.no_grad():
         bo.export_qonnx(

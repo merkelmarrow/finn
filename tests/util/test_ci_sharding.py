@@ -90,7 +90,7 @@ def test_assign_groups_rejects_non_int_pin():
         ci_sharding.assign_groups_to_shards(["k"], 2, pins={"k": "zero"})
 
 
-def test_update_master_preserves_unseen_and_replaces_seen(tmp_path):
+def test_update_master_preserves_unseen_and_appends_seen(tmp_path):
     reports = tmp_path / "reports"
     reports.mkdir()
     master = tmp_path / "master.json"
@@ -98,7 +98,7 @@ def test_update_master_preserves_unseen_and_replaces_seen(tmp_path):
     write_json(
         master,
         {
-            "schema_version": 1,
+            "schema_version": ci_sharding.SCHEMA_VERSION,
             "groups": {
                 "seen": {"samples": [1.0], "count": 1},
                 "unseen": {"samples": [7.0], "count": 2},
@@ -118,13 +118,12 @@ def test_update_master_preserves_unseen_and_replaces_seen(tmp_path):
 
     persisted = json.loads(master.read_text())
     merged = json.loads(out.read_text())
-    # seen's prior median is 1.0, observed 3.5. Ratio 3.5 is within
-    # [0.25, 4.0] so it's accepted and appended to samples.
+    # observed groups are always appended; unseen groups are left untouched.
     assert persisted["groups"]["seen"]["samples"] == [1.0, 3.5]
     assert persisted["groups"]["unseen"]["samples"] == [7.0]
     assert merged["groups"]["seen"]["samples"] == [1.0, 3.5]
-    assert merged["last_update"]["accepted"] == 1
-    assert merged["last_update"]["rejected"] == 0
+    assert merged["last_update"]["observed_groups"] == 1
+    assert merged["last_update"]["persistent_update"] is True
 
 
 def test_merge_maps_writes_searchable_text(tmp_path):
@@ -160,13 +159,19 @@ def test_prepare_timing_snapshot_empty_when_master_missing(tmp_path):
     ci_sharding.prepare_timing_snapshot(str(tmp_path / "missing-master.json"), str(snapshot))
     data = json.loads(snapshot.read_text())
     assert data["groups"] == {}
-    assert data["build_seq"] == 0
+    assert data["schema_version"] == ci_sharding.SCHEMA_VERSION
 
 
 def test_prepare_timing_snapshot_copies_master_when_present(tmp_path):
     master = tmp_path / "master.json"
     snapshot = tmp_path / "snapshot.json"
-    write_json(master, {"schema_version": 1, "groups": {"slow": {"samples": [12.0]}}})
+    write_json(
+        master,
+        {
+            "schema_version": ci_sharding.SCHEMA_VERSION,
+            "groups": {"slow": {"samples": [12.0]}},
+        },
+    )
 
     ci_sharding.prepare_timing_snapshot(str(master), str(snapshot))
 
@@ -490,7 +495,7 @@ def test_update_master_raises_on_persistent_write_failure(tmp_path, monkeypatch)
     reports.mkdir()
     master = tmp_path / "master.json"
     out = reports / "ci_timings_master.json"
-    write_json(master, {"schema_version": 1, "groups": {}})
+    write_json(master, {"schema_version": ci_sharding.SCHEMA_VERSION, "groups": {}})
     write_json(
         reports / "stage.timings.json",
         {
@@ -841,7 +846,11 @@ def test_locked_update_backs_up_corrupt_master(tmp_path):
     master.write_text("{ this is not json")
 
     updated = ci_sharding.locked_update(
-        str(master), lambda cur: {"schema_version": 1, "groups": {"k": {"samples": [1.0]}}}
+        str(master),
+        lambda cur: {
+            "schema_version": ci_sharding.SCHEMA_VERSION,
+            "groups": {"k": {"samples": [1.0]}},
+        },
     )
 
     assert updated["groups"]["k"]["samples"] == [1.0]
@@ -854,30 +863,14 @@ def test_locked_update_backs_up_corrupt_master(tmp_path):
     assert (tmp_path / backups[0]).read_text() == "{ this is not json"
 
 
-def test_backup_if_corrupt_caps_history(tmp_path):
-    master = tmp_path / "master.json"
-    # Pre-populate with more old backups than the retention cap.
-    older = ci_sharding.CORRUPT_BACKUP_RETAIN + 3
-    for i in range(older):
-        (tmp_path / ("master.json.corrupt-%d" % (1000 + i))).write_text("old %d" % i)
-    master.write_text("{ this is not json")
-
-    ci_sharding.locked_update(str(master), lambda cur: {"schema_version": 1, "groups": {}})
-
-    backups = sorted(p.name for p in tmp_path.iterdir() if ".corrupt-" in p.name)
-    # Newest cap survivors plus the freshly-made one from this run.
-    assert len(backups) == ci_sharding.CORRUPT_BACKUP_RETAIN
-    # The very oldest ones were pruned.
-    assert "master.json.corrupt-1000" not in backups
-    # The freshest pre-existing backup survived.
-    assert any("corrupt-%d" % (1000 + older - 1) in b for b in backups)
-
-
 def test_locked_update_does_not_backup_empty_master(tmp_path):
     master = tmp_path / "master.json"
     master.write_text("")
 
-    ci_sharding.locked_update(str(master), lambda cur: {"schema_version": 1, "groups": {}})
+    ci_sharding.locked_update(
+        str(master),
+        lambda cur: {"schema_version": ci_sharding.SCHEMA_VERSION, "groups": {}},
+    )
 
     # zero-byte master is the idle-create case, not corruption, so no backup
     backups = [p for p in tmp_path.iterdir() if ".corrupt-" in p.name]
@@ -910,16 +903,22 @@ def test_update_master_no_master_path_writes_preview(tmp_path):
     assert rc == 0
     assert preview["groups"]["seen"]["samples"] == [1.0]
     assert preview["last_update"]["observed_groups"] == 1
-    assert preview["last_update"]["accepted"] == 1
+    assert preview["last_update"]["persistent_update"] is False
 
 
 # ----------------------------------------------------------------------------
-# Anomaly protection (per-group rolling median + build-wide veto + GC).
+# Per-group rolling-median update (append-and-trim).
 # ----------------------------------------------------------------------------
 
 
 def _seed_master_with_group(path, name, samples, **extra):
-    write_json(path, {"schema_version": 1, "groups": {name: {"samples": list(samples), **extra}}})
+    write_json(
+        path,
+        {
+            "schema_version": ci_sharding.SCHEMA_VERSION,
+            "groups": {name: {"samples": list(samples), **extra}},
+        },
+    )
 
 
 def _write_observation(reports_dir, stash, name, seconds):
@@ -948,12 +947,12 @@ def test_update_master_cold_start_accepts_first_observation(tmp_path):
     reports.mkdir()
     master = tmp_path / "master.json"
     out = reports / "ci_timings_master.json"
-    write_json(master, {"schema_version": 1, "groups": {}})
+    write_json(master, {"schema_version": ci_sharding.SCHEMA_VERSION, "groups": {}})
     _write_observation(reports, "stage", "newgroup", 42.0)
     ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
     persisted = json.loads(master.read_text())
     assert persisted["groups"]["newgroup"]["samples"] == [42.0]
-    assert persisted["last_update"]["accepted"] == 1
+    assert persisted["last_update"]["observed_groups"] == 1
 
 
 def test_update_master_grows_samples_to_max_then_trims(tmp_path):
@@ -975,9 +974,8 @@ def test_update_master_grows_samples_to_max_then_trims(tmp_path):
 
 
 def test_update_master_uses_median_so_one_outlier_in_five_is_absorbed(tmp_path):
-    # 4 samples at 10s plus one accepted-but-large 35s (ratio 3.5, within
-    # [0.25, 4.0]). Median is still 10 so the bin packer's weight is
-    # unaffected by the lone wobble.
+    # Plain append: window [10, 10, 10, 10, 35] has a median of 10, so the
+    # bin packer's weight is unaffected by a single lone wobble.
     reports = tmp_path / "reports"
     reports.mkdir()
     master = tmp_path / "master.json"
@@ -985,85 +983,15 @@ def test_update_master_uses_median_so_one_outlier_in_five_is_absorbed(tmp_path):
     _seed_master_with_group(master, "g", [10.0, 10.0, 10.0, 10.0])
     _write_observation(reports, "stage", "g", 35.0)
     ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
+    persisted = json.loads(master.read_text())
+    assert persisted["groups"]["g"]["samples"] == [10.0, 10.0, 10.0, 10.0, 35.0]
     weights = ci_sharding.load_group_weights(str(master))
     assert weights["g"] == 10.0
 
 
-def test_update_master_rejects_high_ratio_outlier(tmp_path):
-    reports = tmp_path / "reports"
-    reports.mkdir()
-    master = tmp_path / "master.json"
-    out = reports / "ci_timings_master.json"
-    _seed_master_with_group(master, "g", [10.0, 10.0, 10.0])
-    _write_observation(reports, "stage", "g", 100.0)
-    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
-    persisted = json.loads(master.read_text())
-    assert persisted["groups"]["g"]["samples"] == [10.0, 10.0, 10.0]
-    assert persisted["groups"]["g"]["consecutive_rejections"] == 1
-    assert persisted["last_update"]["rejected"] == 1
-
-
-def test_update_master_rejects_low_ratio_outlier(tmp_path):
-    reports = tmp_path / "reports"
-    reports.mkdir()
-    master = tmp_path / "master.json"
-    out = reports / "ci_timings_master.json"
-    _seed_master_with_group(master, "g", [100.0, 100.0, 100.0])
-    _write_observation(reports, "stage", "g", 10.0)
-    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
-    persisted = json.loads(master.read_text())
-    assert persisted["groups"]["g"]["samples"] == [100.0, 100.0, 100.0]
-    assert persisted["groups"]["g"]["consecutive_rejections"] == 1
-
-
-def test_update_master_rejects_crash_suspect_when_prior_was_large(tmp_path):
-    # 0.1s observation against a 600s prior is the "shard crashed before
-    # any real test ran" pattern: very low observed AND very large prior.
-    # 0.1 / 600 = ratio is also out of band, but the crash-floor rule
-    # fires first to give a clearer rejection reason.
-    reports = tmp_path / "reports"
-    reports.mkdir()
-    master = tmp_path / "master.json"
-    out = reports / "ci_timings_master.json"
-    _seed_master_with_group(master, "g", [600.0, 600.0])
-    _write_observation(reports, "stage", "g", 0.1)
-    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
-    persisted = json.loads(master.read_text())
-    assert persisted["groups"]["g"]["samples"] == [600.0, 600.0]
-    assert persisted["groups"]["g"]["consecutive_rejections"] == 1
-
-
-def test_update_master_force_accepts_after_three_consecutive_rejections(tmp_path):
-    # A real regression (test legitimately becomes 10x slower) would
-    # otherwise be locked out forever. After FORCE_ACCEPT_AFTER consecutive
-    # rejections, the next observation force-accepts.
-    reports = tmp_path / "reports"
-    reports.mkdir()
-    master = tmp_path / "master.json"
-    out = reports / "ci_timings_master.json"
-    _seed_master_with_group(master, "g", [10.0, 10.0, 10.0])
-    for _ in range(ci_sharding.FORCE_ACCEPT_AFTER):
-        _write_observation(reports, "stage", "g", 100.0)
-        ci_sharding.update_master(
-            str(reports),
-            str(master),
-            str(out),
-            update_persistent=True,
-            allow_force_accept=True,
-        )
-    persisted = json.loads(master.read_text())
-    # third pass triggers force-accept on its observation, master now
-    # contains 100.0 alongside the older 10.0 samples.
-    assert 100.0 in persisted["groups"]["g"]["samples"]
-    assert persisted["groups"]["g"]["consecutive_rejections"] == 0
-    assert persisted["last_update"]["force_accepted"] == 1
-
-
-def test_update_master_skips_all_updates_on_build_wide_anomaly(tmp_path):
-    # Five groups all 4.5x faster than usual at the same time -> looks
-    # like an LSF-storm where every shard finished faster than expected,
-    # poisoning every group at once. Build-wide veto leaves the master
-    # untouched and records the anomaly in last_update.
+def test_update_master_preview_leaves_persistent_master_untouched(tmp_path):
+    # Non-persist mode must write the per-build preview to out_path but
+    # never touch the on-disk master.
     reports = tmp_path / "reports"
     reports.mkdir()
     master = tmp_path / "master.json"
@@ -1071,104 +999,17 @@ def test_update_master_skips_all_updates_on_build_wide_anomaly(tmp_path):
     write_json(
         master,
         {
-            "schema_version": 1,
-            "groups": {name: {"samples": [100.0, 100.0]} for name in ["a", "b", "c", "d", "e"]},
+            "schema_version": ci_sharding.SCHEMA_VERSION,
+            "groups": {"g": {"samples": [10.0]}},
         },
     )
-    for name in ["a", "b", "c", "d", "e"]:
-        _write_observation(reports, name, name, 600.0)  # 6x prior median
-    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
-    persisted = json.loads(master.read_text())
-    # No group was updated.
-    for name in ["a", "b", "c", "d", "e"]:
-        assert persisted["groups"][name]["samples"] == [100.0, 100.0]
-    assert persisted["last_update"]["anomaly"] is True
-    assert persisted["last_update"]["anomaly_outliers"] == 5
-    assert persisted["last_update"]["anomaly_eligible"] == 5
-
-
-def test_update_master_build_wide_veto_requires_minimum_eligible(tmp_path):
-    # With only two eligible groups, even both being outliers must not
-    # trigger the build-wide veto (a single-shard debug build observing
-    # one group should still apply per-group rules normally).
-    reports = tmp_path / "reports"
-    reports.mkdir()
-    master = tmp_path / "master.json"
-    out = reports / "ci_timings_master.json"
-    write_json(
-        master,
-        {
-            "schema_version": 1,
-            "groups": {"a": {"samples": [100.0]}, "b": {"samples": [100.0]}},
-        },
-    )
-    for name in ("a", "b"):
-        _write_observation(reports, name, name, 600.0)
-    ci_sharding.update_master(str(reports), str(master), str(out), update_persistent=True)
-    persisted = json.loads(master.read_text())
-    assert persisted["last_update"]["anomaly"] is False
-    # both rejected per-group, master unchanged for both
-    assert persisted["last_update"]["rejected"] == 2
-    assert persisted["groups"]["a"]["samples"] == [100.0]
-    assert persisted["groups"]["b"]["samples"] == [100.0]
-
-
-def test_update_master_garbage_collects_groups_unseen_for_n_builds(tmp_path):
-    reports = tmp_path / "reports"
-    reports.mkdir()
-    master = tmp_path / "master.json"
-    out = reports / "ci_timings_master.json"
-    # Set up a build_seq large enough that the cutoff kicks in, plus a
-    # group that's stale (last_seen_build_seq way below cutoff).
-    write_json(
-        master,
-        {
-            "schema_version": 1,
-            "build_seq": ci_sharding.GC_BUILDS_UNSEEN + 50,
-            "groups": {
-                "stale": {"samples": [10.0], "last_seen_build_seq": 1},
-                "fresh": {
-                    "samples": [10.0],
-                    "last_seen_build_seq": ci_sharding.GC_BUILDS_UNSEEN + 40,
-                },
-            },
-        },
-    )
-    _write_observation(reports, "stage", "fresh", 10.0)
-    ci_sharding.update_master(
-        str(reports), str(master), str(out), update_persistent=True, run_gc=True
-    )
-    persisted = json.loads(master.read_text())
-    assert "stale" not in persisted["groups"]
-    assert "fresh" in persisted["groups"]
-    assert persisted["last_update"]["gc_dropped"] == 1
-
-
-def test_update_master_preview_does_not_gc_unobserved_groups(tmp_path):
-    reports = tmp_path / "reports"
-    reports.mkdir()
-    master = tmp_path / "master.json"
-    out = reports / "ci_timings_master.json"
-    write_json(
-        master,
-        {
-            "schema_version": 1,
-            "build_seq": ci_sharding.GC_BUILDS_UNSEEN + 50,
-            "groups": {
-                "end2end": {"samples": [100.0], "last_seen_build_seq": 1},
-                "sanity": {"samples": [10.0], "last_seen_build_seq": 200},
-            },
-        },
-    )
-    _write_observation(reports, "stage", "sanity", 10.0)
+    _write_observation(reports, "stage", "g", 25.0)
     ci_sharding.update_master(str(reports), str(master), str(out))
     persisted = json.loads(master.read_text())
     preview = json.loads(out.read_text())
-    assert "end2end" in persisted["groups"]
-    assert persisted["build_seq"] == ci_sharding.GC_BUILDS_UNSEEN + 50
-    assert "end2end" in preview["groups"]
+    assert persisted["groups"]["g"]["samples"] == [10.0]
+    assert preview["groups"]["g"]["samples"] == [10.0, 25.0]
     assert preview["last_update"]["persistent_update"] is False
-    assert preview["last_update"]["gc_dropped"] == 0
 
 
 def test_load_group_weights_returns_median_of_samples(tmp_path):
@@ -1176,7 +1017,7 @@ def test_load_group_weights_returns_median_of_samples(tmp_path):
     write_json(
         master,
         {
-            "schema_version": 1,
+            "schema_version": ci_sharding.SCHEMA_VERSION,
             "groups": {"g": {"samples": [10.0, 20.0, 30.0]}},
         },
     )
@@ -1193,8 +1034,7 @@ def test_normalise_master_drops_unknown_schema_version(capsys):
 
 def test_normalise_master_writes_canonical_schema_version_key():
     out = ci_sharding.normalise_master({"groups": {}})
-    assert "schema_version" in out
-    assert out["schema_version"] == 1
+    assert out["schema_version"] == ci_sharding.SCHEMA_VERSION
 
 
 def _install_finn_ci_plugin(pytester):
@@ -1289,7 +1129,8 @@ def test_b():
     )
 
     result = pytester.runpytest(
-        "-m", "fpgadataflow",
+        "-m",
+        "fpgadataflow",
         "--num-shards=2",
         "--shard-id=1",
         "--junitxml=stage.xml",
@@ -1458,7 +1299,7 @@ def test_which_shard_uses_timing_master_for_placement(tmp_path):
     write_json(
         master,
         {
-            "schema_version": 1,
+            "schema_version": ci_sharding.SCHEMA_VERSION,
             "groups": {
                 "synthetic-group": {"samples": [10.0], "count": 1},
             },

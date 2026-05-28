@@ -1,13 +1,23 @@
 # FINN Jenkins CI maintainer guide
 
+> `FINN_CI_NFS_ROOT` is the one required env var. It is set in the Jenkins job DSL (lives in the `jenkins-deploy` repo, not in this one). Everything else derives from it.
+
+## TL;DR for local development
+
+You do not need Jenkins to run the same tests locally. The Jenkinsfile generates a per-shard `run-tests.sh` for each parallel branch, but the underlying invocation is just `python -m pytest -m <marker>`. From a checkout:
+
+```bash
+./run-docker.sh python -m pytest -m sanity_bnn
+```
+
+substituting any marker from the `STAGES` table in [`ci_sharding.py`](./ci_sharding.py). Leave `FINN_CI_NFS_ROOT` unset and the run picks up local-fallback mode automatically: per-agent Docker build, no build-to-HW handoff, no persistent timing master, deterministic round-robin sharding. The same per-shard JUnit XML and HTML reports are produced under the workspace.
+
 ## TL;DR for contributors
 
 - Run a PR build: click *Build with Parameters*, leave `STAGES=sanity`, hit *Build*.
 - Debug just one family: set `STAGES=fpgadataflow` or `STAGES=end2end`.
-- Find which shard a test runs on: `pytest --collect-only --which-shard <substring>` locally, or grep `reports/shard_map.txt` on an archived build. From a finn-less checkout, `python3 docker/jenkins/ci_sharding.py which-shard <group> [--marker <marker>] [--timings <path>]` returns an approximation that uses only the timing master.
+- Find which shard a test runs on: `pytest --collect-only --which-shard <substring>` from a finn-installed checkout. From an archived Jenkins build, grep `reports/shard_map.txt`. Without finn installed, `python3 docker/jenkins/ci_sharding.py which-shard <group> [--marker <marker>] [--timings <path>]` is the finn-less escape hatch.
 - Add a new test: decorate it with the existing marker (e.g. `@pytest.mark.fpgadataflow`). The next CI run picks it up.
-
-Run the same pipeline locally without Jenkins by leaving `FINN_CI_NFS_ROOT` unset and invoking `./run-docker.sh ./run-tests.sh` from a checkout. Validate prints a banner listing the features that degrade in local fallback (no shared Docker image cache, no build-to-HW handoff, no persistent timing master, no per-agent NFS caches), but everything else runs end-to-end and produces the same per-shard JUnit XML and HTML reports.
 
 The rest of this doc is the maintainer-facing detail behind those four lines.
 
@@ -21,6 +31,7 @@ Optional operator overrides, all with sensible defaults so nothing else needs to
 | --- | --- | --- |
 | `FINN_LOCAL_BUILD_LABEL` | `finn-build` | Agent label for the optional non-Docker `setup-local.sh` stage. Override only when that stage needs an apt + python3.10 host distinct from the main build pool. |
 | `FINN_CI_LOCAL_CACHE_ROOT` | `${WORKSPACE_TMP}/finn-ci-cache` | Pip + XDG cache root for the same optional stage. Override on agents whose home or scratch layout matters. |
+| `FINN_CI_MIN_FREE_GB` | `120` | Minimum free space (GB) on the agent scratch volume below which a shard refuses to start. Lower on tighter disks, higher when bumping shard concurrency. |
 | `FINN_LSF_NFS_STAGING` | unset (no LSF tails) | When set, `archive_failure_logs.sh` includes LSF staging-dir tails in the failure bundle. |
 | `FINN_DOCKER_TAG` | repo-derived | Docker image tag the build, run, and HW pipelines pull. Override only for pinned-image debugging. |
 
@@ -30,18 +41,9 @@ The HW-tethered [`Jenkinsfile_HW`](./Jenkinsfile_HW) follows the same broad patt
 
 ## Dynamic timing state
 
-There is no checked-in seed file. Cold start (master absent) and snapshot-unreachable both fall through to deterministic round-robin shard assignment, so the pipeline keeps working without persistent timings. The persistent master is refreshed only by trusted full-matrix builds (`STAGES=full`, no `STAGE_FILTER`, successful build). Partial sanity/debug builds still write an archived `reports/ci_timings_master.json` preview, but do not update the shared master or advance garbage collection.
+There is no checked-in seed file. Cold start (master absent) and snapshot-unreachable both fall through to deterministic round-robin shard assignment, so the pipeline keeps working without persistent timings. The persistent master is refreshed only by trusted full-matrix builds (`STAGES=full`, no `STAGE_FILTER`, successful build). Partial sanity/debug builds still write an archived `reports/ci_timings_master.json` preview, but do not touch the shared master.
 
-The master schema is `{"schema_version": 1, "groups": {<name>: {"samples": [last MAX_SAMPLES observations], count, consecutive_rejections, last_seen_*}}}`. Per-group weights consumed by the bin packer are the median of `samples`, so a single anomalous observation only moves one slot in a five-element window and the median is unaffected.
-
-Two layers of anomaly protection live in `ci_sharding.update_master`:
-
-1. **Per-group rolling median + outlier rejection.** A new observation must fall within `[OUTLIER_LOW_RATIO, OUTLIER_HIGH_RATIO]` times the current median to be accepted. The crash-floor rule additionally rejects suspiciously-low observations against historically-large medians (the "shard crashed before any real test ran" pattern). Trusted full-matrix updates can force-accept after `FORCE_ACCEPT_AFTER` rejections so real regressions eventually propagate.
-2. **Build-wide anomaly veto.** When at least `MIN_ELIGIBLE_FOR_ANOMALY_VETO` observations have a prior median and more than `BUILD_WIDE_ANOMALY_RATIO` of them are out-of-band, the entire persistent update is vetoed. This catches LSF / NFS-storm days where every shard is uniformly slower and would otherwise poison every group's `consecutive_rejections` counter at once.
-
-Garbage collection drops groups not observed in the last `GC_BUILDS_UNSEEN` trusted full-matrix updates so renamed or removed tests do not leak into the master forever. Sanity/debug builds do not advance this counter.
-
-All tunable thresholds live at the top of [`ci_sharding.py`](./ci_sharding.py).
+The master schema is `{"schema_version": 2, "groups": {<name>: {"samples": [last MAX_SAMPLES observations], count, last_seen_*}}}`. Each trusted full-matrix build appends one observation per observed group and trims the window to MAX_SAMPLES (five). Per-group weights consumed by the bin packer are the median of `samples`, so a single anomalous observation only moves one slot and the median is unaffected. `MAX_SAMPLES` lives at the top of [`ci_sharding.py`](./ci_sharding.py).
 
 ## Build-to-HW zip handoff
 
@@ -72,6 +74,17 @@ There is no operator-controlled promotion knob. The Jenkinsfile updates the pers
 ## Per-build storage and retention
 
 Set `FINN_CI_NFS_ROOT` once on the Jenkins controller (in the job DSL) and the build pipeline derives every shared subtree from it. There are no other CI storage env vars to set. If `FINN_CI_NFS_ROOT` is unset the pipeline runs in local fallback mode. Validate prints a banner listing the disabled features and the build completes with handoff steps no-oping. `assertZipArtifactsEmitted` marks the build UNSTABLE at aggregate time if the selected rows would normally have published board artifacts.
+
+Layout under `FINN_CI_NFS_ROOT`:
+
+```
+agent_caches/<NODE>/{xrt,finn_cache,vivado_ip_cache}   per-agent caches
+docker_images/<jobKey>/<BUILD>/                        shared docker image
+artifacts/ci_runs/<jobKey>/<BUILD>/                    build-to-HW handoff + BUILD_INFO
+_ci_state/<jobKey>/                                    timing master + snapshots
+```
+
+Per-shard scratch lives at `${WORKSPACE}/tmp/ci_runs/<BUILD>/<stash>`. The workspace is per-agent (NFS-mounted via `remote_fs` on lab build hosts, local SSD elsewhere) and `git clean -ffdx` between runs handles rotation. The HW pipeline hard-requires `FINN_CI_NFS_ROOT` because it has nothing to read otherwise.
 
 | Tree | Path under `FINN_CI_NFS_ROOT` | Subcommand | Retention |
 | --- | --- | --- | --- |
@@ -152,7 +165,7 @@ Adding a new `hwTestType` (today `bnn_build_sanity` or `bnn_build_full`) is a on
 
 If `FINN_CI_NFS_ROOT` is unset, any row that would publish board artifacts no-ops at handoff time and the aggregate stage marks the build UNSTABLE with a per-board summary.
 
-Other narrower knobs: `local_setup` is an orthogonal opt-in for the non-Docker Vivado setup test. `STAGE_FILTER` is a substring filter for debugging a single shard within whichever rows `STAGES` selected. The HW job exposes `build_job_name`, `build_dir`, and `allow_fallback` for handoff overrides.
+Other narrower knobs: `local_setup` is an orthogonal opt-in for the non-Docker Vivado setup test. `STAGE_FILTER` is a substring filter for debugging a single shard within whichever rows `STAGES` selected. The HW job exposes `build_job_name`, `build_dir`, and `allow_fallback` for handoff overrides, plus `BOARD_FILTER` as the board-side mirror of `STAGE_FILTER` (substring-matched against `HW_SHARDS[*].board`; a typo errors loudly at Get-node-status with the candidate list).
 
 ### Debug one stage without running the whole pipeline?
 
@@ -172,7 +185,7 @@ This prints `shard | items | groups | weight_s | sample_group` and exits. Set `F
 
 ### Inspect timing state?
 
-Open `reports/ci_timings_master.json` from any archived build. The `last_update` field shows the build's accepted/rejected/force_accepted/anomaly counts and whether it was a persistent update. Manual updates are not supported. Run a successful `STAGES=full` build to refresh the shared master.
+Open `reports/ci_timings_master.json` from any archived build. The `last_update` field shows how many groups this build observed and whether it was a persistent update. Manual updates are not supported. Run a successful `STAGES=full` build to refresh the shared master.
 
 `python3 docker/jenkins/ci_sharding.py summarize path/to/reports/` prints per-shard wall-clock outliers from archived `<stash>.timings.json` files, useful when investigating one slow build.
 
@@ -182,7 +195,7 @@ Open `reports/ci_timings_master.json` from any archived build. The `last_update`
 - `reports/<stash>.timings.json` per shard.
 - `reports/<stash>.shardmap.txt` and `reports/<stash>.shardmap.json` per shard.
 - `reports/shard_map.txt` and `reports/shard_map.json` merged across all shards.
-- `reports/ci_timings_master.json` archived timing preview from this build. Its `last_update` field records the accepted/rejected/force_accepted/anomaly counts and whether the shared master was updated.
+- `reports/ci_timings_master.json` archived timing preview from this build. Its `last_update` field records the observed group count and whether the shared master was updated.
 - `reports/<stash>.empty-shard` per shard that collected zero items. Useful for distinguishing "shard had no work" from "shard crashed".
 - `coverage_combined/` one merged HTML report across all rows with `coverage: true`. Per-shard pytest runs write raw `.coverage` data files (one per shard, named via `COVERAGE_FILE=<stash>.coverage`), `aggregateReports` runs `coverage combine` and `coverage html` on the union, and the merged result is archived. Skipped silently when no row opted in.
 - `${FINN_CI_NFS_ROOT}/artifacts/ci_runs/<jobKey>/<BUILD_NUMBER>/zips/<hwTestType>/<board>.zip` per row with a `zipArtifacts` entry. `aggregateReports()` runs `assertZipArtifactsEmitted()` which marks the build UNSTABLE (non-fatal) when an active row declared `zipArtifacts` but no `.READY` was written.

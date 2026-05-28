@@ -22,12 +22,12 @@ if [ ! -d "$bd" ]; then
   exit 0
 fi
 
-mapfile -t failed < <(find "$bd" \( \
-    -name vitis_hls.log -o \
-    -name build_dataflow.log -o \
-    -path '*/project_*/sol1/impl/ip/vivado.log' -o \
-    -path '*/finn_zynqbuild_*/vivado.log' -o \
-    -path '*/vitis_proj/_x/logs/*.log' \
+mapfile -t failed < <(find "$bd" -type f \( \
+    -name 'vitis_hls.log' -o \
+    -name 'build_dataflow.log' -o \
+    -name 'vivado.log' -o \
+    -name 'v++_a.log' -o \
+    -name 'v++.link_summary' \
   \) -exec grep -l 'ERROR:' {} + 2>/dev/null)
 
 if [ "${#failed[@]}" = "0" ]; then

@@ -183,9 +183,7 @@ def build_dataflow_cfg(model_filename, cfg: DataflowBuildConfig):
         for transform_step in build_dataflow_steps:
             try:
                 step_name = transform_step.__name__
-                print(
-                    "Running step: %s [%d/%d]" % (step_name, step_num, len(build_dataflow_steps))
-                )
+                print("Running step: %s [%d/%d]" % (step_name, step_num, len(build_dataflow_steps)))
                 # redirect output to logfile
                 if not cfg.verbose:
                     sys.stdout = stdout_logger

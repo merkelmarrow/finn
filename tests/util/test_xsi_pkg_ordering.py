@@ -16,14 +16,14 @@ ADAPTER_PATH = os.path.join(REPO_ROOT, "finn_xsi", "finn_xsi", "adapter.py")
 
 
 def _extract_pkg_predicate():
-    """Pull ``_is_pkg_src`` out of compile_sim_obj via AST and exec it.
+    """Pull module-level ``_is_pkg_src`` out of finn_xsi/adapter.py via AST.
 
     Importing finn_xsi.adapter would drag finn (and qonnx/torch) into the
-    util shard collection. AST extraction keeps this test stdlib-only and
-    locks the predicate down regardless of any future surrounding refactor.
+    util shard's collection path. AST extraction keeps this test stdlib-only
+    while still exercising the real predicate.
     """
     tree = ast.parse(open(ADAPTER_PATH).read())
-    for node in ast.walk(tree):
+    for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == "_is_pkg_src":
             module = ast.Module(body=[node], type_ignores=[])
             namespace = {"os": os}

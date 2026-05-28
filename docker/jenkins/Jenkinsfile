@@ -43,6 +43,9 @@ List<Map> PARALLEL_SHARDS = []
 List<String> ENABLED_PARAMS = []
 
 @Field
+Set<String> ENABLED_PARAM_SET = [] as Set
+
+@Field
 String FINN_CI_TIMINGS_MASTER = ''
 
 @Field
@@ -51,15 +54,27 @@ String FINN_CI_TIMINGS_SNAPSHOT = ''
 @Field
 String FINN_CI_JOB_KEY = ''
 
-// Sized for ~2 concurrent build trees per agent (~60-80 GB each) plus headroom.
-@Field
-int FINN_CI_MIN_FREE_GB = 120
+// Minimum free space (GB) on the agent scratch volume below which a shard
+// refuses to start. Default sized for ~2 concurrent build trees per agent
+// (~60-80 GB each) plus headroom. env FINN_CI_MIN_FREE_GB overrides. Kept
+// in a lazy helper rather than a @Field initialiser because Jenkins CPS
+// cannot invoke a user-defined method during script construction.
+int finnCiMinFreeGB() {
+  String raw = (env.FINN_CI_MIN_FREE_GB ?: '').trim()
+  if (!raw) { return 120 }
+  if (raw.isInteger()) { return raw.toInteger() }
+  echo "FINN_CI_MIN_FREE_GB='${raw}' is not an integer, falling back to 120"
+  return 120
+}
 
 @Field
 Map RETENTION = [:]
 
-// Jenkins agent label every non-board stage runs on. Hoisted so a relabel
-// only touches one line. Mirrored in node(...) and the budget probe below.
+// Agent label every non-board stage runs on. Static-final so declarative
+// `agent { label "${FINN_BUILD_LABEL}" }` blocks can read it at pipeline-
+// construction time. A relabel is a one-line edit here and a matching
+// edit in Jenkinsfile_HW. Cannot be env-overridden: `env` is not bound
+// during @Field initialisation under Jenkins CPS.
 @Field
 static final String FINN_BUILD_LABEL = 'finn-build'
 
@@ -87,20 +102,10 @@ java.util.regex.Pattern MARKER_SAFE_PATTERN = ~/^[A-Za-z0-9_]+( or [A-Za-z0-9_]+
 // ============================================================================
 // NFS layout
 // ============================================================================
-// FINN_CI_NFS_ROOT is the only env var operators set. Every shared subtree
-// derives from it. When unset the pipeline degrades to local fallback: per-
-// agent Docker builds, no build-to-HW handoff staged, no persistent timing master,
-// no per-agent NFS caches. The HW pipeline hard-requires FINN_CI_NFS_ROOT.
-//
-//   agent_caches/<NODE>/{xrt,finn_cache,vivado_ip_cache}   per-agent caches
-//   docker_images/<jobKey>/<BUILD>/                        shared docker image
-//   artifacts/ci_runs/<jobKey>/<BUILD>/                    build-to-HW handoff + BUILD_INFO
-//   _ci_state/<jobKey>/                                    timing master + snapshots
-//
-// Per-shard scratch lives at ${WORKSPACE}/tmp/ci_runs/<BUILD>/<stash>. The
-// workspace is per-agent and `git clean -ffdx` between runs handles rotation.
-//
-// All resolvers return '' in local fallback mode. Callers MUST handle that.
+// FINN_CI_NFS_ROOT is the only env var operators set. The README "Per-build
+// storage and retention" section documents the full subtree layout and
+// retention policy. All resolvers below return '' in local fallback mode;
+// callers must handle that.
 
 String finnCiNfsRoot()                    { return loadCommonOnce().finnCiNfsRoot() }
 String finnAgentCachesDir(String node)    { return loadCommonOnce().finnAgentCachesDir(node) }
@@ -180,11 +185,11 @@ void announceCiMode() {
   if (root) {
     echo "[finn-ci] FINN_CI_NFS_ROOT=${root} (full operation)"
   } else {
-    echo "[finn-ci] FINN_CI_NFS_ROOT is unset. Running in local fallback mode."
-    echo "[finn-ci]   - no shared Docker images (each agent builds locally)"
-    echo "[finn-ci]   - no build-to-HW artifact handoff (HW pipeline will fail against this build)"
-    echo "[finn-ci]   - no persistent timing master (cold-start round-robin each build)"
-    echo "[finn-ci]   - no per-agent NFS caches (network downloads run fresh)"
+    echo """[finn-ci] FINN_CI_NFS_ROOT is unset. Running in local fallback mode.
+[finn-ci]   - no shared Docker images (each agent builds locally)
+[finn-ci]   - no build-to-HW artifact handoff (HW pipeline will fail against this build)
+[finn-ci]   - no persistent timing master (cold-start round-robin each build)
+[finn-ci]   - no per-agent NFS caches (network downloads run fresh)"""
   }
 }
 
@@ -199,10 +204,11 @@ void loadStageConfig() {
     "--job-name ${shellQuote(env.JOB_NAME ?: 'job')}"
   ).trim()
   Map payload = readJSON(text: raw) as Map
-  PARALLEL_SHARDS = (payload.stages as List).collect { it as Map }
-  ENABLED_PARAMS  = (payload.enabled_params as List).collect { it as String }
-  RETENTION       = payload.retention as Map
-  FINN_CI_JOB_KEY = payload.job_key as String
+  PARALLEL_SHARDS    = (payload.stages as List).collect { it as Map }
+  ENABLED_PARAMS     = (payload.enabled_params as List).collect { it as String }
+  ENABLED_PARAM_SET  = ENABLED_PARAMS as Set
+  RETENTION          = payload.retention as Map
+  FINN_CI_JOB_KEY    = payload.job_key as String
 }
 
 void validateShards() {
@@ -221,6 +227,12 @@ void validateShards() {
   }
   def activeCount = 0
   eachActiveShard { row, id -> activeCount++ }
+  // local_setup adds one parallel branch on finnLocalBuildLabel(). When that
+  // label resolves to FINN_BUILD_LABEL it shares the executor pool the budget
+  // check is measuring, so it must contribute to activeCount.
+  if (paramBool('local_setup') && finnLocalBuildLabel() == FINN_BUILD_LABEL) {
+    activeCount++
+  }
   // STAGE_FILTER mismatch is fatal so a zero-shard "green" build cannot
   // mask a typo. The error lists active stage names so the operator does
   // not have to guess what the filter should look like.
@@ -242,6 +254,11 @@ void validateShards() {
   try {
     def lbl = Jenkins.instance.getLabelAtom(FINN_BUILD_LABEL)
     if (lbl) { available = lbl.getTotalExecutors() }
+  } catch (org.jenkinsci.plugins.scriptsecurity.sandbox.RejectedAccessException e) {
+    // Budget check is informational; surface the actionable approval hint
+    // without turning the build yellow over a pre-existing sandbox gap.
+    echo "validateShards: executor query rejected by Script Security (${e.message}). " +
+         "Approve Jenkins.instance.getLabelAtom in Manage Jenkins to restore the budget check."
   } catch (Exception e) {
     echo "validateShards: executor query failed (${e.class.name}: ${e.message}), skipping budget check"
   }
@@ -321,6 +338,11 @@ void rotateBuildTree(String subcommand, String root, Map policy) {
 }
 
 void rotateBuildTrees() {
+  // null RETENTION here means loadStageConfig() did not populate it; fail
+  // loud rather than interpolate "null" into the python prune CLI.
+  if (!RETENTION) {
+    error "rotateBuildTrees: RETENTION is empty. loadStageConfig() must run first."
+  }
   rotateBuildTree('prune-images', finnDockerImagesRoot(), RETENTION.image)
   rotateBuildTree('prune-artifacts', finnArtifactsRoot(), RETENTION.artifact)
   rotateBuildTree('prune-snapshots', finnCiStateRoot(), RETENTION.snapshot)
@@ -349,39 +371,18 @@ String buildDockerImageDir() {
   return "${parent}/${env.BUILD_NUMBER}"
 }
 
-// Other agents docker-load this image instead of rebuilding. Tag derives from
-// `./run-docker.sh print-tag`. The build-scoped imageDir keeps cross-build
-// readers away from in-progress writes. The flock guards a same-build retry.
+// Other agents docker-load this image instead of rebuilding. Tag derives
+// from `./run-docker.sh print-tag`. The build-scoped imageDir keeps
+// cross-build readers away from in-progress writes; the heredoc's flock
+// guards a same-build retry. See publish_docker_image.sh for the body.
 void publishSharedDockerImage(String imageDir) {
   def tag = sh(returnStdout: true, script: './run-docker.sh print-tag').trim()
   if (!tag || tag.contains('\n')) {
     error "run-docker.sh print-tag must emit exactly one Docker tag line. Got: ${tag}"
   }
   sh "mkdir -p ${shellQuote(imageDir)}"
-  // bash for set -o pipefail (Jenkins sh defaults to dash). flock on a
-  // numeric fd avoids nested-quote gymnastics. The lock releases on shell exit.
-  sh """#!/bin/bash
-set -eo pipefail
-image_dir=${shellQuote(imageDir)}
-tag=${shellQuote(tag)}
-build=${shellQuote(env.BUILD_NUMBER ?: '')}
-tmp_img="\${image_dir}/finn-docker-image.tar.gz.tmp-\${build}"
-tmp_tag="\${image_dir}/finn-docker-tag.txt.tmp-\${build}"
-final_img="\${image_dir}/finn-docker-image.tar.gz"
-final_tag="\${image_dir}/finn-docker-tag.txt"
-exec 9>"\${image_dir}/.publish.lock"
-flock -x 9
-rm -f "\$tmp_img" "\$tmp_tag"
-if command -v pigz >/dev/null 2>&1; then
-  docker save "\$tag" | pigz -p \$(nproc) > "\$tmp_img"
-else
-  docker save "\$tag" | gzip > "\$tmp_img"
-fi
-printf '%s\\n' "\$tag" > "\$tmp_tag"
-sync "\$tmp_img" "\$tmp_tag"
-mv "\$tmp_img" "\$final_img"
-mv "\$tmp_tag" "\$final_tag"
-"""
+  sh "docker/jenkins/scripts/publish_docker_image.sh " +
+     "${shellQuote(imageDir)} ${shellQuote(tag)} ${shellQuote(env.BUILD_NUMBER ?: '')}"
 }
 
 
@@ -415,7 +416,7 @@ void runParallelOrFail(Map<String, Closure> branches) {
 // builder and the result-aggregation helpers.
 
 boolean rowIsActive(Map row) {
-  return ENABLED_PARAMS.contains(row.param as String)
+  return ENABLED_PARAM_SET.contains(row.param as String)
 }
 
 String resolveStageFilter() { return paramString('STAGE_FILTER') }
@@ -467,7 +468,7 @@ void runShard(Map row, int shardIdx, String stageName, String stashName) {
         withEnv(["FINN_HOST_BUILD_DIR=${buildDir}"]) {
           sh "mkdir -p ${shellQuote(perBuildRoot)}"
           sh "touch ${shellQuote(startMarker)}"
-          checkAgentFreeSpace(FINN_CI_MIN_FREE_GB)
+          checkAgentFreeSpace(finnCiMinFreeGB())
           sh "mkdir -p ${shellQuote(stashName)}"
           cleanPreviousBuildFiles(buildDir)
           try {
@@ -626,8 +627,9 @@ void runPytest(Map opts) {
   // running pytest with the wrong env.
   writeFile file: 'run-tests.sh', text:
       "#!/bin/bash\nset -eo pipefail\n${envLines.join('\n')}\n${cmd}\n"
-  sh 'chmod 755 run-tests.sh'
-  runDockerCommand('./run-docker.sh ./run-tests.sh')
+  // invoke via bash so we do not depend on the workspace file having the
+  // execute bit set (writeFile creates 0644 by default).
+  runDockerCommand('./run-docker.sh bash run-tests.sh')
 }
 
 
@@ -785,7 +787,7 @@ void updateTimingState() {
              message: 'updateTimingState failed. Persistent master may be stale') {
     if (!fileExists('reports')) { return }
     String masterArg = FINN_CI_TIMINGS_MASTER ? "--master ${shellQuote(FINN_CI_TIMINGS_MASTER)}" : ''
-    String updateArg = shouldUpdatePersistentTimingState() ? '--update-master --allow-force-accept --gc' : ''
+    String updateArg = shouldUpdatePersistentTimingState() ? '--update-master' : ''
     sh "python3 docker/jenkins/ci_sharding.py update --reports reports ${masterArg} " +
        "--out reports/ci_timings_master.json " +
        "--job ${shellQuote(env.JOB_NAME ?: '')} --build ${shellQuote(env.BUILD_NUMBER ?: '')} " +
@@ -892,23 +894,43 @@ void wipeStaleWorkspace() {
   '''
 }
 
-// Must run after node binding so ${NODE_NAME} resolves before
-// FINN_DOCKER_EXTRA is interpolated. Hostname pin is unconditional: bsub's
-// gethostbyname() on the default finn_dev_<user> fails with "Error 0".
-void withAgentNfsEnv(Closure body) {
+// Pre-create the per-agent NFS cache subtree. Split out from
+// agentCachesDockerExtra so the env-map builder stays free of side effects
+// and can be called from any context without an sh side effect.
+void prepareAgentCaches(String node) {
+  String cachesDir = finnAgentCachesDir(node)
+  if (!cachesDir) { return }
+  sh "mkdir -p ${shellQuote(cachesDir + '/xrt')} " +
+     "${shellQuote(cachesDir + '/finn_cache')} " +
+     "${shellQuote(cachesDir + '/vivado_ip_cache')}"
+}
+
+// Pure compute: returns the env-var list and FINN_DOCKER_EXTRA addition
+// implied by the per-agent NFS caches plus the unconditional hostname pin.
+// Hostname pin is required because bsub's gethostbyname() on the default
+// finn_dev_<user> fails with "Error 0".
+Map agentCachesDockerExtra() {
   String node = env.NODE_NAME ?: 'localhost'
   String dockerExtra = "${env.FINN_DOCKER_EXTRA ?: ''} --hostname ${node}"
   List<String> envList = []
   String cachesDir = finnAgentCachesDir(node)
   if (cachesDir) {
-    sh "mkdir -p ${shellQuote(cachesDir + '/xrt')} " +
-       "${shellQuote(cachesDir + '/finn_cache')} " +
-       "${shellQuote(cachesDir + '/vivado_ip_cache')}"
     dockerExtra += " -v ${cachesDir}/vivado_ip_cache:/tmp/vivado_ip_cache"
     envList << "FINN_XRT_PATH=${cachesDir}/xrt"
     envList << "FINN_DOCKER_CACHE_DIR=${cachesDir}/finn_cache"
   }
-  envList << "FINN_DOCKER_EXTRA=${dockerExtra}"
+  return [envList: envList, dockerExtra: dockerExtra]
+}
+
+// Must run after node binding so ${NODE_NAME} resolves before
+// FINN_DOCKER_EXTRA is interpolated. Composes prepareAgentCaches +
+// agentCachesDockerExtra with the shared-image-dir or local-build toggle.
+void withAgentNfsEnv(Closure body) {
+  String node = env.NODE_NAME ?: 'localhost'
+  prepareAgentCaches(node)
+  Map agentEnv = agentCachesDockerExtra()
+  List<String> envList = agentEnv.envList as List<String>
+  envList << "FINN_DOCKER_EXTRA=${agentEnv.dockerExtra}"
   String imageDir = buildDockerImageDir()
   if (imageDir) {
     envList << "FINN_DOCKER_SHARED_IMAGE_DIR=${imageDir}"

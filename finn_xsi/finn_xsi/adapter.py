@@ -18,6 +18,19 @@ from typing import Optional
 from finn.util.basic import launch_process_helper, resolve_xilinx_tool
 
 
+def _is_pkg_src(path: str) -> bool:
+    """``True`` for ``*_pkg.{sv,v}`` source files (package declarations).
+
+    Used by ``compile_sim_obj`` to partition the source list so packages are
+    handed to xelab before modules that import them. A basename-suffix match
+    catches every package file uniformly; the prior substring whitelist
+    (``["swg_pkg", "mvu_pkg"]``) silently elaborated newer finn-hlslib
+    packages after their importers and tripped xelab.
+    """
+    base = os.path.basename(path)
+    return base.endswith("_pkg.sv") or base.endswith("_pkg.v")
+
+
 def locate_glbl() -> Optional[str]:
     """
     Tries to determine the glbl.v file path from environment variables.
@@ -45,17 +58,9 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
         }
         verilog_header_incl_str = " ".join(["--include " + x for x in verilog_headers])
 
-        # *_pkg.{sv,v} must elaborate before modules that import them.
-        # The prior sorted(..., key=...) form recognised only the substrings
-        # ``["swg_pkg", "mvu_pkg"]``, so any other ``*_pkg.sv`` (e.g. one
-        # introduced by a newer finn-hlslib package) elaborated after its
-        # importers and xelab failed. Switching to a basename-suffix match
-        # covers every package file uniformly. List comprehensions are
-        # stable, so relative ordering inside each partition is preserved.
-        def _is_pkg_src(p):
-            base = os.path.basename(p)
-            return base.endswith("_pkg.sv") or base.endswith("_pkg.v")
-
+        # *_pkg.{sv,v} must elaborate before modules that import them. List
+        # comprehensions are stable, so relative ordering inside each
+        # partition is preserved. See module-level _is_pkg_src.
         pkg_srcs = [s for s in source_list if _is_pkg_src(s)]
         other_srcs = [s for s in source_list if not _is_pkg_src(s)]
         srcs_list = pkg_srcs + other_srcs

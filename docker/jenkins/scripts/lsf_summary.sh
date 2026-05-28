@@ -31,7 +31,15 @@ viv_hosts=$(find "$bd" -name vivado.log -exec grep -h '^# Running On:' {} + 2>/d
 all_hosts=$(printf '%s\n%s\n' "$hls_hosts" "$viv_hosts" | grep -v '^$')
 n_runs=$(echo "$all_hosts" | grep -c .)
 if [ "$n_runs" = "0" ]; then
-  echo "$tag no tool runs"
+  # warn loudly when logs exist but the host-line format has drifted; a
+  # silent "no tool runs" otherwise masks a parsing regression after a
+  # Vivado/Vitis version bump.
+  n_logs=$(find "$bd" \( -name vitis_hls.log -o -name vivado.log \) 2>/dev/null | wc -l)
+  if [ "$n_logs" -gt 0 ]; then
+    echo "$tag no parseable host found in ${n_logs} log(s) (format change?)"
+  else
+    echo "$tag no tool runs"
+  fi
   exit 0
 fi
 n_remote=$(echo "$all_hosts" | grep -vcx "$agent")

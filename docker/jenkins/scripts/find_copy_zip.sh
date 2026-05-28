@@ -26,10 +26,11 @@ if [ ! -d "$find_dir" ]; then
 fi
 
 mkdir -p "$stage_dir/$board"
-# u+w so a previous run's read-only residue can be removed. Ignore failures
+# u+w so a previous run's read-only residue can be removed. ignore failures
 # on a freshly-created dir.
 chmod -R u+w "$stage_dir/$board" 2>/dev/null || true
-rm -rf "${stage_dir:?}/${board:?}"/*
+# find -mindepth 1 catches dotfiles that glob */* would miss.
+find "${stage_dir:?}/${board:?}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
 found=0
 while IFS= read -r -d '' board_dir; do

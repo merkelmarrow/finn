@@ -454,9 +454,7 @@ class VitisLink(Transformation):
         with open(gen_rep_xml_sh, "w") as f:
             f.write("#!/bin/bash \n")
             f.write("cd {}\n".format(link_dir))
-            f.write(
-                "%s -mode batch -source %s\n" % (vivado_cmd, link_dir + "/gen_report_xml.tcl")
-            )
+            f.write("%s -mode batch -source %s\n" % (vivado_cmd, link_dir + "/gen_report_xml.tcl"))
             f.write("cd {}\n".format(working_dir))
         bash_command = ["bash", gen_rep_xml_sh]
         process_genxml = subprocess.Popen(bash_command, stdout=subprocess.PIPE)
