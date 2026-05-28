@@ -41,7 +41,16 @@ trap 'rm -f "$list"' EXIT
       -name build_dataflow.log -o \
       -path '*/project_*/sol1/impl/ip/vivado.log' -o \
       -path '*/finn_zynqbuild_*/vivado.log' -o \
-      -path '*/vitis_proj/_x/logs/*.log' \
+      -path '*/vitis_proj/_x/logs/*.log' -o \
+      -path '*/vivado_stitch_proj_*/vivado.log' -o \
+      -path '*/vitis_link_proj_*/v++_a.log' -o \
+      -path '*/vitis_link_proj_*/v++.link_summary' -o \
+      -path '*/vitis_link_proj_*/run_vitis_link.sh' -o \
+      -path '*/vitis_link_proj_*/config.txt' -o \
+      -path '*/vitis_link_proj_*/_x/link/link.steps.log' -o \
+      -path '*/vitis_link_proj_*/_x/link/sys_link/_sysl/.cdb/*.fcnmap.xml' -o \
+      -path '*/vitis_link_proj_*/_x/link/sys_link/_sysl/.cdb/xd_ip_index.xml' -o \
+      -path '*/vitis_link_proj_*/_x/link/vivado/vpl/*runme.log' \
     \) -print0 2>/dev/null
   if [ -d "$lsf_staging" ]; then
     find "$lsf_staging" -mindepth 2 -maxdepth 3 -type f -newer "$newer_ref" \( \
