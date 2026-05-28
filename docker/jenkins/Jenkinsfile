@@ -147,13 +147,11 @@ pipeline {
         script {
           wipeStaleWorkspace()
           announceCiMode()
-          withAgentNfsEnv {
-            loadStageConfig()
-            prepareTimingState()
-            validateShards()
-            rotateBuildTrees()
-            writeBuildInfo()
-          }
+          loadStageConfig()
+          prepareTimingState()
+          validateShards()
+          rotateBuildTrees()
+          writeBuildInfo()
         }
       }
     }
@@ -961,9 +959,6 @@ String activeArtifactRowSummary() {
   // transformed closures do not coerce reliably to that SAM type, so we use
   // the explicit get/put pattern that matches the C-style loop earlier in
   // the file.
-  // bare LinkedHashMap. Groovy 2.x parses the trailing >> in
-  // LinkedHashMap<String, List<String>> as right-shift in the as-cast
-  // position and fails to compile the script.
   def rowToBoards = [:] as LinkedHashMap
   eachActiveZipArtifact { row, testType, board ->
     String stage = row.stage as String
