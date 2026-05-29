@@ -194,7 +194,22 @@ def create_two_fc_model(mem_mode="internal_decoupled"):
     return model
 
 
-@pytest.mark.parametrize("mem_mode", ["internal_embedded", "internal_decoupled"])
+# gen_model -> do_stitch -> rtlsim chain via load_test_checkpoint_or_skip;
+# pin each mem_mode chain to one xdist worker so the file is on disk before
+# the next test reads it.
+@pytest.mark.parametrize(
+    "mem_mode",
+    [
+        pytest.param(
+            "internal_embedded",
+            marks=pytest.mark.xdist_group(name="ipstitch_internal_embedded"),
+        ),
+        pytest.param(
+            "internal_decoupled",
+            marks=pytest.mark.xdist_group(name="ipstitch_internal_decoupled"),
+        ),
+    ],
+)
 @pytest.mark.fpgadataflow
 @pytest.mark.vivado
 def test_fpgadataflow_ipstitch_gen_model(mem_mode):
@@ -213,7 +228,19 @@ def test_fpgadataflow_ipstitch_gen_model(mem_mode):
     model.save(ip_stitch_model_dir + "/test_fpgadataflow_ipstitch_gen_model_%s.onnx" % mem_mode)
 
 
-@pytest.mark.parametrize("mem_mode", ["internal_embedded", "internal_decoupled"])
+@pytest.mark.parametrize(
+    "mem_mode",
+    [
+        pytest.param(
+            "internal_embedded",
+            marks=pytest.mark.xdist_group(name="ipstitch_internal_embedded"),
+        ),
+        pytest.param(
+            "internal_decoupled",
+            marks=pytest.mark.xdist_group(name="ipstitch_internal_decoupled"),
+        ),
+    ],
+)
 @pytest.mark.fpgadataflow
 @pytest.mark.vivado
 @pytest.mark.slow
@@ -249,7 +276,19 @@ def test_fpgadataflow_ipstitch_do_stitch(mem_mode):
     model.save(ip_stitch_model_dir + "/test_fpgadataflow_ip_stitch_%s.onnx" % mem_mode)
 
 
-@pytest.mark.parametrize("mem_mode", ["internal_embedded", "internal_decoupled"])
+@pytest.mark.parametrize(
+    "mem_mode",
+    [
+        pytest.param(
+            "internal_embedded",
+            marks=pytest.mark.xdist_group(name="ipstitch_internal_embedded"),
+        ),
+        pytest.param(
+            "internal_decoupled",
+            marks=pytest.mark.xdist_group(name="ipstitch_internal_decoupled"),
+        ),
+    ],
+)
 @pytest.mark.fpgadataflow
 @pytest.mark.vivado
 def test_fpgadataflow_ipstitch_rtlsim(mem_mode):

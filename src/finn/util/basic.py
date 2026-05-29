@@ -26,20 +26,20 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import errno
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.custom_op.registry import getCustomOp
 from qonnx.util.basic import gen_finn_dt_tensor, roundup_to_integer_multiple
 from typing import Dict, Optional, Tuple
 
 from finn.util.data_packing import finnpy_to_packed_bytearray
-
-# test boards used for bnn pynq tests
-test_board_map = ["Pynq-Z1", "KV260_SOM", "ZCU104", "U250"]
 
 # mapping from PYNQ board names to FPGA part names
 pynq_part_map = dict()
@@ -159,16 +159,54 @@ def make_build_dir(prefix=""):
     Use this function instead of tempfile.mkdtemp to ensure any generated files
     will survive on the host after the FINN Docker container exits."""
     try:
-        tmpdir = tempfile.mkdtemp(prefix=prefix)
-        newdir = tmpdir.replace("/tmp", os.environ["FINN_BUILD_DIR"])
-        os.makedirs(newdir)
-        return newdir
+        build_dir = os.environ["FINN_BUILD_DIR"]
     except KeyError:
         raise Exception(
             """Environment variable FINN_BUILD_DIR must be set
         correctly. Please ensure you have launched the Docker contaier correctly.
         """
         )
+    # mkdtemp(dir=...) creates the unique dir atomically inside FINN_BUILD_DIR;
+    # the old replace("/tmp", ...) form left an orphan /tmp/<prefix>XXX on every
+    # call that nothing ever cleaned up.
+    os.makedirs(build_dir, exist_ok=True)
+    new_dir = tempfile.mkdtemp(prefix=prefix, dir=build_dir)
+    # mkdtemp uses 0700 unconditionally for security. Widen to 0755 so a
+    # sibling container or a non-build UID on the same host can still read the
+    # FINN build tree (FINN_BUILD_DIR itself is already world-readable).
+    os.chmod(new_dir, 0o755)
+    return new_dir
+
+
+def robust_rmtree(path, retries=6, initial_delay=0.1, backoff=2.0):
+    """Remove a directory tree, retrying transient NFS ``ENOTEMPTY`` races.
+
+    Use this at production cleanup sites that delete a FINN build tree on NFS
+    (e.g. the CleanUp transformation, or a test that ran a real build under
+    ``make_build_dir``/``FINN_BUILD_DIR``): a tool subprocess closing a file
+    just as the tree is removed triggers an NFS silly-rename and a transient
+    ``ENOTEMPTY``. Prefer pytest's ``tmp_path`` for ad-hoc test scratch that
+    does not need ``FINN_BUILD_DIR`` -- pytest owns the cleanup and it lives on
+    local fs, sidestepping the race entirely.
+
+    Maximum total wait at the defaults is ~6.3s across retries before a
+    persistent ``ENOTEMPTY`` propagates. Other ``OSError`` subclasses
+    propagate immediately. A missing path is a no-op.
+    """
+    if not path or not os.path.exists(path):
+        return
+    delay = initial_delay
+    for attempt in range(retries):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if exc.errno != errno.ENOTEMPTY or attempt == retries - 1:
+                raise
+            time.sleep(delay)
+            delay *= backoff
 
 
 class CppBuilder:
@@ -218,22 +256,35 @@ class CppBuilder:
         process_compile.communicate()
 
 
-def launch_process_helper(args, proc_env=None, cwd=None):
+def launch_process_helper(args, proc_env=None, cwd=None, check=False):
     """Helper function to launch a process in a way that facilitates logging
     stdout/stderr with Python loggers.
-    Returns (cmd_out, cmd_err)."""
+
+    Returns ``(cmd_out, cmd_err)`` as decoded UTF-8 strings. When ``check`` is
+    True and the process exits non-zero, raises :class:`subprocess.CalledProcessError`
+    with ``output`` and ``stderr`` populated as the same decoded strings. The
+    output is mirrored to ``sys.stdout``/``sys.stderr`` before the raise so the
+    captured tool log is visible even on failure (hence the manual check rather
+    than ``subprocess.run(check=True)``).
+    """
     if proc_env is None:
         proc_env = os.environ.copy()
-    with subprocess.Popen(
-        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=proc_env, cwd=cwd
-    ) as proc:
-        (cmd_out, cmd_err) = proc.communicate()
+    proc = subprocess.run(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=proc_env,
+        cwd=cwd,
+        encoding="utf-8",
+    )
+    cmd_out = proc.stdout
+    cmd_err = proc.stderr
     if cmd_out is not None:
-        cmd_out = cmd_out.decode("utf-8")
         sys.stdout.write(cmd_out)
     if cmd_err is not None:
-        cmd_err = cmd_err.decode("utf-8")
         sys.stderr.write(cmd_err)
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, args, cmd_out, cmd_err)
     return (cmd_out, cmd_err)
 
 
@@ -256,6 +307,37 @@ def which(program):
                 return exe_file
 
     return None
+
+
+# Xilinx tools whose generated-script invocations FINN routes through
+# resolve_xilinx_tool. The directory override lets an out-of-band dispatcher
+# (e.g. an LSF bsub wrapper) intercept every call by pointing at one shim
+# directory whose filenames match these names, with no per-tool wiring and no
+# PATH shim. Kept as a tuple for documentation and the round-trip test; the
+# resolver itself accepts any name.
+_XILINX_TOOLS = ("vivado", "v++", "vitis_hls", "vitis-run", "xelab")
+
+_XILINX_TOOL_DIR_ENV = "FINN_TOOL_DIR_OVERRIDE"
+
+
+def resolve_xilinx_tool(default_name):
+    """Return the Xilinx-tool command to embed in generated bash scripts.
+
+    With ``FINN_TOOL_DIR_OVERRIDE`` set, the command resolves to
+    ``<override>/<default_name>``; otherwise the bare ``default_name`` is used.
+    The single directory override is all a tool-wrapping site needs: point it
+    at a shim dir whose filenames match the bare tool names. Raises
+    FileNotFoundError when the resolved command is not on PATH. ``assert`` is
+    unsuitable here because the check is runtime input, not an invariant, and
+    would be stripped under ``-O``.
+    """
+    dir_override = os.environ.get(_XILINX_TOOL_DIR_ENV)
+    tool = os.path.join(dir_override, default_name) if dir_override else default_name
+    if which(tool) is None:
+        raise FileNotFoundError(
+            "%s not found in PATH (%s=%r)" % (tool, _XILINX_TOOL_DIR_ENV, dir_override)
+        )
+    return tool
 
 
 mem_primitives_versal = {

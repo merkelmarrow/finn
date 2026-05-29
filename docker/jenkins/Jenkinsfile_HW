@@ -1,481 +1,538 @@
+// FINN HW CI pipeline. Tethered to physical boards.
+//
+// HW_SHARDS is loaded from ci_sharding.py's BOARDS table so the build and HW
+// pipelines share one source of truth. Shared Groovy helpers live in
+// docker/jenkins/common.groovy.
+
+import groovy.transform.Field
+
+
+// ============================================================================
+// Module-level imports and shared-helper cache
+// ============================================================================
+
+@Field
+def _common = null
+
+private def loadCommonOnce() {
+  if (_common == null) { _common = load 'docker/jenkins/common.groovy' }
+  return _common
+}
+
+
+// ============================================================================
+// Configuration fields
+// ============================================================================
+
+@Field
+List<Map> HW_SHARDS = []
+
+// Populated from ci_sharding.py's hw-config-json so the build and HW
+// pipelines stay in sync without duplicating the list on the Groovy side.
+@Field
+List<String> HW_TEST_TYPES = []
+
+// Populated from ci_sharding.py's hw-config-json. Adding a new HW test type
+// is a one-line edit of HW_TEST_TYPE_LABELS in ci_sharding.py;
+// validate_config() rejects an hwTestType without a matching label.
+@Field
+Map<String, String> HW_TEST_TYPE_LABELS = [:]
+
+// Keyed by agentLabel. Populated by refreshNodeOnlineFlags().
+@Field
+Map<String, Boolean> NODE_ONLINE = [:]
+
+// Keyed by "${testType}::${board}" (a separator that cannot occur inside a
+// testType or board name), value is the resolve-build-zips entry for
+// that pair (or [:] when no READY zip resolved). Populated once in the
+// Collect stage so later helpers do not touch the filesystem.
+@Field
+Map<String, Map> BUILD_BOARD_ZIP_PATHS = [:]
+
+// Jenkins agent label every non-board stage runs on. Mirrors the same
+// @Field in Jenkinsfile so a relabel is a one-line edit in both files.
+// Cannot be env-overridden because `env` is not bound during @Field
+// initialisation under Jenkins CPS.
+@Field
+static final String FINN_BUILD_LABEL = 'finn-build'
+
+
+// ============================================================================
+// Pipeline declaration
+// ============================================================================
+
 pipeline {
   agent none
+  parameters {
+    string(name: 'build_job_name', defaultValue: 'finn',
+           description: 'Build pipeline Jenkins job feeding this HW build. Scans the build job\'s ci_runs tree on shared NFS for per-board READY zips.')
+    string(name: 'build_dir', defaultValue: '',
+           description: 'Optional explicit path to a single build directory. Overrides build_job_name auto-discovery and forces every board to be read from this one directory. Use for off-Jenkins recovery or pinning a specific build.')
+    booleanParam(name: 'allow_fallback', defaultValue: false,
+                 description: 'Allow a board to test an older READY build when the newest build did not produce that board zip. Default false marks the HW build unstable if fallback is used.')
+    string(name: 'BOARD_FILTER', defaultValue: '',
+           description: 'Substring filter for debugging a single board. Matches against the board name. Leave empty for a normal build.')
+  }
   stages {
     stage('Get node status') {
-      options { skipDefaultCheckout() }
-      agent {
-        label 'finn-build'
-      }
-      steps {
-        script {
-          // Check which boards are online before running HW tests
-          env.ALVEO_HOST_ONLINE = isNodeOnline('finn-u250')
-          env.PYNQ_ONLINE = isNodeOnline('finn-pynq')
-          env.ZCU104_ONLINE = isNodeOnline('finn-zcu104')
-          env.KV260_ONLINE = isNodeOnline('finn-kv260')
-        }
-      }
+      agent { label "${FINN_BUILD_LABEL}" }
+      steps { script { loadHwShards(); validateBoardFilter(); refreshNodeOnlineFlags() } }
     }
     stage('Reboot Zynq platforms') {
-      parallel {
-        stage('Pynq-Z1') {
-          options { skipDefaultCheckout() }
-          when {
-            // beforeAgent set to 'true' to prevent an offline agent hanging the stage
-            beforeAgent true
-            expression { return (env.PYNQ_ONLINE == 'true') }
-          }
-          agent {
-            label 'finn-pynq'
-          }
-          environment {
-            BOARD = 'Pynq-Z1'
-            USER_CREDENTIALS = credentials('pynq-z1-credentials')
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              restartZynqPlatform()
-            }
-          }
-        }
-        stage('ZCU104') {
-          options { skipDefaultCheckout() }
-          when {
-            // beforeAgent set to 'true' to prevent an offline agent hanging the stage
-            beforeAgent true
-            expression { return (env.ZCU104_ONLINE == 'true') }
-          }
-          agent {
-            label 'finn-zcu104'
-          }
-          environment {
-            BOARD = 'ZCU104'
-            USER_CREDENTIALS = credentials('pynq-z1-credentials')
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              restartZynqPlatform()
-            }
-          }
-        }
-        stage('Kria KV260_SOM') {
-          options { skipDefaultCheckout() }
-          when {
-            // beforeAgent set to 'true' to prevent an offline agent hanging the stage
-            beforeAgent true
-            expression { return (env.KV260_ONLINE == 'true') }
-          }
-          agent {
-            label 'finn-kv260'
-          }
-          environment {
-            BOARD = 'KV260_SOM'
-            USER_CREDENTIALS = credentials('user-ubuntu-credentials')
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              restartZynqPlatform()
-            }
-          }
-        }
-      }
+      steps { script { parallel(buildRebootMap()) } }
     }
     stage('Wait for Nodes to reboot') {
       options { skipDefaultCheckout() }
-      agent {
-        label 'finn-build'
-      }
-      steps {
-        sleep(time: "${env.REBOOT_SLEEP}", unit: 'MINUTES')
-      }
+      agent { label "${FINN_BUILD_LABEL}" }
+      // REBOOT_SLEEP minutes. Default 5; the job DSL may override.
+      steps { sleep(time: (env.REBOOT_SLEEP ?: '5').toInteger(), unit: 'MINUTES') }
     }
+    // Default checkout is required so docker/jenkins/test_bnn_hw_pytest.py
+    // is in the workspace for the bnn_test_files stash.
     stage('Collect build information for HW testing') {
-      options { skipDefaultCheckout() }
-      agent {
-        label 'finn-build'
-      }
+      agent { label "${FINN_BUILD_LABEL}" }
+      steps { script { collectBuildArtifacts() } }
+    }
+    // One scripted stage per HW test type. The loop body adds a nested
+    // ``stage(name)`` per entry so each test type still shows up as its
+    // own row in the Jenkins UI. Adding a new test type is a one-line edit
+    // of HW_TEST_TYPE_LABELS in ci_sharding.py.
+    stage('Run Hardware Tests') {
       steps {
         script {
-          // Check which boards are online before running HW tests
-          env.ALVEO_HOST_ONLINE = isNodeOnline('finn-u250')
-          env.PYNQ_ONLINE = isNodeOnline('finn-pynq')
-          env.ZCU104_ONLINE = isNodeOnline('finn-zcu104')
-          env.KV260_ONLINE = isNodeOnline('finn-kv260')
-
-          // Stash the HW test scripts to be used on worker nodes
-          dir('docker/jenkins') {
-            stash name: 'bnn_test_files', includes: 'test_bnn_hw_pytest.py'
-          }
-
-          // Collect build artifacts from network and stash for use on worker nodes
-          dir("${env.ARTIFACT_DIR}"){
-            stashBuildArtifacts('bnn_build_sanity')
-            stashBuildArtifacts('bnn_build_full')
-          }
-        }
-      }
-    }
-    stage('Sanity - Run Hardware Tests') {
-      parallel {
-        stage('BNN Sanity - U250') {
-          when {
-            // beforeAgent set to 'true' to prevent an offline agent hanging the stage
-            beforeAgent true
-            expression { return (env.ALVEO_HOST_ONLINE == 'true') }
-          }
-          agent {
-            label 'finn-u250'
-          }
-          environment {
-            BOARD = 'U250'
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              runTest("bnn_build_sanity", "${env.BOARD}", "${env.BOARD}")
-            }
-          }
-          post {
-            always {
-              stashResults("bnn_build_sanity", "${env.BOARD}")
-              cleanUpWorkspaceOwnership()
-            }
-          }
-        }
-        stage('BNN Sanity - Pynq-Z1') {
-          when {
-            // beforeAgent set to 'true' to prevent an offline agent hanging the stage
-            beforeAgent true
-            expression { return (env.PYNQ_ONLINE == 'true') }
-          }
-          agent {
-            label 'finn-pynq'
-          }
-          environment {
-            BOARD = 'Pynq-Z1'
-            USER_CREDENTIALS = credentials('pynq-z1-credentials')
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              runTest("bnn_build_sanity", "${env.BOARD}", "Pynq")
-            }
-          }
-          post {
-            always {
-              stashResults("bnn_build_sanity", "${env.BOARD}")
-              cleanUpWorkspaceOwnership()
-            }
-          }
-        }
-        stage('BNN Sanity - ZCU104') {
-          when {
-            // beforeAgent set to 'true' to prevent an offline agent hanging the stage
-            beforeAgent true
-            expression { return (env.ZCU104_ONLINE == 'true') }
-          }
-          agent {
-            label 'finn-zcu104'
-          }
-          environment {
-            BOARD = 'ZCU104'
-            USER_CREDENTIALS = credentials('pynq-z1-credentials')
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              runTest("bnn_build_sanity", "${env.BOARD}", "${env.BOARD}")
-            }
-          }
-          post {
-            always {
-              stashResults("bnn_build_sanity", "${env.BOARD}")
-              cleanUpWorkspaceOwnership()
-            }
-          }
-        }
-        stage('BNN Sanity - KV260_SOM') {
-          when {
-            // beforeAgent set to 'true' to prevent an offline agent hanging the stage
-            beforeAgent true
-            expression { return (env.KV260_ONLINE == 'true') }
-          }
-          agent {
-            label 'finn-kv260'
-          }
-          environment {
-            BOARD = 'KV260_SOM'
-            USER_CREDENTIALS = credentials('user-ubuntu-credentials')
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              runTest("bnn_build_sanity", "${env.BOARD}", "${env.BOARD}")
-            }
-          }
-          post {
-            always {
-              stashResults("bnn_build_sanity", "${env.BOARD}")
-              cleanUpWorkspaceOwnership()
-            }
-          }
-        }
-      }
-    }
-    stage('End2end - Run Hardware Tests') {
-      parallel {
-        stage('BNN end2end - U250') {
-          when {
-            // beforeAgent set to 'true' to prevent an offline agent hanging the stage
-            beforeAgent true
-            expression { return (env.ALVEO_HOST_ONLINE == 'true') }
-          }
-          agent {
-            label 'finn-u250'
-          }
-          environment {
-            BOARD = 'U250'
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              runTest("bnn_build_full", "${env.BOARD}", "${env.BOARD}")
-            }
-          }
-          post {
-            always {
-              stashResults("bnn_build_full", "${env.BOARD}")
-              cleanUpWorkspaceOwnership()
-            }
-          }
-        }
-        stage('BNN end2end - Pynq-Z1') {
-          when {
-            // beforeAgent set to 'true' to prevent an offline agent hanging the stage
-            beforeAgent true
-            expression { return (env.PYNQ_ONLINE == 'true') }
-          }
-          agent {
-            label 'finn-pynq'
-          }
-          environment {
-            BOARD = 'Pynq-Z1'
-            USER_CREDENTIALS = credentials('pynq-z1-credentials')
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              runTest("bnn_build_full", "${env.BOARD}", "Pynq")
-            }
-          }
-          post {
-            always {
-              stashResults("bnn_build_full", "${env.BOARD}")
-              cleanUpWorkspaceOwnership()
-            }
-          }
-        }
-        stage('BNN end2end - ZCU104') {
-          when {
-            // beforeAgent set to 'true' to prevent an offline agent hanging the stage
-            beforeAgent true
-            expression { return (env.ZCU104_ONLINE == 'true') }
-          }
-          agent {
-            label 'finn-zcu104'
-          }
-          environment {
-            BOARD = 'ZCU104'
-            USER_CREDENTIALS = credentials('pynq-z1-credentials')
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              runTest("bnn_build_full", "${env.BOARD}", "${env.BOARD}")
-            }
-          }
-          post {
-            always {
-              stashResults("bnn_build_full", "${env.BOARD}")
-              cleanUpWorkspaceOwnership()
-            }
-          }
-        }
-        stage('BNN end2end - KV260_SOM') {
-          when {
-            // beforeAgent set to 'true' to prevent an offline agent hanging the stage
-            beforeAgent true
-            expression { return (env.KV260_ONLINE == 'true') }
-          }
-          agent {
-            label 'finn-kv260'
-          }
-          environment {
-            BOARD = 'KV260_SOM'
-            USER_CREDENTIALS = credentials('user-ubuntu-credentials')
-          }
-          steps {
-            catchError(stageResult: 'FAILURE') {
-              runTest("bnn_build_full", "${env.BOARD}", "${env.BOARD}")
-            }
-          }
-          post {
-            always {
-              stashResults("bnn_build_full", "${env.BOARD}")
-              cleanUpWorkspaceOwnership()
+          HW_TEST_TYPES.each { testType ->
+            String label = hwTestTypeLabel(testType)
+            stage("${label} - Run Hardware Tests") {
+              runHwParallelStage(testType)
             }
           }
         }
       }
     }
     stage('Check Stage Results') {
-      agent {
-        label 'finn-build'
-      }
-      steps {
-        script {
-          sh 'mkdir -p reports'
-          cleanPreviousBuildFiles('reports')
-          dir('reports') {
-            // Only unstash for stages that ran
-            unstashSuccessfulStage(env.ALVEO_HOST_ONLINE, "xml_bnn_build_sanity_U250")
-            unstashSuccessfulStage(env.PYNQ_ONLINE, "xml_bnn_build_sanity_Pynq-Z1")
-            unstashSuccessfulStage(env.ZCU104_ONLINE, "xml_bnn_build_sanity_ZCU104")
-            unstashSuccessfulStage(env.KV260_ONLINE, "xml_bnn_build_sanity_KV260_SOM")
-            unstashSuccessfulStage(env.ALVEO_HOST_ONLINE, "xml_bnn_build_full_U250")
-            unstashSuccessfulStage(env.PYNQ_ONLINE, "xml_bnn_build_full_Pynq-Z1")
-            unstashSuccessfulStage(env.ZCU104_ONLINE, "xml_bnn_build_full_ZCU104")
-            unstashSuccessfulStage(env.KV260_ONLINE, "xml_bnn_build_full_KV260_SOM")
-          }
+      agent { label "${FINN_BUILD_LABEL}" }
+      steps { script { aggregateReports() } }
+    }
+  }
+}
 
-          // Combine individual HTML files to one single report
-          sh './run-docker.sh pytest_html_merger -i reports/ -o reports/test_report_hw_final.html'
 
-          // Archive the XML & HTML test results
-          archiveArtifacts artifacts: "reports/*.xml"
-          archiveArtifacts artifacts: "reports/*.html"
+// ============================================================================
+// Get-node-status / Reboot stage helpers
+// ============================================================================
 
-          // Plot what XML files were created during the test run
-          junit 'reports/*.xml'
+void loadHwShards() {
+  // One subprocess loads shards + test types + labels, validating the
+  // BOARDS/STAGES tables once. validate_config (run inside hw-config-json)
+  // rejects an hwTestType without a matching label, so HW_TEST_TYPE_LABELS is
+  // guaranteed to cover HW_TEST_TYPES by the time we get here.
+  String raw = sh(returnStdout: true, script:
+    "python3 src/finn/util/ci_sharding.py hw-config-json"
+  ).trim()
+  Map cfg = readJSON(text: raw) as Map
+  HW_SHARDS = (cfg.shards as List).collect { it as Map }
+  HW_TEST_TYPES = (cfg.test_types as List).collect { it as String }
+  HW_TEST_TYPE_LABELS = cfg.labels as Map
+}
+
+String hwTestTypeLabel(String testType) {
+  String label = HW_TEST_TYPE_LABELS[testType]
+  if (!label) {
+    error "hwTestTypeLabel: no HW_TEST_TYPE_LABELS entry for ${testType}"
+  }
+  return label
+}
+
+// Fails Get-node-status loudly with a candidate list when BOARD_FILTER
+// matches no board. Mirrors the build-side STAGE_FILTER pattern so a typo
+// cannot reach the parallel branches and silently degrade to "no shards run".
+void validateBoardFilter() {
+  String filter = paramString('BOARD_FILTER')
+  if (!filter) { return }
+  def matched = HW_SHARDS.findAll { (it.board as String).contains(filter) }
+  if (matched.isEmpty()) {
+    error "BOARD_FILTER='${filter}' matched no boards. Available: " +
+          HW_SHARDS.collect { it.board }.join(', ')
+  }
+}
+
+void refreshNodeOnlineFlags() {
+  HW_SHARDS.each { row ->
+    NODE_ONLINE[row.agentLabel as String] = isNodeOnline(row.agentLabel as String)
+  }
+}
+
+boolean isOnline(String agentLabel) {
+  Boolean v = NODE_ONLINE[agentLabel]
+  return v != null && v
+}
+
+// One reboot per restartPrep=true board. runReboot() skips offline ones.
+Map<String, Closure> buildRebootMap() {
+  def branches = [:]
+  HW_SHARDS.each { row ->
+    if (!row.restartPrep) { return }
+    String stage = row.board == 'KV260_SOM' ? "Kria ${row.board}" : row.board
+    branches[stage] = { runReboot(row, stage) }
+  }
+  return branches
+}
+
+void runReboot(Map row, String stageName) {
+  if (!isOnline(row.agentLabel as String)) {
+    echo "${stageName} reboot skipped: agent ${row.agentLabel} offline"
+    return
+  }
+  node(row.agentLabel) {
+    stage(stageName) {
+      catchError(stageResult: 'FAILURE') {
+        withHwCredentials(row) {
+          restartZynqPlatform()
         }
       }
     }
   }
 }
 
-void cleanPreviousBuildFiles(String buildDir) {
-  // Delete any build files from a previous build
-  // Previous build folders affect findCopyZip() and can cause the stage to fail
-  if (!buildDir.empty) {
-    if (env.USER_CREDENTIALS) {
-      sh "echo $USER_CREDENTIALS_PSW | sudo -S rm -rf ${buildDir}*"
-    } else {
-      sh "rm -rf ${buildDir}"
-    }
+
+// ============================================================================
+// Collect-build-information stage helpers
+// ============================================================================
+
+void collectBuildArtifacts() {
+  refreshNodeOnlineFlags()
+  resolveBuildBoardZipPaths()
+  archiveBuildInfo()
+  dir('docker/jenkins') {
+    stash name: 'bnn_test_files', includes: 'test_bnn_hw_pytest.py'
   }
+  HW_TEST_TYPES.each { testType -> stashBuildArtifacts(testType) }
 }
 
-void createTestScript(String board, String marker, String testResultsFilename) {
-   if(board == "U250")
-    sh """echo "#!/bin/bash
-. /opt/xilinx/xrt/setup.sh
-. ${VENV_ACTIVATE}
-python -m pytest -m ${marker} --junitxml=${testResultsFilename}.xml --html=${testResultsFilename}.html --self-contained-html" >> run-tests.sh
-    """
-  else
-    sh """echo "#!/bin/bash
-. /etc/profile.d/pynq_venv.sh
-. /etc/profile.d/xrt_setup.sh
-python -m pytest -m ${marker} --junitxml=${testResultsFilename}.xml --html=${testResultsFilename}.html --self-contained-html" >> run-tests.sh
-    """
-
-  // Give permissions to script
-  sh 'chmod 777 run-tests.sh'
-}
-
-def isNodeOnline(String labelName) {
-  Label label = Jenkins.instance.getLabel(labelName)
-  def agentOnline = false
-
-  if (label) {
-    List<Node> nodes = Jenkins.instance.getNodes()
-
-    nodes.each { node ->
-      if (node.getAssignedLabels().contains(label)) {
-        def computer = node.toComputer()
-        if (computer && computer.isOnline()) {
-          agentOnline = true
-        } else {
-          echo """Agent ${node.displayName} is offline"""
+// One shellout to resolve-build-zips walks the per-job ci_runs tree once in
+// Python instead of fanning out 2*N_BOARDS per-pair find pipelines.
+void resolveBuildBoardZipPaths() {
+  BUILD_BOARD_ZIP_PATHS = [:]
+  String rawJob = paramString('build_job_name').trim() ?: 'finn'
+  String jobKey = sh(returnStdout: true, script:
+    "python3 src/finn/util/ci_sharding.py job-key ${shellQuote(rawJob)}"
+  ).trim()
+  String override = paramString('build_dir').trim()
+  String artifactDir = loadCommonOnce().finnArtifactsRoot()
+  if (!artifactDir && !override) {
+    error "resolveBuildBoardZipPaths: FINN_CI_NFS_ROOT is unset. The HW pipeline cannot " +
+          "locate build artifacts. Set FINN_CI_NFS_ROOT in the HW job's environment " +
+          "to the same path as the build job, or pass build_dir explicitly to pin a " +
+          "single build directory (useful for off-NFS recovery)."
+  }
+  String tests = HW_TEST_TYPES.join(',')
+  String boards = HW_SHARDS.collect { it.board }.join(',')
+  String cmd = "python3 src/finn/util/ci_sharding.py resolve-build-zips " +
+               "--artifact-dir ${shellQuote(artifactDir)} --job-key ${shellQuote(jobKey)} " +
+               "--tests ${shellQuote(tests)} --boards ${shellQuote(boards)} " +
+               "--build-dir ${shellQuote(override)}"
+  Map resolved = readJSON(text: sh(returnStdout: true, script: cmd).trim()) as Map
+  def fallbackMessages = []
+  HW_TEST_TYPES.each { testType ->
+    HW_SHARDS.each { row ->
+      String board = row.board as String
+      String key = "${testType}::${board}"
+      Map entry = ((resolved[testType] ?: [:])[board] ?: [:]) as Map
+      BUILD_BOARD_ZIP_PATHS[key] = entry
+      if (entry.zip) {
+        String fallback = entry.fallback ? " fallback_from=${entry.build} latest=${entry.latestBuild}" : ""
+        echo "resolveBuildBoardZipPaths: ${key} -> ${entry.zip}${fallback}"
+        if (entry.fallback) {
+          fallbackMessages << "${key} uses build ${entry.build}, latest available for ${testType} is ${entry.latestBuild}"
         }
-      }
-    }
-  } else {
-    echo """Node with label ${labelName} not found"""
-  }
-
-  return agentOnline
-}
-
-void unstashSuccessfulStage(String stageEnvVariableSet, String stashName) {
-  if (stageEnvVariableSet) {
-    unstash stashName
-  }
-}
-
-void stashBuildArtifacts(String testDir) {
-  dir("$testDir") {
-    def files = findFiles()
-    files.each { f ->
-      def file = f.toString()
-      def extIndex = file.lastIndexOf(".")
-      def boardName = file.substring(0, extIndex)
-      stash name: "${testDir}_${boardName}_zip", includes: "${f}"
-    }
-  }
-}
-
-void runTest(String testType, String board, String marker) {
-  sh "mkdir -p ${testType}"
-  dir("$testType") {
-    // Clean any files from a previous run
-    cleanPreviousBuildFiles("${board}*")
-
-    // Get the test files
-    unstash name: "${testType}_${board}_zip"
-    sh "unzip -o ${board}.zip"
-
-    dir("$board") {
-      // Get the scripts necessary for running hw tests
-      unstash name: 'bnn_test_files'
-
-      // Create test script
-      createTestScript(board, marker, "${testType}_hw_${board}")
-
-      if (env.USER_CREDENTIALS) {
-        // Execute the script as the root user - needed for zynq platforms
-        sh 'echo ${USER_CREDENTIALS_PSW} | sudo -S ./run-tests.sh'
+      } else if (override) {
+        echo "resolveBuildBoardZipPaths: ${key} not READY under explicit build_dir=${override}, this board will be skipped"
       } else {
-        // Execute the script
-        sh './run-tests.sh'
+        echo "resolveBuildBoardZipPaths: ${key} has no READY zip, HW will skip this board"
+      }
+    }
+  }
+  if (!fallbackMessages.isEmpty() && !paramBool('allow_fallback')) {
+    unstable "HW fallback used without allow_fallback=true:\n  - " + fallbackMessages.join('\n  - ')
+  }
+}
+
+// Sole writer of currentBuild.description on the HW pipeline. Boards may
+// resolve to different builds when one board regressed. Archive each
+// distinct build's BUILD_INFO.txt for traceability.
+void archiveBuildInfo() {
+  catchError(buildResult: null, stageResult: null,
+             message: 'archiveBuildInfo failed, non-fatal') {
+    // the HW pipeline does not git-clean between runs, so wipe stale per-build
+    // info files here before a fresh archive
+    sh 'rm -f build_info_*.txt'
+    Set<String> buildDirs = new LinkedHashSet<>()
+    Map<String, String> boardToBuild = [:]
+    BUILD_BOARD_ZIP_PATHS.each { key, entry ->
+      // entry is [:] when no READY zip was resolved for this pair.
+      String dir = entry.buildDir as String
+      if (!dir) { return }
+      buildDirs.add(dir)
+      String fallback = entry.fallback ? " fallback=true latest=${entry.latestBuild}" : " fallback=false"
+      boardToBuild[key] = "${dir}${fallback}"
+    }
+    int n = 0
+    buildDirs.each { dir ->
+      String info = "${dir}/BUILD_INFO.txt"
+      if (!fileExists(info)) {
+        echo "archiveBuildInfo: ${info} not present, skipping"
+        return
+      }
+      String localName = "build_info_${n}.txt"
+      sh "cp ${shellQuote(info)} ${shellQuote(localName)}"
+      archiveArtifacts artifacts: localName, allowEmptyArchive: true
+      n++
+    }
+    if (!boardToBuild.isEmpty()) {
+      List<String> lines = boardToBuild.collect { k, v -> "${k}=${v}" }.sort()
+      currentBuild.description = "build per board:<br>" + lines.join('<br>')
+    }
+  }
+}
+
+// Per-board skip when offline or no READY zip keeps the rest of the matrix running.
+void stashBuildArtifacts(String testType) {
+  HW_SHARDS.each { row ->
+    String board = row.board as String
+    if (!isOnline(row.agentLabel as String)) {
+      echo "stashBuildArtifacts[${testType}]: ${board} agent offline, skipping"
+      return
+    }
+    String src = buildBoardZip(testType, board)
+    if (!src) {
+      echo "stashBuildArtifacts[${testType}]: no READY zip for ${board}, HW shard will skip"
+      return
+    }
+    String zipName = "${board}.zip"
+    sh "cp ${shellQuote(src)} ${shellQuote(zipName)}"
+    echo "stashBuildArtifacts[${testType}]: ${board} <- ${src}"
+    stash name: hwZipStashName(testType, board), includes: zipName
+    sh "rm -f ${shellQuote(zipName)}"
+  }
+}
+
+
+// ============================================================================
+// Run-Hardware-Tests stage helpers
+// ============================================================================
+
+// Pure map lookup, no filesystem stats. Runs from the no-agent orchestrator.
+Map<String, Closure> buildHwStageMap(String testType) {
+  String label = hwTestTypeLabel(testType)
+  String filter = paramString('BOARD_FILTER')
+  def branches = [:]
+  def offlineWithZip = []
+  HW_SHARDS.each { row ->
+    String board = row.board as String
+    if (filter && !board.contains(filter)) {
+      return
+    }
+    if (!buildBoardZip(testType, board)) {
+      echo "buildHwStageMap[${testType}]: no READY zip for ${board}, skipping"
+      return
+    }
+    if (!isOnline(row.agentLabel as String)) {
+      offlineWithZip << "${board} (${row.agentLabel})"
+      echo "buildHwStageMap[${testType}]: READY zip exists for ${board}, but agent ${row.agentLabel} is offline"
+      return
+    }
+    String stage = "BNN ${label} - ${board}"
+    branches[stage] = { runHwShard(row, testType, stage) }
+  }
+  if (!offlineWithZip.isEmpty()) {
+    unstable "Offline HW agent(s) with READY zips for ${testType}: " + offlineWithZip.join(', ')
+  }
+  return branches
+}
+
+void runHwParallelStage(String testType) {
+  Map<String, Closure> branches = buildHwStageMap(testType)
+  if (!branches) {
+    unstable "No READY zips resolved for ${testType}, no hardware shards will run"
+    echo "runHwParallelStage[${testType}]: no branches"
+    return
+  }
+  parallel(branches)
+}
+
+String buildBoardZip(String testType, String board) {
+  Map entry = BUILD_BOARD_ZIP_PATHS["${testType}::${board}"] as Map
+  return entry?.zip ?: ''
+}
+
+// finally{} ensures junit XML on failure. chown runs before stash so any
+// root-owned ${testType}_hw_${board}.xml/html (created by sudo'd pytest on
+// Pynq boards under a restrictive umask) is owned by the Jenkins user
+// before stash reads it. Otherwise stash would silently see no XML.
+void runHwShard(Map row, String testType, String stageName) {
+  if (!isOnline(row.agentLabel as String)) {
+    error "${stageName} cannot run: agent ${row.agentLabel} is offline"
+  }
+  node(row.agentLabel) {
+    stage(stageName) {
+      String stash = hwStashName(testType, row.board as String)
+      try {
+        catchError(stageResult: 'FAILURE') {
+          withHwCredentials(row) {
+            runHwTest(row, testType)
+          }
+        }
+      } finally {
+        withHwCredentials(row) { cleanUpWorkspaceOwnership(row) }
+        dir("${testType}/${row.board}") {
+          safeStashReport(stash, "${testType}_hw_${row.board}")
+        }
       }
     }
   }
 }
 
-void stashResults (String testType, String board) {
-  // Get test result file and delete test files on the board
-  dir("${testType}/${board}") {
-    // Collect the results file on the worker node by stashing
-    try {
-      stash name: "xml_${testType}_${board}", includes: "${testType}_hw_${board}.xml,${testType}_hw_${board}.html"
-    } catch (err) {
-      echo "No results to stash"
+// Boards with credentialsId get a withCredentials wrapper. Alveo has none.
+// The no-credentials breadcrumb is load-bearing for operators: when a board
+// gets a fresh credentialsId in ci_sharding.py but the credential itself was
+// never created in Jenkins, the chown silently no-ops without the echo and
+// stale root-owned residue appears mysteriously on the next shard.
+void withHwCredentials(Map row, Closure body) {
+  if (!row.credentialsId) {
+    echo "[hw] ${row.board}: no credentialsId bound. Running without sudo wrapper"
+    body.call()
+    return
+  }
+  withCredentials([usernamePassword(
+      credentialsId: row.credentialsId as String,
+      usernameVariable: 'USER_CREDENTIALS_USR',
+      passwordVariable: 'USER_CREDENTIALS_PSW')]) {
+    withEnv(['USER_CREDENTIALS=true']) {
+      body.call()
     }
   }
 }
 
-void cleanUpWorkspaceOwnership () {
+void runHwTest(Map row, String testType) {
+  sh "mkdir -p ${shellQuote(testType)}"
+  dir("${testType}") {
+    cleanBoardWorkdir(row.board as String)
+    String zipName = "${row.board}.zip"
+    unstash name: hwZipStashName(testType, row.board as String)
+    sh "unzip -o ${shellQuote(zipName)}"
+    dir("${row.board}") {
+      unstash name: 'bnn_test_files'
+      createTestScript(row, "${testType}_hw_${row.board}")
+      if (env.USER_CREDENTIALS) {
+        sh 'echo ${USER_CREDENTIALS_PSW} | sudo -S bash run-tests.sh'
+      } else {
+        sh 'bash run-tests.sh'
+      }
+    }
+  }
+}
+
+// Marker via env var to prevent shell injection.
+void createTestScript(Map row, String testResultsFilename) {
+  String setup = (row.setupScript == 'alveo')
+      ? '. /opt/xilinx/xrt/setup.sh\n. ${VENV_ACTIVATE}'
+      : '. /etc/profile.d/pynq_venv.sh\n. /etc/profile.d/xrt_setup.sh'
+  String script =
+      "#!/bin/bash\n${setup}\n" +
+      "export FINN_CI_MARKER=${shellQuote(row.marker as String)}\n" +
+      "python -m pytest -m \"\$FINN_CI_MARKER\" " +
+      "--junitxml=${testResultsFilename}.xml --html=${testResultsFilename}.html " +
+      "--self-contained-html\n"
+  writeFile file: 'run-tests.sh', text: script
+}
+
+String hwStashName(String testType, String board) {
+  return "${testType}_${board}"
+}
+
+String hwZipStashName(String testType, String board) {
+  return "${testType}_${board}_zip"
+}
+
+
+// ============================================================================
+// Check-Stage-Results helpers
+// ============================================================================
+
+// junit first (workspace-local, never flakes), then merge and archive.
+void aggregateReports() {
+  // clean must come first. Otherwise we'd rm -rf the dir we just created
+  // and the subsequent unstash would land in a stale parent.
+  cleanReportsDir('reports')
+  sh 'mkdir -p reports'
+  dir('reports') {
+    expectedStashes().each { name -> unstashIfPresent(name) }
+  }
+  junit allowEmptyResults: true, testResults: 'reports/*.xml'
+  catchError(buildResult: null, stageResult: 'UNSTABLE',
+             message: 'pytest_html_merger failed, per-stage HTMLs still archived') {
+    runDockerCommand('./run-docker.sh pytest_html_merger -i reports/ -o reports/test_report_hw_final.html')
+  }
+  catchError(buildResult: null, stageResult: 'UNSTABLE',
+             message: 'archiveArtifacts (xml) failed') {
+    archiveArtifacts artifacts: 'reports/*.xml', allowEmptyArchive: true
+  }
+  catchError(buildResult: null, stageResult: 'UNSTABLE',
+             message: 'archiveArtifacts (html) failed') {
+    archiveArtifacts artifacts: 'reports/*.html', allowEmptyArchive: true
+  }
+}
+
+List<String> expectedStashes() {
+  def stashes = []
+  HW_TEST_TYPES.each { testType ->
+    HW_SHARDS.each { row ->
+      String board = row.board as String
+      if (isOnline(row.agentLabel as String) && buildBoardZip(testType, board)) {
+        stashes << hwStashName(testType, board)
+      }
+    }
+  }
+  return stashes
+}
+
+
+// ============================================================================
+// Cross-cutting helpers
+// ============================================================================
+
+void cleanUpWorkspaceOwnership(Map row) {
+  if (!row.credentialsId) {
+    echo "cleanUpWorkspaceOwnership: ${row.board} has no sudo credentials, skipping chown"
+    return
+  }
   if (env.USER_CREDENTIALS) {
     sh 'echo ${USER_CREDENTIALS_PSW} | sudo -S chown -R $(id -u):$(id -g) ${WORKSPACE}'
+  } else {
+    error "cleanUpWorkspaceOwnership: USER_CREDENTIALS unset. Wrap the call in withHwCredentials() so the chown has a password to feed sudo."
   }
 }
 
-void restartZynqPlatform () {
+void restartZynqPlatform() {
   if (env.USER_CREDENTIALS) {
     sh 'echo ${USER_CREDENTIALS_PSW} | sudo -S shutdown -r +1'
+  } else {
+    error "restartZynqPlatform: USER_CREDENTIALS unset. Wrap the call in withHwCredentials() so the shutdown has a password to feed sudo."
   }
+}
+
+// Thin wrappers over docker/jenkins/common.groovy. safeStashReport takes an
+// explicit fileBase because HW reports use a different basename pattern
+// (testType_hw_board) from the stash name (testType_board).
+boolean paramBool(String name)                { return loadCommonOnce().paramBool(name) }
+String paramString(String name)               { return loadCommonOnce().paramString(name) }
+String shellQuote(String s)                   { return loadCommonOnce().shellQuote(s) }
+void   runDockerCommand(String command)       { loadCommonOnce().runDockerCommand(command) }
+void   unstashIfPresent(String stashName)     { loadCommonOnce().unstashIfPresent(stashName) }
+void   cleanBoardWorkdir(String buildDir)     { loadCommonOnce().cleanBoardWorkdirHw(buildDir) }
+void   cleanReportsDir(String dir)            { loadCommonOnce().cleanReportsDirHw(dir) }
+boolean isNodeOnline(String labelName)        { return loadCommonOnce().isNodeOnline(labelName) }
+
+void safeStashReport(String stashName, String fileBase) {
+  loadCommonOnce().safeStashHwReport(stashName, fileBase)
 }

@@ -29,12 +29,9 @@ import pytest
 
 import numpy as np
 import os
-import shutil
 import subprocess
 from qonnx.core.datatype import DataType
 from qonnx.util.basic import gen_finn_dt_tensor
-
-from finn.util.basic import make_build_dir
 
 
 @pytest.mark.util
@@ -50,9 +47,12 @@ from finn.util.basic import make_build_dir
 )
 @pytest.mark.parametrize("test_shape", [(1, 2, 4), (1, 1, 64), (2, 64)])
 @pytest.mark.vivado
-def test_npy2vectorstream(test_shape, dtype):
+def test_npy2vectorstream(test_shape, dtype, tmp_path):
+    # tmp_path keeps the scratch dir on local fs and lets pytest handle
+    # cleanup; on NFS the compiled binary's deferred close races
+    # shutil.rmtree via silly-rename and produces ENOTEMPTY.
     ndarray = gen_finn_dt_tensor(dtype, test_shape)
-    test_dir = make_build_dir(prefix="test_npy2vectorstream_")
+    test_dir = str(tmp_path)
     shape = ndarray.shape
     elem_hls_type = dtype.get_hls_datatype_str()
     vLen = shape[-1]
@@ -110,8 +110,4 @@ g++ -o test_npy2vectorstream test.cpp $FINN_ROOT/src/finn/qnn-data/cpp/cnpy.cpp 
     (stdout, stderr) = execute.communicate()
     produced = np.load(npy_out)
     success = (produced == ndarray).all()
-    # only delete generated code if test has passed
-    # useful for debug otherwise
-    if success:
-        shutil.rmtree(test_dir)
     assert success

@@ -89,8 +89,10 @@ def export_model_to_qonnx(input_size=10, hidden_size=20, num_layers=4, output_si
     model(x)  # Initialise scale factors
     model.eval()
 
-    # Export the model to ONNX format
-    onnx_path = os.environ["FINN_BUILD_DIR"] + f"/simple_module_{num_layers}layers.onnx"
+    # filename per parametrisation so concurrent workers do not collide
+    onnx_path = (
+        os.environ["FINN_BUILD_DIR"] + f"/simple_module_{num_layers}layers_{input_size}in.onnx"
+    )
     with torch.no_grad():
         bo.export_qonnx(
             model,
@@ -117,12 +119,28 @@ def check_tensor_shape(model_wrapper, name, expected_shape):
     ), f"Shape mismatch for {name}: expected {expected_shape}, got {actual_shape}"
 
 
+@pytest.fixture
+def isolated_dynamo_cache(tmp_path, monkeypatch):
+    """Give each parametrisation its own torch/dynamo cache dirs.
+
+    Brevitas dynamo export compiles graphs through torch inductor/triton, whose
+    default caches live under a shared ``$HOME/.cache`` (and the inductor/triton
+    defaults). Concurrent xdist workers sharing those races on the cache index;
+    pointing every cache dir at this test's tmp_path removes the shared state so
+    the parametrisations can run in parallel instead of being pinned to one
+    worker.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
+
+
 # input_size == hidden_size to create model that can be rolled
 @pytest.mark.parametrize("input_size", [20, 30, 40])
 # num_layers
 @pytest.mark.parametrize("num_layers", [6, 12, 24])
 @pytest.mark.transform
-def test_finn_loop(input_size, num_layers):
+def test_finn_loop(input_size, num_layers, isolated_dynamo_cache):
     hidden_size = input_size
 
     onnx_path, model = export_model_to_qonnx(input_size, hidden_size, num_layers)
