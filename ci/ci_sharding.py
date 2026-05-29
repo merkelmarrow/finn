@@ -156,7 +156,7 @@ STAGES = [
         "param": "sanity",
         "stage": "Sanity - Build Hardware",
         "marker": "sanity_bnn",
-        "shards": 1,
+        "shards": 4,
         "workers": 1,
         "zipArtifacts": {
             "hwTestType": "bnn_build_sanity",
