@@ -189,7 +189,7 @@ def robust_rmtree(path, retries=6, initial_delay=0.1, backoff=2.0):
     does not need ``FINN_BUILD_DIR`` -- pytest owns the cleanup and it lives on
     local fs, sidestepping the race entirely.
 
-    Maximum total wait at the defaults is ~6.3s across retries before a
+    Maximum total wait at the defaults is ~3.1s across retries before a
     persistent ``ENOTEMPTY`` propagates. Other ``OSError`` subclasses
     propagate immediately. A missing path is a no-op.
     """

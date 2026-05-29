@@ -544,8 +544,11 @@ def canonical_key(name):
     return name
 
 
-def _median_index(values):
-    """Median by index without importing statistics. Returns 0.0 on empty."""
+def _median(values):
+    """Upper median of the positive values, without importing statistics.
+
+    Returns 0.0 on an empty input.
+    """
     s = sorted(v for v in values if v > 0.0)
     return s[len(s) // 2] if s else 0.0
 
@@ -556,7 +559,7 @@ def _entry_median_seconds(entry):
         return 0.0
     samples = entry.get("samples")
     if isinstance(samples, list) and samples:
-        return _median_index(float(s or 0.0) for s in samples if s is not None)
+        return _median(float(s or 0.0) for s in samples if s is not None)
     return 0.0
 
 
@@ -735,8 +738,6 @@ def timing_rows(reports_dir):
     rows = []
     pattern = os.path.join(reports_dir, "*.timings.json")
     for path in sorted(glob.glob(pattern)):
-        if os.path.basename(path) == "ci_timings_master.json":
-            continue
         data = read_json(path, default={})
         if not isinstance(data, dict):
             print("ci_sharding summarize: could not parse %s" % path, file=sys.stderr)
@@ -809,6 +810,12 @@ def summarize_timings(reports_dir):
 # shape so a snapshot can be inspected with the same tools as the master. An
 # unrecognised schema_version is logged and treated as empty, which makes old
 # or corrupt state degrade to round-robin sharding rather than crashing.
+#
+# Only ``samples`` is load-bearing: the bin packer reads its median. ``count``
+# and the ``last_seen_*`` fields are informational, for humans inspecting the
+# JSON. The version counter starts at 2 from pre-deployment iteration and must
+# not be reset to 1, because a live master already on NFS at v2 would be treated
+# as unrecognised and discarded, cold-starting the accumulated timings.
 
 SCHEMA_VERSION = 2
 
@@ -848,8 +855,6 @@ def _samples_from_entry(entry):
 def observed_groups_from_reports(reports_dir):
     observed = {}
     for path in sorted(glob.glob(os.path.join(reports_dir, "*.timings.json"))):
-        if os.path.basename(path) == "ci_timings_master.json":
-            continue
         data = read_json(path, default={})
         if not isinstance(data, dict):
             continue
@@ -937,34 +942,7 @@ def update_master(reports_dir, master_path, out_path, update_persistent=False, m
         "ci_sharding update: %d observed, %d in master, persistent_update=%s"
         % (len(observed_seconds), len(master.get("groups", {})), persistent_updated)
     )
-    _report_regressions(master_path, observed_seconds)
     return 0
-
-
-# Regression canary: flag groups whose latest observation is >= REGRESSION_FACTOR
-# times their prior median, so a real slowdown does not hide behind the
-# median-of-five window's smoothing.
-REGRESSION_FACTOR = 2.0
-
-
-def _report_regressions(master_path, observed_seconds):
-    """Print one line per group whose latest observation >= REGRESSION_FACTOR x prior median."""
-    if not master_path or not observed_seconds:
-        return
-    prior = normalise_master(read_json(master_path, default={}))
-    flagged = []
-    for name, seconds in observed_seconds.items():
-        prior_median = _entry_median_seconds(prior["groups"].get(name))
-        if prior_median > 0.0 and seconds >= REGRESSION_FACTOR * prior_median:
-            flagged.append((name, seconds, prior_median))
-    if not flagged:
-        return
-    flagged.sort(key=lambda row: row[1] / row[2], reverse=True)
-    parts = ["%s=%.1fs vs %.1fs" % (name, sec, med) for name, sec, med in flagged]
-    print(
-        "ci_sharding update: regressions vs prior median (>=%.1fx): %s"
-        % (REGRESSION_FACTOR, "; ".join(parts))
-    )
 
 
 def prepare_timing_snapshot(master_path, snapshot_path):
@@ -1020,12 +998,12 @@ def _backup_if_corrupt(master_path):
 
 
 def locked_update(master_path, update_fn):
-    """Apply ``update_fn`` to the master JSON under an NFS-safe directory lock.
+    """Apply ``update_fn`` to the master JSON under an NFS-safe lock.
 
     flock/fcntl advisory locks are local-only on NFS and give no cross-agent
-    exclusion, so the timing-master update serialises on the mkdir-based
-    nfs_dir_lock instead. The lock dir (``.<basename>.lock.d``) lives next to
-    the master; a crashed holder is reclaimed by the lock's stale TTL, so a
+    exclusion, so the timing-master update serialises on the bakery ticket lock
+    in ``nfs_lock`` instead. The lock dir (``.<basename>.lock.d``) lives next to
+    the master, and a crashed holder is reclaimed by the lock's stale TTL, so a
     dead build never wedges the master.
     """
     if not master_path:

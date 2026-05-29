@@ -12,6 +12,8 @@ You do not need Jenkins to run the same tests locally. The Jenkinsfile generates
 
 substituting any marker from the `STAGES` table in [`ci_sharding.py`](./ci_sharding.py). Leave `FINN_CI_NFS_ROOT` unset and the run picks up local-fallback mode automatically: per-agent Docker build, no build-to-HW handoff, no persistent timing master, deterministic round-robin sharding. The same per-shard JUnit XML and HTML reports are produced under the workspace.
 
+Running tests in parallel locally with `-n <N>`? Add `--dist loadgroup` too, so the checkpoint-linked end2end and ipstitch chains (grouped with `@pytest.mark.xdist_group`) stay on one worker. Plain `-n <N>` can split such a chain across workers and skip the dependent steps.
+
 ## TL;DR for contributors
 
 - Run a PR build: click *Build with Parameters*, leave `STAGES=sanity`, hit *Build*.

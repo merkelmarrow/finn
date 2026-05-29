@@ -5,7 +5,6 @@
 
 import pytest
 
-import json
 import multiprocessing
 import nfs_lock
 import os
@@ -14,12 +13,25 @@ import time
 
 pytestmark = pytest.mark.util
 
+# A ts that sorts before any real (current-time) ticket, so a planted ticket is
+# always "earlier" in the bakery queue and must be cleared before we proceed.
+_EARLIEST_TS = "00000000T000000000000"
 
-def _write_holder(lock_dir, *, pid, hostname, ts):
-    """Plant a held lock dir with a chosen holder.json (simulates another holder)."""
-    os.mkdir(lock_dir)
-    with open(os.path.join(lock_dir, nfs_lock.HOLDER_FILENAME), "w") as f:
-        json.dump({"pid": pid, "hostname": hostname, "timestamp": ts}, f)
+
+def _plant_ticket(lock_dir, *, pid, host, ts=_EARLIEST_TS, tid=1, mtime=None):
+    """Drop a ticket with a chosen name/mtime to simulate another holder."""
+    os.makedirs(lock_dir, exist_ok=True)
+    name = "%s.%d.%d.%s%s" % (ts, tid, pid, host, nfs_lock.TICKET_SUFFIX)
+    path = os.path.join(lock_dir, name)
+    with open(path, "w") as f:
+        f.write("{}")
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    return path
+
+
+def _live_tickets(lock_dir):
+    return [n for n in os.listdir(lock_dir) if n.endswith(nfs_lock.TICKET_SUFFIX)]
 
 
 def _find_dead_pid():
@@ -48,19 +60,17 @@ def _rmw_worker(lock_path, counter_path):
             f.write(str(value + 1))
 
 
-def test_acquire_creates_and_release_removes(tmp_path):
+def test_acquire_writes_ticket_and_release_removes_it(tmp_path):
     lock = str(tmp_path / "x.lock.d")
     with nfs_lock.nfs_dir_lock(lock):
-        assert os.path.isdir(lock)
-        assert os.path.isfile(os.path.join(lock, nfs_lock.HOLDER_FILENAME))
-    assert not os.path.exists(lock)
+        assert len(_live_tickets(lock)) == 1
+    assert _live_tickets(lock) == []
 
 
 def test_missing_parent_is_created(tmp_path):
     lock = str(tmp_path / "deep" / "nested" / "x.lock.d")
     with nfs_lock.nfs_dir_lock(lock):
         assert os.path.isdir(lock)
-    assert not os.path.exists(lock)
 
 
 def test_released_on_exception(tmp_path):
@@ -68,46 +78,34 @@ def test_released_on_exception(tmp_path):
     with pytest.raises(RuntimeError):
         with nfs_lock.nfs_dir_lock(lock):
             raise RuntimeError("boom")
-    assert not os.path.exists(lock)
+    assert _live_tickets(lock) == []
 
 
-def test_timeout_when_held_by_live_holder(tmp_path):
-    # A live holder (this process) within the TTL must not be stolen, so a
-    # second acquire times out rather than corrupting mutual exclusion.
+def test_timeout_when_blocked_by_live_earlier_ticket(tmp_path):
+    # An earlier ticket held by a live process on this host (us) within the TTL
+    # must not be reclaimed, so a second acquire times out rather than
+    # corrupting mutual exclusion.
     lock = str(tmp_path / "x.lock.d")
-    _write_holder(lock, pid=os.getpid(), hostname=socket.gethostname(), ts=nfs_lock._now_iso())
+    _plant_ticket(lock, pid=os.getpid(), host=socket.gethostname())
     with pytest.raises(TimeoutError):
         with nfs_lock.nfs_dir_lock(lock, timeout=0.5, poll=0.05):
             pass
-    assert os.path.isfile(os.path.join(lock, nfs_lock.HOLDER_FILENAME))
 
 
-def test_stale_holder_by_ttl_is_stolen(tmp_path):
+def test_stale_earlier_ticket_by_ttl_is_reclaimed(tmp_path):
     lock = str(tmp_path / "x.lock.d")
-    old = time.strftime(nfs_lock._TS_FORMAT, time.gmtime(time.time() - 10000))
-    # Foreign hostname so the steal decision rests on the TTL, not PID liveness.
-    _write_holder(lock, pid=1, hostname="some-other-host", ts=old)
+    # Foreign host so the reclaim decision rests on the TTL, not PID liveness.
+    _plant_ticket(lock, pid=1, host="some-other-host", mtime=time.time() - 10000)
     with nfs_lock.nfs_dir_lock(lock, timeout=2.0, stale_ttl=120):
-        assert nfs_lock._read_holder(lock)["pid"] == os.getpid()
-    assert not os.path.exists(lock)
+        pass  # acquired: the stale earlier ticket was reclaimed
 
 
-def test_dead_pid_on_this_host_is_stolen(tmp_path):
+def test_dead_pid_earlier_ticket_on_this_host_is_reclaimed(tmp_path):
     lock = str(tmp_path / "x.lock.d")
-    # Recent timestamp: only the dead-PID-on-this-host check can make it stale.
-    _write_holder(lock, pid=_find_dead_pid(), hostname=socket.gethostname(), ts=nfs_lock._now_iso())
+    # Recent mtime, so only the dead-PID-on-this-host check can make it stale.
+    _plant_ticket(lock, pid=_find_dead_pid(), host=socket.gethostname())
     with nfs_lock.nfs_dir_lock(lock, timeout=2.0, stale_ttl=120):
-        assert nfs_lock._read_holder(lock)["pid"] == os.getpid()
-    assert not os.path.exists(lock)
-
-
-def test_holderless_dir_stolen_after_grace(tmp_path, monkeypatch):
-    lock = str(tmp_path / "x.lock.d")
-    os.mkdir(lock)  # aborted mkdir: no holder.json written
-    monkeypatch.setattr(nfs_lock, "_NO_HOLDER_GRACE_S", -1.0)
-    with nfs_lock.nfs_dir_lock(lock, timeout=2.0):
-        assert os.path.isfile(os.path.join(lock, nfs_lock.HOLDER_FILENAME))
-    assert not os.path.exists(lock)
+        pass
 
 
 def test_multiprocess_no_lost_updates(tmp_path):
@@ -125,4 +123,24 @@ def test_multiprocess_no_lost_updates(tmp_path):
     assert all(p.exitcode == 0 for p in procs)
     with open(counter) as f:
         assert int(f.read().strip()) == n
-    assert not os.path.exists(lock)
+    assert _live_tickets(lock) == []
+
+
+def test_concurrent_stale_reclaim_no_lost_updates(tmp_path):
+    # N processes contend while an always-stale earlier ticket sits in the
+    # queue, so every contender must reap it before proceeding. If concurrent
+    # reclamation could double-acquire, updates would be lost; the exact count
+    # proves it cannot.
+    lock = str(tmp_path / "counter.lock.d")
+    counter = str(tmp_path / "counter.txt")
+    _plant_ticket(lock, pid=1, host="some-dead-host", mtime=time.time() - 10000)
+    n = 12
+    ctx = multiprocessing.get_context("fork")
+    procs = [ctx.Process(target=_rmw_worker, args=(lock, counter)) for _ in range(n)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=120)
+    assert all(p.exitcode == 0 for p in procs)
+    with open(counter) as f:
+        assert int(f.read().strip()) == n
