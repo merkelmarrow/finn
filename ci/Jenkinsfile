@@ -837,8 +837,9 @@ void findCopyZip(String testType, String board, String findDir, String copyDir) 
 // ============================================================================
 
 // Per-shard scratch lives under WORKSPACE_TMP (a sibling of the git
-// workspace), so git clean -fdx never races the NFS attribute cache on a
-// deep scratch tree the way it did when scratch sat inside the workspace.
+// workspace), so the steady-state workspace stays clean and git clean has no
+// deep scratch tree to walk. Any legacy in-workspace scratch left by old
+// builds is still cleared below (see the git clean -ff note).
 // We still reap the prior build's scratch here to reclaim space; a stuck NFS
 // handle (typically a stale LSF farm job from a prior aborted build still
 // holding fds) surfaces as a loud, operator-actionable failure with a
@@ -868,7 +869,12 @@ void wipeStaleWorkspace() {
         exit 1
       fi
     fi
-    git clean -fdx || true
+    # -ff (double force) so git clean descends into nested git repos: legacy
+    # in-workspace scratch from pre-WORKSPACE_TMP builds can leave
+    # FINN-generated cpp_driver_*/.git trees that a single -f silently skips,
+    # which would otherwise leave tmp/ dirty and trip the gate below on every
+    # run.
+    git clean -ffdx || true
     dirty=\$(git status --porcelain)
     if [ -n "\$dirty" ]; then
       n=\$(echo "\$dirty" | wc -l)
@@ -1062,7 +1068,7 @@ String activeArtifactRowSummary() {
 }
 
 // Per-shard scratch root under WORKSPACE_TMP (a sibling of the git
-// workspace), so a deep NFS scratch tree never races git clean -fdx. Falls
+// workspace), so a deep NFS scratch tree never races git clean. Falls
 // back to <workspace>/tmp only when WORKSPACE_TMP is unset (in which case
 // the git clean race that wipeStaleWorkspace guards against can recur).
 String finnCiScratchRoot() {

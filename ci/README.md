@@ -87,7 +87,7 @@ artifacts/ci_runs/<jobKey>/<BUILD>/                    build-to-HW handoff + BUI
 _ci_state/<jobKey>/                                    timing master + snapshots
 ```
 
-Per-shard scratch lives at `${WORKSPACE_TMP}/finn_ci_runs/<BUILD>/<stash>` (falling back to `${WORKSPACE}/tmp/finn_ci_runs/...` only when `WORKSPACE_TMP` is unset). Keeping it under `WORKSPACE_TMP`, a sibling of the git workspace, means `git clean -fdx` never has to walk a deep NFS scratch tree, so the attribute-cache race that the old in-workspace layout fought no longer applies. `wipeStaleWorkspace` reaps the prior build's scratch to reclaim space. The HW pipeline hard-requires `FINN_CI_NFS_ROOT` because it has nothing to read otherwise.
+Per-shard scratch lives at `${WORKSPACE_TMP}/finn_ci_runs/<BUILD>/<stash>` (falling back to `${WORKSPACE}/tmp/finn_ci_runs/...` only when `WORKSPACE_TMP` is unset). Keeping it under `WORKSPACE_TMP`, a sibling of the git workspace, means `git clean` never has to walk a deep NFS scratch tree for the current build. `wipeStaleWorkspace` still runs `git clean -ffdx` (double force) so it can clear any legacy in-workspace scratch left by old builds, including FINN-generated `cpp_driver_*/.git` trees that a single `-f` silently skips (which would otherwise leave `tmp/` dirty and fail every shard scheduled onto that workspace). `wipeStaleWorkspace` reaps the prior build's scratch to reclaim space. The HW pipeline hard-requires `FINN_CI_NFS_ROOT` because it has nothing to read otherwise.
 
 | Tree | Path under `FINN_CI_NFS_ROOT` | Subcommand | Retention |
 | --- | --- | --- | --- |
