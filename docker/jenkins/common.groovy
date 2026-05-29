@@ -138,4 +138,18 @@ String finnArtifactsRoot()                { return finnSubdir('artifacts') }
 String finnCiStateRoot()                  { return finnSubdir('_ci_state') }
 String finnCiStateDir(String jobKey)      { return finnSubdir('_ci_state', jobKey) }
 
+// Append `value` to the list at `map[key]`, creating the list lazily.
+// Replaces the inline `Map.computeIfAbsent` idiom because CPS does not
+// reliably transform SAM closures to java.util.function.Function. Returns
+// the (possibly newly created) list so callers can chain.
+List mapAppend(Map map, Object key, Object value) {
+  def existing = map.get(key)
+  if (existing == null) {
+    existing = []
+    map.put(key, existing)
+  }
+  existing << value
+  return existing
+}
+
 return this

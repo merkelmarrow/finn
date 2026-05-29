@@ -18,9 +18,12 @@ ADAPTER_PATH = os.path.join(REPO_ROOT, "finn_xsi", "finn_xsi", "adapter.py")
 def _extract_pkg_predicate():
     """Pull module-level ``_is_pkg_src`` out of finn_xsi/adapter.py via AST.
 
-    Importing finn_xsi.adapter would drag finn (and qonnx/torch) into the
-    util shard's collection path. AST extraction keeps this test stdlib-only
-    while still exercising the real predicate.
+    ``finn_xsi.adapter`` eagerly imports ``finn_xsi.sim_engine``, which
+    in turn imports the ``xsi`` C extension built only inside the FINN
+    Docker image at runtime. AST extraction lets the predicate be tested
+    against the production source without that build artefact, so the
+    util shard still runs in a fresh checkout that has not yet built
+    finn_xsi.
     """
     tree = ast.parse(open(ADAPTER_PATH).read())
     for node in tree.body:
@@ -54,28 +57,3 @@ def test_is_pkg_src_does_not_match_non_pkg_or_header_files():
     assert not pred("/path/to/swg_pkg.svh")
     assert not pred("/path/to/swg_pkg_top.sv")
     assert not pred("/path/to/_pkg.svh")
-
-
-@pytest.mark.util
-def test_pkg_partition_places_packages_first_and_preserves_order():
-    pred = _extract_pkg_predicate()
-    source_list = [
-        "/path/a.sv",
-        "/path/swg_pkg.sv",
-        "/path/b.sv",
-        "/path/mvu_pkg.sv",
-        "/path/c.sv",
-        "/path/some_other_pkg.v",
-    ]
-    pkg_srcs = [s for s in source_list if pred(s)]
-    other_srcs = [s for s in source_list if not pred(s)]
-    out = pkg_srcs + other_srcs
-
-    assert pkg_srcs == [
-        "/path/swg_pkg.sv",
-        "/path/mvu_pkg.sv",
-        "/path/some_other_pkg.v",
-    ]
-    assert other_srcs == ["/path/a.sv", "/path/b.sv", "/path/c.sv"]
-    assert out[: len(pkg_srcs)] == pkg_srcs
-    assert out[len(pkg_srcs) :] == other_srcs

@@ -86,6 +86,8 @@ VALID_BOARD_SETUP_SCRIPTS = ("alveo", "pynq")
 #   marker:        the ``-m`` expression the on-board test file runs against
 #                  (differs from the board name only for Pynq-Z1, whose
 #                  marker cannot contain a hyphen)
+#   bnnMarker:     the build-side ``-m`` token the BNN end2end test file
+#                  parametrises this board under (``bnn_<board>``)
 #
 # Key order is the canonical test-parametrisation order and is load-bearing:
 # ``TEST_BOARDS`` below derives from it and is what ``tests/end2end``
@@ -97,6 +99,7 @@ BOARDS = {
         "restartPrep": True,
         "setupScript": "pynq",
         "marker": "Pynq",
+        "bnnMarker": "bnn_pynq",
     },
     "KV260_SOM": {
         "agentLabel": "finn-kv260",
@@ -104,6 +107,7 @@ BOARDS = {
         "restartPrep": True,
         "setupScript": "pynq",
         "marker": "KV260_SOM",
+        "bnnMarker": "bnn_kv260",
     },
     "ZCU104": {
         "agentLabel": "finn-zcu104",
@@ -111,6 +115,7 @@ BOARDS = {
         "restartPrep": True,
         "setupScript": "pynq",
         "marker": "ZCU104",
+        "bnnMarker": "bnn_zcu104",
     },
     "U250": {
         "agentLabel": "finn-u250",
@@ -118,6 +123,7 @@ BOARDS = {
         "restartPrep": False,
         "setupScript": "alveo",
         "marker": "U250",
+        "bnnMarker": "bnn_u250",
     },
 }
 
@@ -300,7 +306,14 @@ def validate_board_row(board, row):
     """Sanity-check one BOARDS row consumed by Jenkinsfile_HW."""
     if not isinstance(row, dict):
         raise ValueError("BOARDS row %r must be a dict, got %r" % (board, row))
-    required = ("agentLabel", "credentialsId", "restartPrep", "setupScript", "marker")
+    required = (
+        "agentLabel",
+        "credentialsId",
+        "restartPrep",
+        "setupScript",
+        "marker",
+        "bnnMarker",
+    )
     missing = [key for key in required if key not in row]
     if missing:
         raise ValueError("BOARDS row %r is missing required field(s): %r" % (board, missing))
@@ -320,6 +333,8 @@ def validate_board_row(board, row):
         )
     if not isinstance(row["marker"], str) or not row["marker"]:
         raise ValueError("BOARDS row %r has invalid marker=%r" % (board, row["marker"]))
+    if not isinstance(row["bnnMarker"], str) or not row["bnnMarker"]:
+        raise ValueError("BOARDS row %r has invalid bnnMarker=%r" % (board, row["bnnMarker"]))
 
 
 def validate_config(stages=None, boards=None, hw_test_type_labels=None):
@@ -571,45 +586,6 @@ def assign_groups_to_shards(group_keys, num_shards, weights=None, pins=None):
         source[key] = "known" if key in weights else "fallback"
         shard_load[shard] += weight
     return assignment, source, shard_load, fallback
-
-
-def which_shard(query, master_path="", marker_filter=None, stages=None):
-    """Return per-stage placement rows for ``query`` against the timing master.
-
-    For each STAGES row (optionally filtered by ``marker_filter``), inject
-    ``query`` as a synthetic group alongside the master's known groups,
-    rerun the placement, and report which shard the query lands on.
-
-    The result is an approximation: the timing master holds canonical
-    group keys, not test-id strings, and it does not record which row
-    "owns" each group. The exact answer still requires
-    ``pytest --collect-only`` from a finn-installed venv. Without the
-    finn install, this is the closest the operator can get from a plain
-    Python checkout.
-    """
-    stages = stages if stages is not None else STAGES
-    weights = load_group_weights(master_path) if master_path else {}
-    canonical = canonical_key(query)
-    rows = []
-    for row in stages:
-        if marker_filter is not None and marker_filter not in marker_tokens(row.get("marker", "")):
-            continue
-        shards = int(row.get("shards", 1))
-        keys = list(weights.keys())
-        if canonical not in keys:
-            keys.append(canonical)
-        assignment, _src, _load, _fallback = assign_groups_to_shards(keys, shards, weights=weights)
-        shard_id = assignment[canonical]
-        rows.append(
-            {
-                "stage": row.get("stage", ""),
-                "marker": row.get("marker", ""),
-                "shards": shards,
-                "shard": shard_id,
-                "stash": stash_name(row.get("stage", ""), shards, shard_id),
-            }
-        )
-    return rows
 
 
 # =============================================================================
@@ -1316,14 +1292,6 @@ def _dispatch(argv):
     p.add_argument("max_age_days", type=int)
     p.add_argument("--dry-run", action="store_true")
 
-    # which-shard is a finn-less approximation: it reads the timing master
-    # directly so an operator without a finn install can still ask
-    # "where would test X land?" before kicking off a build.
-    p = sub.add_parser("which-shard")
-    p.add_argument("query")
-    p.add_argument("--marker", default=None)
-    p.add_argument("--timings", default="")
-
     args = parser.parse_args(argv)
     if args.cmd == "stage-choices-json":
         print(json.dumps(jenkins_stage_choices()))
@@ -1406,10 +1374,6 @@ def _dispatch(argv):
             args.max_age_days,
             args.dry_run,
         )
-    if args.cmd == "which-shard":
-        rows = which_shard(args.query, master_path=args.timings, marker_filter=args.marker)
-        print(json.dumps(rows, indent=2))
-        return 0
     parser.print_help()
     return 2
 

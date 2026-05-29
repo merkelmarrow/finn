@@ -57,7 +57,7 @@ recho () {
 }
 
 # qonnx pyproject.toml workaround for https://github.com/pypa/pip/issues/7953.
-# The trap restores the file if pip install aborts under `set -e`.
+# `set -e` propagates pip failures; the trap covers only the qonnx-only swap.
 _qonnx_pyproj_toml="${FINN_ROOT}/deps/qonnx/pyproject.toml"
 _qonnx_pyproj_tmp="${FINN_ROOT}/deps/qonnx/pyproject.tmp"
 mv "$_qonnx_pyproj_toml" "$_qonnx_pyproj_tmp"

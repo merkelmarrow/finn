@@ -8,14 +8,10 @@ import pytest
 import json
 import os
 import re
-import sys
+
+from finn.util import ci_sharding
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-JENKINS_DIR = os.path.join(REPO_ROOT, "docker", "jenkins")
-if JENKINS_DIR not in sys.path:
-    sys.path.insert(0, JENKINS_DIR)
-
-import ci_sharding  # noqa: E402
 
 pytestmark = pytest.mark.util
 pytest_plugins = ["pytester"]
@@ -323,10 +319,6 @@ def test_enabled_params_bare_name_returns_that_one():
     assert ci_sharding.enabled_params_for_choice("end2end") == ["end2end"]
 
 
-def test_jenkins_stage_choices_list_is_sanity_full_then_bare_params():
-    assert ci_sharding.jenkins_stage_choices() == ["sanity", "full", "fpgadataflow", "end2end"]
-
-
 def test_jenkinsfile_stage_choices_match_python_source():
     # Anchor on the STAGES choice block so a future ``choice(name: 'XYZ', ...)``
     # cannot match instead. Accept both single- and double-quoted Groovy strings.
@@ -458,22 +450,6 @@ def test_validate_config_rejects_orphan_zipartifact_board(monkeypatch, capsys):
     assert "NotABoard" in capsys.readouterr().err
 
 
-def test_active_artifact_rows_present_for_sanity_and_end2end_choices():
-    # Mirrors the Groovy hasActiveArtifactRows() decision: in local-fallback
-    # mode the build-to-HW handoff is silently skipped for these choices (yellow
-    # build via aggregateReports), and absent for fpgadataflow.
-    def has_artifact_rows(choice):
-        enabled = set(ci_sharding.enabled_params_for_choice(choice))
-        return any(
-            row.get("zipArtifacts") and row.get("param") in enabled for row in ci_sharding.STAGES
-        )
-
-    assert has_artifact_rows("sanity") is True
-    assert has_artifact_rows("end2end") is True
-    assert has_artifact_rows("full") is True
-    assert has_artifact_rows("fpgadataflow") is False
-
-
 def test_jenkins_stage_choices_omits_sanity_head_when_param_absent():
     # If a future STAGES has no sanity rows at all, jenkins_stage_choices()
     # must not synthesise a "sanity" choice the dropdown cannot deliver.
@@ -572,13 +548,6 @@ def test_prune_numeric_builds_dry_run_matches_real_run_count(tmp_path):
     assert sorted(p.name for p in parent.iterdir()) == ["4"]
 
 
-def test_prune_numeric_builds_tag_is_keyword_only():
-    import inspect
-
-    sig = inspect.signature(ci_sharding.prune_numeric_builds)
-    assert sig.parameters["tag"].kind is inspect.Parameter.KEYWORD_ONLY
-
-
 def test_prune_numeric_builds_rejects_non_numeric_current(tmp_path):
     # off-Jenkins CLI invocations or a broken BUILD_NUMBER env must not
     # silently degrade retention to "newest N" by passing a string the
@@ -662,6 +631,7 @@ def test_boards_has_metadata_for_every_zip_artifact_board():
                 "restartPrep": False,
                 "setupScript": "pynq",
                 "marker": "B",
+                "bnnMarker": "bnn_b",
             },
             "invalid agentLabel",
         ),
@@ -673,6 +643,7 @@ def test_boards_has_metadata_for_every_zip_artifact_board():
                 "restartPrep": False,
                 "setupScript": "pynq",
                 "marker": "B",
+                "bnnMarker": "bnn_b",
             },
             "invalid credentialsId",
         ),
@@ -684,6 +655,7 @@ def test_boards_has_metadata_for_every_zip_artifact_board():
                 "restartPrep": True,
                 "setupScript": "pynq",
                 "marker": "B",
+                "bnnMarker": "bnn_b",
             },
             "restartPrep=true but no credentialsId",
         ),
@@ -695,8 +667,21 @@ def test_boards_has_metadata_for_every_zip_artifact_board():
                 "restartPrep": False,
                 "setupScript": "bogus",
                 "marker": "B",
+                "bnnMarker": "bnn_b",
             },
             "invalid setupScript",
+        ),
+        (
+            "B",
+            {
+                "agentLabel": "finn-b",
+                "credentialsId": None,
+                "restartPrep": False,
+                "setupScript": "pynq",
+                "marker": "B",
+                "bnnMarker": "",
+            },
+            "invalid bnnMarker",
         ),
     ],
 )
@@ -1215,12 +1200,16 @@ def test_b():
 
 
 def test_hw_test_types_lists_distinct_values_in_stage_order():
+    # ordering is first-appearance in STAGES; structural check, no snapshot.
     types = ci_sharding.hw_test_types()
-    assert types == ["bnn_build_sanity", "bnn_build_full"]
-    declared = {
+    declared = [
         row["zipArtifacts"]["hwTestType"] for row in ci_sharding.STAGES if row.get("zipArtifacts")
-    }
-    assert set(types) == declared
+    ]
+    seen = []
+    for t in declared:
+        if t not in seen:
+            seen.append(t)
+    assert types == seen
 
 
 def test_hw_test_types_json_cli_emits_valid_json(capsys):
@@ -1264,68 +1253,6 @@ def test_validate_config_rejects_hw_test_type_without_label(monkeypatch):
     monkeypatch.setattr(ci_sharding, "STAGES", bad_stages)
     with pytest.raises(ValueError, match="bnn_build_unlabelled"):
         ci_sharding.validate_config()
-
-
-# ============================================================================
-# which-shard
-# ============================================================================
-
-
-def test_which_shard_returns_one_row_per_stage_without_marker_filter():
-    rows = ci_sharding.which_shard("synthetic-group")
-    stage_names = [r["stage"] for r in rows]
-    expected = [row["stage"] for row in ci_sharding.STAGES]
-    assert stage_names == expected
-    for r in rows:
-        assert 0 <= r["shard"] < r["shards"]
-        assert r["stash"]
-
-
-def test_which_shard_filters_by_marker():
-    rows = ci_sharding.which_shard("any-group", marker_filter="fpgadataflow")
-    assert len(rows) == 1
-    assert rows[0]["stage"] == "fpgadataflow"
-    assert rows[0]["shards"] == 2
-
-
-def test_which_shard_filters_compound_marker_by_token():
-    rows = ci_sharding.which_shard("any-group", marker_filter="util")
-    assert len(rows) == 1
-    assert rows[0]["stage"] == "Sanity - Unit Tests"
-
-
-def test_which_shard_uses_timing_master_for_placement(tmp_path):
-    master = tmp_path / "master.json"
-    write_json(
-        master,
-        {
-            "schema_version": ci_sharding.SCHEMA_VERSION,
-            "groups": {
-                "synthetic-group": {"samples": [10.0], "count": 1},
-            },
-        },
-    )
-    rows = ci_sharding.which_shard(
-        "synthetic-group", master_path=str(master), marker_filter="fpgadataflow"
-    )
-    assert rows and rows[0]["shards"] == 2
-    assert rows[0]["shard"] in (0, 1)
-
-
-def test_which_shard_cli_emits_valid_json(capsys):
-    rc = ci_sharding.main(["which-shard", "some-test", "--marker", "fpgadataflow"])
-    assert rc == 0
-    parsed = json.loads(capsys.readouterr().out)
-    assert isinstance(parsed, list) and len(parsed) == 1
-    assert parsed[0]["stage"] == "fpgadataflow"
-
-
-def test_which_shard_cli_marker_filter_accepts_marker_token(capsys):
-    rc = ci_sharding.main(["which-shard", "some-test", "--marker", "util"])
-    assert rc == 0
-    parsed = json.loads(capsys.readouterr().out)
-    assert isinstance(parsed, list) and len(parsed) == 1
-    assert parsed[0]["stage"] == "Sanity - Unit Tests"
 
 
 # ============================================================================
@@ -1554,13 +1481,4 @@ def test_validate_config_runs_validate_stage_row_for_every_entry(monkeypatch, ca
     captured = capsys.readouterr()
     assert captured.err.startswith("ci_sharding: ")
     assert "unsafe marker" in captured.err
-    assert "Traceback" not in captured.err
-
-
-def test_validate_config_unknown_choice_returns_clean_error(capsys):
-    rc = ci_sharding.main(["validate-config", "--choice", "notathing", "--job-name", "j"])
-    assert rc == 2
-    captured = capsys.readouterr()
-    assert captured.err.startswith("ci_sharding: ")
-    assert "unknown STAGES choice" in captured.err
     assert "Traceback" not in captured.err

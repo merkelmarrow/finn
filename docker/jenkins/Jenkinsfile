@@ -1,8 +1,8 @@
 // FINN build pipeline. The board-tethered HW tests live in Jenkinsfile_HW.
 //
 // Sharding config, timing helpers, and the STAGES/BOARDS tables live in
-// docker/jenkins/ci_sharding.py. Shared Groovy utilities live in
-// docker/jenkins/_common.groovy. This file is internally segmented by
+// src/finn/util/ci_sharding.py. Shared Groovy utilities live in
+// docker/jenkins/common.groovy. This file is internally segmented by
 // '// =====' banners and is meant to be read top-down: knobs first,
 // pipeline next, per-stage helpers grouped after, cross-cutting helpers at
 // the bottom.
@@ -13,7 +13,7 @@ import groovy.transform.Field
 // ============================================================================
 // Module-level imports and shared-helper cache
 // ============================================================================
-// _common.groovy is loaded once on the first active node and reused from
+// common.groovy is loaded once on the first active node and reused from
 // every subsequent stage. Several wrappers below run from no-agent
 // orchestration code, so the loaded module must remain accessible.
 // @Field is load-bearing here: under Jenkins CPS replay, top-level locals
@@ -25,7 +25,7 @@ import groovy.transform.Field
 def _common = null
 
 private def loadCommonOnce() {
-  if (_common == null) { _common = load 'docker/jenkins/_common.groovy' }
+  if (_common == null) { _common = load 'docker/jenkins/common.groovy' }
   return _common
 }
 
@@ -56,15 +56,16 @@ String FINN_CI_JOB_KEY = ''
 
 // Minimum free space (GB) on the agent scratch volume below which a shard
 // refuses to start. Default sized for ~2 concurrent build trees per agent
-// (~60-80 GB each) plus headroom. env FINN_CI_MIN_FREE_GB overrides. Kept
-// in a lazy helper rather than a @Field initialiser because Jenkins CPS
-// cannot invoke a user-defined method during script construction.
+// (~60-80 GB each) plus headroom. env FINN_CI_MIN_FREE_GB overrides; a
+// non-integer value fails Validate loudly so an operator who set
+// FINN_CI_MIN_FREE_GB="120 GB" finds out before any shard runs. Kept in a
+// lazy helper rather than a @Field initialiser because Jenkins CPS cannot
+// invoke a user-defined method during script construction.
 int finnCiMinFreeGB() {
   String raw = (env.FINN_CI_MIN_FREE_GB ?: '').trim()
   if (!raw) { return 120 }
   if (raw.isInteger()) { return raw.toInteger() }
-  echo "FINN_CI_MIN_FREE_GB='${raw}' is not an integer, falling back to 120"
-  return 120
+  error "FINN_CI_MIN_FREE_GB='${raw}' is not an integer (units, whitespace, etc. are not accepted)"
 }
 
 @Field
@@ -211,7 +212,7 @@ void announceCiMode() {
 void loadStageConfig() {
   String choice = paramString('STAGES') ?: 'sanity'
   String raw = sh(returnStdout: true, script:
-    "python3 docker/jenkins/ci_sharding.py validate-config " +
+    "python3 src/finn/util/ci_sharding.py validate-config " +
     "--choice ${shellQuote(choice)} " +
     "--job-name ${shellQuote(env.JOB_NAME ?: 'job')}"
   ).trim()
@@ -297,7 +298,7 @@ void prepareTimingState() {
   catchError(buildResult: null, stageResult: null,
              message: 'prepareTimingState failed, sharding will cold-start to round-robin') {
     sh "mkdir -p ${shellQuote(stateDir)}"
-    sh "python3 docker/jenkins/ci_sharding.py prepare " +
+    sh "python3 src/finn/util/ci_sharding.py prepare " +
        "--master ${shellQuote(master)} --snapshot ${shellQuote(snapshot)}"
     FINN_CI_TIMINGS_MASTER = master
     FINN_CI_TIMINGS_SNAPSHOT = snapshot
@@ -343,7 +344,7 @@ void rotateBuildTree(String subcommand, String root, Map policy) {
   catchError(buildResult: null, stageResult: null,
              message: "${subcommand} failed, non-fatal") {
     if (!root) { return }
-    sh "python3 docker/jenkins/ci_sharding.py ${subcommand} " +
+    sh "python3 src/finn/util/ci_sharding.py ${subcommand} " +
        "${shellQuote(root)} ${shellQuote(finnCiJobKey())} ${shellQuote(env.BUILD_NUMBER ?: '')} " +
        "${policy.retain} ${policy.ageDays}"
   }
@@ -735,7 +736,7 @@ void echoShardTimings() {
   catchError(buildResult: null, stageResult: null,
              message: 'echoShardTimings failed, non-fatal') {
     if (!fileExists('reports')) { return }
-    sh "python3 docker/jenkins/ci_sharding.py summarize reports/"
+    sh "python3 src/finn/util/ci_sharding.py summarize reports/"
   }
 }
 
@@ -743,7 +744,7 @@ void mergeShardMaps() {
   catchError(buildResult: null, stageResult: null,
              message: 'mergeShardMaps failed, non-fatal') {
     if (!fileExists('reports')) { return }
-    sh "python3 docker/jenkins/ci_sharding.py merge-maps reports/"
+    sh "python3 src/finn/util/ci_sharding.py merge-maps reports/"
   }
 }
 
@@ -800,7 +801,7 @@ void updateTimingState() {
     if (!fileExists('reports')) { return }
     String masterArg = FINN_CI_TIMINGS_MASTER ? "--master ${shellQuote(FINN_CI_TIMINGS_MASTER)}" : ''
     String updateArg = shouldUpdatePersistentTimingState() ? '--update-master' : ''
-    sh "python3 docker/jenkins/ci_sharding.py update --reports reports ${masterArg} " +
+    sh "python3 src/finn/util/ci_sharding.py update --reports reports ${masterArg} " +
        "--out reports/ci_timings_master.json " +
        "--job ${shellQuote(env.JOB_NAME ?: '')} --build ${shellQuote(env.BUILD_NUMBER ?: '')} " +
        "${updateArg}"
@@ -891,25 +892,11 @@ void findCopyZip(String testType, String board, String findDir, String copyDir) 
 // Cross-cutting helpers
 // ============================================================================
 
-// Cold start so stale outputs do not mask ordering bugs in a reused
-// workspace. Post-clean status check hard-fails on root-owned residue.
-//
-// FINN_HOST_BUILD_DIR lives on the NFS workspace so LSF farm hosts can
-// resolve absolute paths FINN writes into TCL/bash scripts. Per-shard
-// scratch under tmp/ci_runs/ therefore stays on NFS and can grow to
-// 100K+ files per shard. Asking `git clean -ffdx` to walk it loses the
-// listdir/rmdir race against the NFS attribute cache, with the failure
-// mode "warning: failed to remove tmp/ci_runs/<old>/...: Directory not
-// empty" plus a non-zero exit code that aborts the shell under set -e.
-//
-// Instead, reap the per-build scratch tree ourselves with bounded retry
-// (10 attempts, 1s sleep between attempts). Each pass makes progress
-// because any successful unlinks stick, so the budget covers any
-// realistic attribute-cache propagation delay. By the time git clean
-// runs, the deep tree is gone and it only walks source-tree residue.
-// A truly stuck NFS server or a live writer holding handles surfaces
-// here as a loud, operator-actionable failure rather than a silent
-// corrupt clean masked by `set -e` aborting before any error message.
+// Reap tmp/ci_runs/ first because git clean -ffdx races the NFS attribute
+// cache on a deep per-shard scratch tree and aborts the shell mid-clean.
+// Bounded retry (10x, 1s) absorbs realistic attribute-cache jitter; a
+// stuck NFS or a live writer surfaces as a loud, operator-actionable
+// failure with a forensic dump.
 void wipeStaleWorkspace() {
   sh '''
     if [ -d tmp/ci_runs ]; then
@@ -952,10 +939,10 @@ void wipeStaleWorkspace() {
 // ============================================================================
 // Orphans from a previously aborted build sit on the farm and keep open
 // fds on files under tmp/ci_runs/<old>/, which prevents the next build's
-// wipeStaleWorkspace from removing the parent dirs. The wrapper at
-// finn-lsf/lsf_vivado_wrapper.sh tags every bsub with
+// wipeStaleWorkspace from removing the parent dirs. Sites that wrap their
+// Vivado/Vitis invocations through bsub must tag every job name with
 // `finn_ci_<jobScope>_<TOOL>_<JOB_TAG>` where jobScope matches lsfScope()
-// above. The two helpers below reap orphans in two complementary places.
+// below. The two helpers reap orphans in two complementary places:
 //
 //   reapThisBuildLsfJobs   post { always { ... } }: graceful completion
 //                          and graceful abort
@@ -963,8 +950,15 @@ void wipeStaleWorkspace() {
 //                          whose own post-block never ran. Consults the
 //                          Jenkins API so a concurrent older-numbered
 //                          build's jobs are not killed.
+//
+// Both gate on FINN_LSF_NFS_STAGING so non-LSF sites skip the bsub probe
+// entirely. With LSF in use, FINN_LSF_NFS_STAGING is also the staging-dir
+// path archive_failure_logs.sh tails on a failure.
+
+boolean lsfEnabled() { return (env.FINN_LSF_NFS_STAGING ?: '').trim() as boolean }
 
 void reapThisBuildLsfJobs() {
+  if (!lsfEnabled()) { return }
   catchError(buildResult: null, stageResult: null,
              message: 'LSF self-reap failed, non-fatal') {
     String pattern = "finn_ci_${lsfScope()}_*"
@@ -978,6 +972,7 @@ void reapThisBuildLsfJobs() {
 // that submitted them is no longer running). Defaults to LEAVE ALONE on
 // any uncertainty so an API hiccup never kills a healthy concurrent build.
 void reapOrphanedLsfJobs() {
+  if (!lsfEnabled()) { return }
   catchError(buildResult: null, stageResult: null,
              message: 'LSF orphan reap failed, non-fatal') {
     String jobName = env.JOB_NAME ?: ''
@@ -991,8 +986,6 @@ void reapOrphanedLsfJobs() {
     ).trim()
     if (!raw) { return }
 
-    // CPS: explicit get/put rather than Map.computeIfAbsent (SAM coercion
-    // is not reliably CPS-transformed).
     Map jobidsByBuild = [:] as LinkedHashMap
     String[] lines = raw.split('\n')
     for (int i = 0; i < lines.length; i++) {
@@ -1006,13 +999,7 @@ void reapOrphanedLsfJobs() {
       if (us < 0) { continue }
       String buildStr = tail.substring(0, us)
       if (!buildStr.isInteger()) { continue }
-      int build = buildStr.toInteger()
-      def existing = jobidsByBuild.get(build)
-      if (existing == null) {
-        existing = []
-        jobidsByBuild.put(build, existing)
-      }
-      existing << jobid
+      mapAppend(jobidsByBuild, buildStr.toInteger(), jobid)
     }
     if (jobidsByBuild.isEmpty()) { return }
 
@@ -1097,10 +1084,10 @@ String finnCiJobKey() {
   return FINN_CI_JOB_KEY
 }
 
-// Mirror the BUILD_SCOPE computation in finn-lsf/lsf_vivado_wrapper.sh so
-// bkill -J patterns match what the wrapper sets at bsub time. The wrapper
-// uses FINN_CI_JOB_NAME (the raw JOB_NAME env var) rather than the sanitised
-// jobKey, so this helper sanitises the same way the wrapper does.
+// Sanitise JOB_NAME + BUILD_NUMBER to the BUILD_SCOPE token an LSF bsub
+// wrapper must embed in every job name (`finn_ci_<jobScope>_<TOOL>_<TAG>`).
+// Uses the raw JOB_NAME rather than the validate-config jobKey so the
+// wrapper does not need to load the full config bundle to construct it.
 String lsfScope() {
   String name = env.JOB_NAME ?: 'adhoc'
   String build = env.BUILD_NUMBER ?: 'adhoc'
@@ -1135,19 +1122,9 @@ boolean hasActiveArtifactRows() {
 String activeArtifactRowSummary() {
   // Collapse the per-(row, board) walk back into a per-row summary so each
   // active row appears once even when it publishes for multiple boards.
-  // CPS: computeIfAbsent takes a java.util.function.Function and CPS-
-  // transformed closures do not coerce reliably to that SAM type, so we use
-  // the explicit get/put pattern that matches the C-style loop earlier in
-  // the file.
   def rowToBoards = [:] as LinkedHashMap
   eachActiveZipArtifact { row, testType, board ->
-    String stage = row.stage as String
-    def existing = rowToBoards.get(stage)
-    if (existing == null) {
-      existing = []
-      rowToBoards.put(stage, existing)
-    }
-    existing << board
+    mapAppend(rowToBoards, row.stage as String, board)
   }
   def parts = []
   rowToBoards.each { stage, boards -> parts << "${stage} -> ${boards.join(',')}" }
@@ -1229,7 +1206,7 @@ void archiveFailureLogs(String buildDir, String stashName, String startMarker) {
   }
 }
 
-// Thin wrappers over docker/jenkins/_common.groovy.
+// Thin wrappers over docker/jenkins/common.groovy.
 void safeStashReport(String stashName)        { loadCommonOnce().safeStashShardReport(stashName) }
 void unstashIfPresent(String stashName)       { loadCommonOnce().unstashIfPresent(stashName) }
 void cleanPreviousBuildFiles(String buildDir) { loadCommonOnce().cleanPreviousBuildFiles(buildDir) }
@@ -1237,3 +1214,4 @@ void runDockerCommand(String command)         { loadCommonOnce().runDockerComman
 boolean paramBool(String name)                { return loadCommonOnce().paramBool(name) }
 String  paramString(String name)              { return loadCommonOnce().paramString(name) }
 String  shellQuote(String s)                  { return loadCommonOnce().shellQuote(s) }
+List    mapAppend(Map m, Object k, Object v)  { return loadCommonOnce().mapAppend(m, k, v) }

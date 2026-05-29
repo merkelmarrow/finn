@@ -8,36 +8,15 @@
 
 import pytest
 
-import ast
 import errno
-import os
 import shutil
 import time
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-BASIC_PATH = os.path.join(REPO_ROOT, "src", "finn", "util", "basic.py")
-
-
-def _extract_robust_rmtree():
-    """Pull module-level ``robust_rmtree`` out of src/finn/util/basic.py via AST.
-
-    Importing finn.util.basic would drag qonnx/torch into the util shard's
-    collection path. AST extraction keeps this test stdlib-only while still
-    exercising the real implementation.
-    """
-    tree = ast.parse(open(BASIC_PATH).read())
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "robust_rmtree":
-            module = ast.Module(body=[node], type_ignores=[])
-            namespace = {"os": os, "shutil": shutil, "time": time, "errno": errno}
-            exec(compile(module, BASIC_PATH, "exec"), namespace)
-            return namespace["robust_rmtree"]
-    raise AssertionError("could not find robust_rmtree in %s" % BASIC_PATH)
+from finn.util.basic import robust_rmtree
 
 
 @pytest.mark.util
 def test_robust_rmtree_succeeds_first_attempt(tmp_path):
-    robust_rmtree = _extract_robust_rmtree()
     target = tmp_path / "tree"
     (target / "sub").mkdir(parents=True)
     (target / "sub" / "f").write_text("x")
@@ -47,7 +26,6 @@ def test_robust_rmtree_succeeds_first_attempt(tmp_path):
 
 @pytest.mark.util
 def test_robust_rmtree_missing_path_is_noop(tmp_path):
-    robust_rmtree = _extract_robust_rmtree()
     robust_rmtree(str(tmp_path / "does_not_exist"))
     robust_rmtree("")
     robust_rmtree(None)
@@ -55,7 +33,6 @@ def test_robust_rmtree_missing_path_is_noop(tmp_path):
 
 @pytest.mark.util
 def test_robust_rmtree_retries_on_enotempty_then_succeeds(tmp_path, monkeypatch):
-    robust_rmtree = _extract_robust_rmtree()
     target = tmp_path / "tree"
     target.mkdir()
     (target / "f").write_text("x")
@@ -69,11 +46,7 @@ def test_robust_rmtree_retries_on_enotempty_then_succeeds(tmp_path, monkeypatch)
             raise OSError(errno.ENOTEMPTY, "fake", str(path))
         return real_rmtree(path, *a, **kw)
 
-    # Patch the shutil module that the AST-execed function closes over via
-    # its exec namespace. monkeypatching shutil.rmtree on the real module
-    # is what the captured `shutil` symbol resolves through.
     monkeypatch.setattr(shutil, "rmtree", flaky)
-    # Speed the test up: zero out the backoff so we do not actually sleep.
     monkeypatch.setattr(time, "sleep", lambda _s: None)
 
     robust_rmtree(str(target), retries=5, initial_delay=0.01, backoff=1.0)
@@ -84,7 +57,6 @@ def test_robust_rmtree_retries_on_enotempty_then_succeeds(tmp_path, monkeypatch)
 
 @pytest.mark.util
 def test_robust_rmtree_propagates_non_enotempty_oserror(tmp_path, monkeypatch):
-    robust_rmtree = _extract_robust_rmtree()
     target = tmp_path / "tree"
     target.mkdir()
 
@@ -107,7 +79,6 @@ def test_robust_rmtree_propagates_non_enotempty_oserror(tmp_path, monkeypatch):
 
 @pytest.mark.util
 def test_robust_rmtree_raises_after_retries_exhausted(tmp_path, monkeypatch):
-    robust_rmtree = _extract_robust_rmtree()
     target = tmp_path / "tree"
     target.mkdir()
 
@@ -129,7 +100,6 @@ def test_robust_rmtree_raises_after_retries_exhausted(tmp_path, monkeypatch):
 
 @pytest.mark.util
 def test_robust_rmtree_tolerates_filenotfounderror(tmp_path, monkeypatch):
-    robust_rmtree = _extract_robust_rmtree()
     target = tmp_path / "tree"
     target.mkdir()
 
@@ -137,6 +107,4 @@ def test_robust_rmtree_tolerates_filenotfounderror(tmp_path, monkeypatch):
         raise FileNotFoundError(str(path))
 
     monkeypatch.setattr(shutil, "rmtree", fnf)
-    # No sleep needed because FileNotFoundError returns immediately.
-    # Should return cleanly, no exception.
     robust_rmtree(str(target))

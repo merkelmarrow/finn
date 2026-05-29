@@ -2,7 +2,7 @@
 //
 // HW_SHARDS is loaded from ci_sharding.py's BOARDS table so the build and HW
 // pipelines share one source of truth. Shared Groovy helpers live in
-// docker/jenkins/_common.groovy.
+// docker/jenkins/common.groovy.
 
 import groovy.transform.Field
 
@@ -15,7 +15,7 @@ import groovy.transform.Field
 def _common = null
 
 private def loadCommonOnce() {
-  if (_common == null) { _common = load 'docker/jenkins/_common.groovy' }
+  if (_common == null) { _common = load 'docker/jenkins/common.groovy' }
   return _common
 }
 
@@ -122,15 +122,15 @@ pipeline {
 
 void loadHwShards() {
   String json = sh(returnStdout: true, script:
-    "python3 docker/jenkins/ci_sharding.py hw-shards-json"
+    "python3 src/finn/util/ci_sharding.py hw-shards-json"
   ).trim()
   HW_SHARDS = readJSON(text: json).collect { it as Map }
   String typesJson = sh(returnStdout: true, script:
-    "python3 docker/jenkins/ci_sharding.py hw-test-types-json"
+    "python3 src/finn/util/ci_sharding.py hw-test-types-json"
   ).trim()
   HW_TEST_TYPES = (readJSON(text: typesJson) as List).collect { it as String }
   String labelsJson = sh(returnStdout: true, script:
-    "python3 docker/jenkins/ci_sharding.py hw-test-type-labels-json"
+    "python3 src/finn/util/ci_sharding.py hw-test-type-labels-json"
   ).trim()
   // validate-config (run inside hw-test-type-labels-json) rejects an
   // hwTestType without a matching label, so this map is guaranteed to
@@ -218,7 +218,7 @@ void resolveBuildBoardZipPaths() {
   BUILD_BOARD_ZIP_PATHS = [:]
   String rawJob = paramString('build_job_name').trim() ?: 'finn'
   String jobKey = sh(returnStdout: true, script:
-    "python3 docker/jenkins/ci_sharding.py job-key ${shellQuote(rawJob)}"
+    "python3 src/finn/util/ci_sharding.py job-key ${shellQuote(rawJob)}"
   ).trim()
   String override = paramString('build_dir').trim()
   String artifactDir = loadCommonOnce().finnArtifactsRoot()
@@ -230,7 +230,7 @@ void resolveBuildBoardZipPaths() {
   }
   String tests = HW_TEST_TYPES.join(',')
   String boards = HW_SHARDS.collect { it.board }.join(',')
-  String cmd = "python3 docker/jenkins/ci_sharding.py resolve-build-zips " +
+  String cmd = "python3 src/finn/util/ci_sharding.py resolve-build-zips " +
                "--artifact-dir ${shellQuote(artifactDir)} --job-key ${shellQuote(jobKey)} " +
                "--tests ${shellQuote(tests)} --boards ${shellQuote(boards)} " +
                "--build-dir ${shellQuote(override)}"
@@ -545,7 +545,7 @@ void restartZynqPlatform() {
   }
 }
 
-// Thin wrappers over docker/jenkins/_common.groovy. safeStashReport takes an
+// Thin wrappers over docker/jenkins/common.groovy. safeStashReport takes an
 // explicit fileBase because HW reports use a different basename pattern
 // (testType_hw_board) from the stash name (testType_board).
 boolean paramBool(String name)                { return loadCommonOnce().paramBool(name) }

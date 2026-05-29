@@ -36,7 +36,6 @@ import numpy as np
 # import pytorch before onnx, so we make sure to import onnx first
 import onnx  # NOQA
 import os
-import sys
 import torch
 import warnings
 from brevitas.export import export_qonnx
@@ -97,6 +96,7 @@ from finn.transformation.streamline.reorder import (
 )
 from finn.transformation.streamline.round_thresholds import RoundAndClipThresholds
 from finn.util.basic import get_finn_root, make_build_dir
+from finn.util.ci_sharding import BOARDS, TEST_BOARDS
 from finn.util.pytorch import ToTensor
 from finn.util.test import (
     execute_parent,
@@ -106,19 +106,6 @@ from finn.util.test import (
     get_trained_network_and_ishape,
     load_test_checkpoint_or_skip,
 )
-
-# ci_sharding lives under docker/jenkins/. tests/conftest.py inserts its
-# parent on sys.path before collection; this guard keeps the import resolvable
-# when the file is loaded directly (IDE inspection, isolated reruns).
-_JENKINS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "docker",
-    "jenkins",
-)
-if _JENKINS_DIR not in sys.path:
-    sys.path.insert(0, _JENKINS_DIR)
-
-from ci_sharding import TEST_BOARDS as test_board_map  # noqa: E402
 
 build_dir = os.environ["FINN_BUILD_DIR"]
 target_clk_ns = 20
@@ -392,13 +379,8 @@ _SANITY_BNN_CONFIGS = [
     (2, 2, "cnv", "U250"),
 ]
 
-_BNN_MARKER_BY_BOARD = {
-    "Pynq-Z1": "bnn_pynq",
-    "KV260_SOM": "bnn_kv260",
-    "ZCU104": "bnn_zcu104",
-    "U250": "bnn_u250",
-}
-
+# group names embed these parameter values, so renaming or renumbering an
+# entry invalidates the timing master's accumulated samples.
 _BNN_WBITS = [1, 2]
 _BNN_ABITS = [1, 2]
 _BNN_TOPOLOGY = ["lfc", "tfc", "cnv"]
@@ -423,8 +405,8 @@ def _bnn_scenarios():
                 ],
             )
         )
-    for board in test_board_map:
-        marker_name = _BNN_MARKER_BY_BOARD[board]
+    for board in TEST_BOARDS:
+        marker_name = BOARDS[board]["bnnMarker"]
         marker = getattr(pytest.mark, marker_name)
         for w, a, top in itertools.product(_BNN_WBITS, _BNN_ABITS, _BNN_TOPOLOGY):
             scenarios.append(

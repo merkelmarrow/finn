@@ -46,6 +46,10 @@ trap 'rm -f "$list"' EXIT
 # subtrees. New Vitis internal layouts below _x/link/ stop silently
 # dropping logs because we no longer pin to a fixed path. Anchored to the
 # leading slash so 'myvitis_proj' cannot accidentally match 'vitis_proj'.
+#
+# Naming asymmetry: vitis_proj is a fixed directory name (no hash suffix),
+# so it ends with `/`. The other entries are prefixes for `<name>_<hash>`
+# directories Vivado/Vitis emits, so they end with `_`.
 build_subdirs='/(project_|finn_zynqbuild_|vitis_proj/|vivado_stitch_proj_|vitis_link_proj_)'
 {
   find "$abs_bd" -type f \( \

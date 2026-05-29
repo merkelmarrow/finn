@@ -44,16 +44,9 @@ import pytest
 
 import json
 import os
-import sys
 import time
 
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(THIS_DIR)
-JENKINS_DIR = os.path.join(REPO_ROOT, "docker", "jenkins")
-if JENKINS_DIR not in sys.path:
-    sys.path.insert(0, JENKINS_DIR)
-
-import ci_sharding  # noqa: E402
+from finn.util import ci_sharding
 
 SHARD_MARKER_NAME = "shard"
 

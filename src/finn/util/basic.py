@@ -41,12 +41,6 @@ from typing import Dict, Optional, Tuple
 
 from finn.util.data_packing import finnpy_to_packed_bytearray
 
-# Test boards used for BNN pynq tests. The canonical list lives in
-# docker/jenkins/ci_sharding.TEST_BOARDS; the cross-check in
-# tests/util/test_bnn_board_config.py keeps the two in sync.
-test_board_map = ["Pynq-Z1", "KV260_SOM", "ZCU104", "U250"]
-
-
 # mapping from PYNQ board names to FPGA part names
 pynq_part_map = dict()
 pynq_part_map["Ultra96"] = "xczu3eg-sbva484-1-e"
