@@ -5,11 +5,10 @@
 
 import pytest
 
+import ci_sharding
 import json
 import os
 import re
-
-from finn.util import ci_sharding
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -331,7 +330,6 @@ _PLAN_STAGES = [
         "marker": "bnn_u250",
         "shards": 2,
         "workers": 2,
-        "distMode": "loadgroup",
         "coverage": True,
         "zipArtifacts": {"hwTestType": "bnn_build_full", "boards": ["U250", "ZCU104"]},
     },
@@ -346,13 +344,12 @@ def test_shard_plan_expands_rows_into_per_shard_entries():
     sanity = plan["shards"][0]
     assert sanity["stash"] == "sanity_build"
     assert "coverageFile" not in sanity
-    # multi-shard row carries shardId, coverageFile, distMode, zipArtifacts
+    # multi-shard row carries shardId, coverageFile, zipArtifacts
     u250_b = plan["shards"][2]
     assert u250_b["shardId"] == 1
     assert u250_b["numShards"] == 2
     assert u250_b["stash"] == "bnn_u250_2"
     assert u250_b["coverageFile"] == "bnn_u250_2.coverage"
-    assert u250_b["distMode"] == "loadgroup"
     assert u250_b["zipArtifacts"]["hwTestType"] == "bnn_build_full"
 
 
@@ -398,7 +395,7 @@ def test_shard_plan_matches_live_stages_stash_names():
 def test_jenkinsfile_stage_choices_match_python_source():
     # Anchor on the STAGES choice block so a future ``choice(name: 'XYZ', ...)``
     # cannot match instead. Accept both single- and double-quoted Groovy strings.
-    jenkinsfile = os.path.join(REPO_ROOT, "docker", "jenkins", "Jenkinsfile")
+    jenkinsfile = os.path.join(REPO_ROOT, "ci", "Jenkinsfile")
     text = open(jenkinsfile).read()
     match = re.search(
         r"""choice\(\s*name:\s*['"]STAGES['"],\s*choices:\s*\[([^\]]+)\]""",
@@ -416,7 +413,7 @@ def test_jenkinsfile_stage_choices_match_python_source():
 
 
 def test_readme_stages_table_matches_python_source():
-    readme = os.path.join(REPO_ROOT, "docker", "jenkins", "README.md")
+    readme = os.path.join(REPO_ROOT, "ci", "README.md")
     text = open(readme).read()
     # Parse the values column of the "| STAGES value | ... |" table.
     table_rows = re.findall(r"^\|\s*`([a-z0-9_]+)`(?:\s*\(default\))?\s*\|", text, re.MULTILINE)
@@ -442,22 +439,6 @@ def test_marker_safe_pattern_accepts_live_markers_and_rejects_foot_guns():
         )
     for bad in ("foo and bar", "not slow", "foo  or bar", "foo or", "or foo"):
         assert not pattern.match(bad), "MARKER_SAFE_PATTERN should reject %r" % bad
-
-
-def test_multi_shard_rows_use_loadgroup_dist_mode():
-    # worksteal across xdist_group siblings breaks chained checkpoint tests,
-    # so every multi-shard row must opt in to loadgroup explicitly.
-    for row in ci_sharding.STAGES:
-        if int(row["shards"]) > 1:
-            assert (
-                row.get("distMode") == "loadgroup"
-            ), "STAGES row %r has shards>1 but distMode=%r" % (row["stage"], row.get("distMode"))
-
-
-def test_validate_stage_row_rejects_multi_shard_without_loadgroup():
-    row = {"param": "p", "stage": "X", "marker": "x", "shards": 2, "workers": 1}
-    with pytest.raises(ValueError, match="must set distMode='loadgroup'"):
-        ci_sharding.validate_stage_row(row)
 
 
 def test_enabled_params_rejects_unknown_choice_loudly():
@@ -1091,13 +1072,13 @@ def test_normalise_master_writes_canonical_schema_version_key():
 def _install_finn_ci_plugin(pytester):
     """Wire the real plugin into a pytester sandbox via pytest_plugins.
 
-    The plugin is a normal importable module (finn.util.finn_ci_plugin), so the
+    The plugin is a normal importable module (finn_ci_plugin on sys.path), so the
     sandbox conftest only has to name it. Worker detection in the plugin keys
     off the inner config's ``workerinput`` rather than the inherited
     PYTEST_XDIST_WORKER env var, so an inline sub-run is correctly seen as a
     non-worker and no env scrubbing is needed.
     """
-    pytester.makeconftest('pytest_plugins = ["finn.util.finn_ci_plugin"]')
+    pytester.makeconftest('pytest_plugins = ["finn_ci_plugin"]')
 
 
 def test_pytest_plugin_writes_timings_for_successful_sharded_run(pytester):
@@ -1540,17 +1521,6 @@ def test_validate_stage_row_accepts_each_live_row():
                 "coverage": "yes",
             },
             "invalid coverage",
-        ),
-        (
-            {
-                "stage": "X",
-                "param": "p",
-                "marker": "a",
-                "shards": 1,
-                "workers": 1,
-                "distMode": "bogus",
-            },
-            "invalid distMode",
         ),
     ],
 )

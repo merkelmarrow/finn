@@ -25,8 +25,16 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# The Jenkins CI sharding and timing-observability plugin lives in
-# finn.util.finn_ci_plugin so it is importable as a normal module (tests load
-# it via the same pytest_plugins line). Local pytest collection is unaffected
-# unless the --num-shards / --which-shard options are passed.
-pytest_plugins = ["finn.util.finn_ci_plugin"]
+# The Jenkins CI sharding + timing plugin lives in the top-level ci/ dir, out
+# of the shipped finn package. Put ci/ on sys.path so the plugin and the
+# end2end board parametrisation can import it by bare name. Local pytest
+# collection is unaffected unless the --num-shards / --which-shard options are
+# passed.
+import os
+import sys
+
+_CI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ci")
+if _CI_DIR not in sys.path:
+    sys.path.insert(0, _CI_DIR)
+
+pytest_plugins = ["finn_ci_plugin"]

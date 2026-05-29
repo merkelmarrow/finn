@@ -17,6 +17,11 @@ import finn.util.basic as basic
 # round-trip test at the bottom covers every routed tool.
 SAMPLE_TOOL = "vivado"
 
+# The canonical routed tools, asserted by the round-trip test below. Kept here
+# (not in finn.util.basic) because it is test data -- resolve_xilinx_tool
+# accepts any name, so the production code does not need the list.
+XILINX_TOOLS = ("vivado", "v++", "vitis_hls", "vitis-run", "xelab")
+
 
 def _stub_which(monkeypatch, expected):
     """Patch finn.util.basic.which so it accepts only ``expected``."""
@@ -50,7 +55,7 @@ def test_resolve_missing_raises_with_override_in_message(monkeypatch):
 
 # every routed tool round-trips: with no override each resolves to its bare
 # name. Catches a typo in the documented tool list.
-@pytest.mark.parametrize("tool", basic._XILINX_TOOLS)
+@pytest.mark.parametrize("tool", XILINX_TOOLS)
 @pytest.mark.util
 def test_resolve_every_routed_tool_round_trips(monkeypatch, tool):
     monkeypatch.delenv(basic._XILINX_TOOL_DIR_ENV, raising=False)

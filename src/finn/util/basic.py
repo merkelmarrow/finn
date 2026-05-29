@@ -309,24 +309,19 @@ def which(program):
     return None
 
 
-# Xilinx tools whose generated-script invocations FINN routes through
-# resolve_xilinx_tool. The directory override lets an out-of-band dispatcher
-# (e.g. an LSF bsub wrapper) intercept every call by pointing at one shim
-# directory whose filenames match these names, with no per-tool wiring and no
-# PATH shim. Kept as a tuple for documentation and the round-trip test; the
-# resolver itself accepts any name.
-_XILINX_TOOLS = ("vivado", "v++", "vitis_hls", "vitis-run", "xelab")
-
 _XILINX_TOOL_DIR_ENV = "FINN_TOOL_DIR_OVERRIDE"
 
 
 def resolve_xilinx_tool(default_name):
     """Return the Xilinx-tool command to embed in generated bash scripts.
 
+    FINN routes its generated-script tool invocations (today ``vivado``,
+    ``v++``, ``vitis_hls``, ``vitis-run``, ``xelab``) through this resolver.
     With ``FINN_TOOL_DIR_OVERRIDE`` set, the command resolves to
     ``<override>/<default_name>``; otherwise the bare ``default_name`` is used.
-    The single directory override is all a tool-wrapping site needs: point it
-    at a shim dir whose filenames match the bare tool names. Raises
+    The single directory override is all a tool-wrapping site (e.g. an LSF
+    bsub dispatcher) needs: point it at a shim dir whose filenames match the
+    bare tool names, with no per-tool wiring and no PATH shim. Raises
     FileNotFoundError when the resolved command is not on PATH. ``assert`` is
     unsuitable here because the check is runtime input, not an invariant, and
     would be stripped under ``-O``.

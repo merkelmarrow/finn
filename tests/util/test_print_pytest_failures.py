@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SCRIPT = os.path.join(REPO_ROOT, "docker", "jenkins", "scripts", "print_pytest_failures.py")
+SCRIPT = os.path.join(REPO_ROOT, "ci", "scripts", "print_pytest_failures.py")
 
 
 JUNIT_WITH_FAILURES = """\

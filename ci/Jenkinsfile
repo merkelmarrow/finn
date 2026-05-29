@@ -1,10 +1,10 @@
 // FINN build pipeline. The board-tethered HW tests live in Jenkinsfile_HW.
 //
 // The shard matrix, timing helpers, and the STAGES/BOARDS tables live in
-// src/finn/util/ci_sharding.py. Validate calls `ci_sharding.py validate-config`
+// ci/ci_sharding.py. Validate calls `ci_sharding.py validate-config`
 // once and the returned shard_plan is the single source of truth for the
 // branch/stash matrix, so this file carries no row-expansion logic. Shared
-// Groovy utilities live in docker/jenkins/common.groovy. This file is
+// Groovy utilities live in ci/common.groovy. This file is
 // internally segmented by '// =====' banners and is meant to be read
 // top-down: knobs first, pipeline next, per-stage helpers grouped after,
 // cross-cutting helpers at the bottom.
@@ -27,7 +27,7 @@ import groovy.transform.Field
 def _common = null
 
 private def loadCommonOnce() {
-  if (_common == null) { _common = load 'docker/jenkins/common.groovy' }
+  if (_common == null) { _common = load 'ci/common.groovy' }
   return _common
 }
 
@@ -39,7 +39,7 @@ private def loadCommonOnce() {
 // read by every later stage. Do not edit these in the middle of the pipeline.
 
 // The per-shard branch list (each entry: stage, stash, marker, workers,
-// distMode, numShards, shardId, coverage[, coverageFile][, zipArtifacts]).
+// numShards, shardId, coverage[, coverageFile][, zipArtifacts]).
 // Computed in Python so this file has no IntRange/closure-serialisation
 // loops to keep CPS-safe.
 @Field
@@ -217,7 +217,7 @@ void announceCiMode() {
 void loadStageConfig() {
   String choice = paramString('STAGES') ?: 'sanity'
   String raw = sh(returnStdout: true, script:
-    "python3 src/finn/util/ci_sharding.py validate-config " +
+    "python3 ci/ci_sharding.py validate-config " +
     "--choice ${shellQuote(choice)} " +
     "--job-name ${shellQuote(env.JOB_NAME ?: 'job')} " +
     "--stage-filter ${shellQuote(resolveStageFilter())}"
@@ -291,7 +291,7 @@ void prepareTimingState() {
   catchError(buildResult: null, stageResult: null,
              message: 'prepareTimingState failed, sharding will cold-start to round-robin') {
     sh "mkdir -p ${shellQuote(stateDir)}"
-    sh "python3 src/finn/util/ci_sharding.py prepare " +
+    sh "python3 ci/ci_sharding.py prepare " +
        "--master ${shellQuote(master)} --snapshot ${shellQuote(snapshot)}"
     FINN_CI_TIMINGS_MASTER = master
     FINN_CI_TIMINGS_SNAPSHOT = snapshot
@@ -343,7 +343,7 @@ void rotateBuildTree(String subcommand, String root, Map policy) {
   catchError(buildResult: null, stageResult: null,
              message: "${subcommand} failed, non-fatal") {
     if (!root) { return }
-    sh "python3 src/finn/util/ci_sharding.py ${subcommand} " +
+    sh "python3 ci/ci_sharding.py ${subcommand} " +
        "${shellQuote(root)} ${shellQuote(finnCiJobKey())} ${shellQuote(env.BUILD_NUMBER ?: '')} " +
        "${policy.retain} ${policy.ageDays}"
   }
@@ -393,7 +393,7 @@ void publishSharedDockerImage(String imageDir) {
     error "run-docker.sh print-tag must emit exactly one Docker tag line. Got: ${tag}"
   }
   sh "mkdir -p ${shellQuote(imageDir)}"
-  sh "docker/jenkins/scripts/publish_docker_image.sh " +
+  sh "ci/scripts/publish_docker_image.sh " +
      "${shellQuote(imageDir)} ${shellQuote(tag)} ${shellQuote(env.BUILD_NUMBER ?: '')}"
 }
 
@@ -473,7 +473,6 @@ void runShardBody(Map entry, String buildDir, String startMarker) {
         stage: entry.stage,
         stash: stashName,
         workers: entry.workers as int,
-        distMode: entry.distMode,
         numShards: entry.numShards as int,
         shardId: entry.shardId as int,
     ]
@@ -523,23 +522,21 @@ void runLocalSetupTest() {
         String pipCacheRoot = "${cacheRoot}/pip"
         String pipCacheDir  = "${pipCacheRoot}/${pipCacheKey}"
         String xdgCacheDir  = "${cacheRoot}/xdg"
-        String pruneLock    = "${pipCacheRoot}/.prune.lock"
         withEnv([
           "FINN_HOST_BUILD_DIR=${buildDir}",
           "PIP_CACHE_DIR=${pipCacheDir}",
           "XDG_CACHE_HOME=${xdgCacheDir}",
         ]) {
-          // flock -n on the prune: concurrent builds skip the GC rather than
-          // racing rm -rf against another build's pip install. The GC keeps
-          // pipCacheDir and deletes cache-key dirs older than 14 days; it is
-          // tested Python (ci_sharding.prune_pip_cache) rather than an inline
-          // find so a path-handling bug is caught off-Jenkins.
+          // Prune the pip cache directly: ci_sharding.prune_pip_cache tolerates
+          // concurrent deletion (FileNotFoundError) and is idempotent, so two
+          // builds GC'ing at once is safe and needs no lock (flock is local-only
+          // on NFS anyway). Tested Python rather than an inline find so a
+          // path-handling bug is caught off-Jenkins. Keeps pipCacheDir and
+          // deletes cache-key dirs older than 14 days.
           sh """
 mkdir -p ${shellQuote(perBuildRoot)} ${shellQuote(pipCacheDir)} ${shellQuote(xdgCacheDir)}
-touch ${shellQuote(pruneLock)}
-flock -n ${shellQuote(pruneLock)} \\
-  python3 src/finn/util/ci_sharding.py prune-pip-cache \\
-    ${shellQuote(pipCacheRoot)} ${shellQuote(pipCacheDir)} 14 || true
+python3 ci/ci_sharding.py prune-pip-cache \\
+  ${shellQuote(pipCacheRoot)} ${shellQuote(pipCacheDir)} 14 || true
 """
           cleanPreviousBuildFiles(buildDir)
           catchError(stageResult: 'FAILURE') {
@@ -570,7 +567,9 @@ void runPytest(Map opts) {
   // process for -n 1, which adds startup overhead and obscures tracebacks.
   int workers = (opts.workers ?: 1) as int
   if (workers > 1) {
-    parts << "-n ${workers} --dist ${opts.distMode ?: 'worksteal'}"
+    // workers>1 always uses loadgroup so xdist_group chains (checkpoint-linked
+    // tests) stay on one worker within the shard.
+    parts << "-n ${workers} --dist loadgroup"
   }
   int numShards = (opts.numShards ?: 0) as int
   if (numShards > 0) {
@@ -702,7 +701,7 @@ void echoShardTimings() {
   catchError(buildResult: null, stageResult: null,
              message: 'echoShardTimings failed, non-fatal') {
     if (!fileExists('reports')) { return }
-    sh "python3 src/finn/util/ci_sharding.py summarize reports/"
+    sh "python3 ci/ci_sharding.py summarize reports/"
   }
 }
 
@@ -710,7 +709,7 @@ void mergeShardMaps() {
   catchError(buildResult: null, stageResult: null,
              message: 'mergeShardMaps failed, non-fatal') {
     if (!fileExists('reports')) { return }
-    sh "python3 src/finn/util/ci_sharding.py merge-maps reports/"
+    sh "python3 ci/ci_sharding.py merge-maps reports/"
   }
 }
 
@@ -748,7 +747,7 @@ void updateTimingState() {
     if (!fileExists('reports')) { return }
     String masterArg = FINN_CI_TIMINGS_MASTER ? "--master ${shellQuote(FINN_CI_TIMINGS_MASTER)}" : ''
     String updateArg = shouldUpdatePersistentTimingState() ? '--update-master' : ''
-    sh "python3 src/finn/util/ci_sharding.py update --reports reports ${masterArg} " +
+    sh "python3 ci/ci_sharding.py update --reports reports ${masterArg} " +
        "--out reports/ci_timings_master.json " +
        "--job ${shellQuote(env.JOB_NAME ?: '')} --build ${shellQuote(env.BUILD_NUMBER ?: '')} " +
        "${updateArg}"
@@ -800,7 +799,7 @@ void publishBoardZip(String testType, String board) {
   String work = "artifact_zips/${testType}/${board}"
   String noDeployments = "${work}/${board}/.NO_DEPLOYMENTS"
   sh "rm -rf ${shellQuote(work)} && mkdir -p ${shellQuote(work + '/' + board)} ${shellQuote(destDir)}"
-  sh "docker/jenkins/scripts/publish_board_zip_stage.sh " +
+  sh "ci/scripts/publish_board_zip_stage.sh " +
      "${shellQuote(srcRoot)} ${shellQuote(work + '/' + board)} " +
      "${shellQuote(board)} ${shellQuote(testType)}"
   if (fileExists(noDeployments)) { return }
@@ -827,7 +826,7 @@ void findCopyZip(String testType, String board, String findDir, String copyDir) 
   String artifactRoot = artifactBuildRoot()
   if (!artifactRoot) { return }
   String stageDir = "${artifactRoot}/deployments/${testType}/${board}/${copyDir}"
-  sh "docker/jenkins/scripts/find_copy_zip.sh " +
+  sh "ci/scripts/find_copy_zip.sh " +
      "${shellQuote(testType)} ${shellQuote(board)} " +
      "${shellQuote(findDir)} ${shellQuote(stageDir)}"
 }
@@ -933,7 +932,7 @@ void reapOrphanedLsfJobs() {
     String parsed = sh(returnStdout: true, script:
       "command -v bjobs >/dev/null 2>&1 && " +
       "bjobs -a -J ${shellQuote(prefix + '*')} -o 'jobid job_name' -noheader 2>/dev/null | " +
-      "python3 src/finn/util/ci_sharding.py lsf-parse-jobs --prefix ${shellQuote(prefix)} || echo '{}'"
+      "python3 ci/ci_sharding.py lsf-parse-jobs --prefix ${shellQuote(prefix)} || echo '{}'"
     ).trim()
     Map jobidsByBuild = readJSON(text: (parsed ?: '{}')) as Map
     if (jobidsByBuild.isEmpty()) { return }
@@ -1103,7 +1102,7 @@ df -BG "\$d" | awk 'NR==2 {print \$4}' | tr -d 'G'
 void printLsfSummary(String buildDir, String stashName) {
   catchError(buildResult: null, stageResult: null,
              message: "printLsfSummary(${stashName}) failed, non-fatal") {
-    sh "docker/jenkins/scripts/lsf_summary.sh " +
+    sh "ci/scripts/lsf_summary.sh " +
        "${shellQuote(buildDir)} ${shellQuote(env.NODE_NAME ?: '')} ${shellQuote(stashName)}"
   }
 }
@@ -1116,7 +1115,7 @@ void printPytestFailures(String stashName, int linesPerFailure, int maxFailures)
       echo "[pytest-failures ${stashName}] no JUnit XML at ${xml}"
       return
     }
-    sh "python3 docker/jenkins/scripts/print_pytest_failures.py " +
+    sh "python3 ci/scripts/print_pytest_failures.py " +
        "${shellQuote(xml)} ${shellQuote(stashName)} ${linesPerFailure} ${maxFailures}"
   }
 }
@@ -1124,7 +1123,7 @@ void printPytestFailures(String stashName, int linesPerFailure, int maxFailures)
 void printFailureTails(String buildDir, String stashName, int tailLines) {
   catchError(buildResult: null, stageResult: null,
              message: "printFailureTails(${stashName}) failed, non-fatal") {
-    sh "docker/jenkins/scripts/failure_tails.sh " +
+    sh "ci/scripts/failure_tails.sh " +
        "${shellQuote(buildDir)} ${shellQuote(stashName)} ${tailLines}"
   }
 }
@@ -1137,13 +1136,13 @@ void archiveFailureLogs(String buildDir, String stashName, String startMarker) {
              message: "archiveFailureLogs(${stashName}) failed, non-fatal") {
     String tarball = "failure_logs/${stashName}.tar.gz"
     String absTarball = "${env.WORKSPACE}/${tarball}"
-    sh "docker/jenkins/scripts/archive_failure_logs.sh " +
+    sh "ci/scripts/archive_failure_logs.sh " +
        "${shellQuote(buildDir)} ${shellQuote(absTarball)} ${shellQuote(startMarker)}"
     archiveArtifacts artifacts: tarball, allowEmptyArchive: true
   }
 }
 
-// Thin wrappers over docker/jenkins/common.groovy.
+// Thin wrappers over ci/common.groovy.
 void safeStashReport(String stashName)        { loadCommonOnce().safeStashShardReport(stashName) }
 void unstashIfPresent(String stashName)       { loadCommonOnce().unstashIfPresent(stashName) }
 void cleanPreviousBuildFiles(String buildDir) { loadCommonOnce().cleanPreviousBuildFiles(buildDir) }

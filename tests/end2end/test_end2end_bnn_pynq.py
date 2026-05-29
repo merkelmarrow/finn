@@ -39,6 +39,7 @@ import os
 import torch
 import warnings
 from brevitas.export import export_qonnx
+from ci_sharding import BOARDS, TEST_BOARDS
 from dataset_loading import cifar, mnist
 from qonnx.core.datatype import DataType
 from qonnx.core.modelwrapper import ModelWrapper
@@ -96,7 +97,6 @@ from finn.transformation.streamline.reorder import (
 )
 from finn.transformation.streamline.round_thresholds import RoundAndClipThresholds
 from finn.util.basic import get_finn_root, make_build_dir
-from finn.util.ci_sharding import BOARDS, TEST_BOARDS
 from finn.util.pytorch import ToTensor
 from finn.util.test import (
     execute_parent,

@@ -4,18 +4,18 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Jenkins-only FINN CI sharding and timing helpers.
+"""FINN CI sharding, timing, and board/stage config helpers.
 
-Used both as a CLI tool from the Jenkinsfile and as the shared implementation
-imported by the pytest plugin in ``finn.util.finn_ci_plugin``. The file is
-internally segmented by ``# =====`` banners and is meant to be read top-down:
-configuration knobs first, then declarative tables, then helpers grouped by
-the concern they own.
+Lives in the top-level ``ci/`` directory, out of the shipped finn package.
+Used as a CLI tool from the Jenkinsfile and imported as a module by the pytest
+plugin ``finn_ci_plugin`` (shard assignment) and by the end2end board
+parametrisation (``BOARDS``/``TEST_BOARDS``). The file is internally segmented
+by ``# =====`` banners and is meant to be read top-down: configuration knobs
+first, then declarative tables, then helpers grouped by the concern they own.
 """
 
 import argparse
 import collections
-import fcntl
 import glob
 import json
 import os
@@ -24,6 +24,7 @@ import shutil
 import sys
 import tempfile
 import time
+from nfs_lock import nfs_dir_lock
 
 # =============================================================================
 # Configuration knobs
@@ -61,10 +62,6 @@ NOTEBOOK_PARAM_RE = re.compile(r"\[(/[^\]]+\.ipynb)\]")
 # ``a or b or c`` shape is accepted so the pytest plugin's mini-evaluator
 # and the Jenkinsfile's MARKER_SAFE_PATTERN agree on what is safe.
 MARKER_SAFE_PATTERN = re.compile(r"^[A-Za-z0-9_]+( or [A-Za-z0-9_]+)*$")
-
-# Recognised pytest-xdist ``--dist`` modes for STAGES rows. ``None`` means
-# "use the xdist default (worksteal)" without setting --dist explicitly.
-VALID_DIST_MODES = (None, "loadgroup", "worksteal")
 
 # Board setup scripts implemented by Jenkinsfile_HW.createTestScript().
 VALID_BOARD_SETUP_SCRIPTS = ("alveo", "pynq")
@@ -128,8 +125,7 @@ BOARDS = {
 }
 
 # Canonical board iteration order for test parametrisation. Single source of
-# truth: ``tests/end2end/test_end2end_bnn_pynq.py`` and the cross-check in
-# ``tests/util/test_bnn_board_config.py`` both consume this tuple.
+# truth: ``tests/end2end/test_end2end_bnn_pynq.py`` consumes this tuple.
 TEST_BOARDS = tuple(BOARDS)
 
 
@@ -148,11 +144,10 @@ HW_TEST_TYPE_LABELS = {
 #   marker:       pytest ``-m`` expression (must match MARKER_SAFE_PATTERN in
 #                 the Jenkinsfile, so only ``a or b ...``)
 #   shards:       how many parallel shards to split the row into
-#   workers:      pytest-xdist worker count per shard
+#   workers:      pytest-xdist worker count per shard. >1 implies
+#                 ``--dist loadgroup`` so xdist_group chains (e.g. tests linked
+#                 by load_test_checkpoint_or_skip) stay on one worker
 #   coverage:     optional, request coverage report
-#   distMode:     optional pytest-xdist dist mode (default worksteal);
-#                 loadgroup is load-bearing for any row whose tests chain via
-#                 load_test_checkpoint_or_skip across xdist_group siblings
 #   zipArtifacts: optional, {"hwTestType": ..., "boards": [...]} declaring the
 #                 build-to-HW handoff zips this row publishes. hwTestType must
 #                 have a HW_TEST_TYPE_LABELS entry
@@ -168,9 +163,6 @@ STAGES = [
             "boards": ["U250", "Pynq-Z1", "ZCU104", "KV260_SOM"],
         },
     },
-    # distMode: loadgroup is load-bearing for any row whose tests chain via
-    # load_test_checkpoint_or_skip across xdist_group siblings. See the
-    # STAGES field doc above before dropping it from any row below.
     {
         "param": "sanity",
         "stage": "Sanity - Unit Tests",
@@ -178,7 +170,6 @@ STAGES = [
         "shards": 1,
         "workers": 8,
         "coverage": True,
-        "distMode": "loadgroup",
     },
     {
         "param": "fpgadataflow",
@@ -187,7 +178,6 @@ STAGES = [
         "shards": 2,
         "workers": 8,
         "coverage": True,
-        "distMode": "loadgroup",
     },
     {
         "param": "end2end",
@@ -195,7 +185,6 @@ STAGES = [
         "marker": "end2end",
         "shards": 3,
         "workers": 6,
-        "distMode": "loadgroup",
     },
     {
         "param": "end2end",
@@ -203,7 +192,6 @@ STAGES = [
         "marker": "bnn_u250",
         "shards": 2,
         "workers": 2,
-        "distMode": "loadgroup",
         "zipArtifacts": {"hwTestType": "bnn_build_full", "boards": ["U250"]},
     },
     {
@@ -212,7 +200,6 @@ STAGES = [
         "marker": "bnn_pynq",
         "shards": 3,
         "workers": 2,
-        "distMode": "loadgroup",
         "zipArtifacts": {"hwTestType": "bnn_build_full", "boards": ["Pynq-Z1"]},
     },
     {
@@ -221,7 +208,6 @@ STAGES = [
         "marker": "bnn_zcu104",
         "shards": 2,
         "workers": 4,
-        "distMode": "loadgroup",
         "zipArtifacts": {"hwTestType": "bnn_build_full", "boards": ["ZCU104"]},
     },
     {
@@ -230,7 +216,6 @@ STAGES = [
         "marker": "bnn_kv260",
         "shards": 2,
         "workers": 2,
-        "distMode": "loadgroup",
         "zipArtifacts": {"hwTestType": "bnn_build_full", "boards": ["KV260_SOM"]},
     },
 ]
@@ -244,7 +229,7 @@ def marker_tokens(marker_expr):
 def validate_stage_row(row):
     """Sanity-check a single STAGES row in isolation.
 
-    Catches a typo in param / marker / shards / workers / coverage / distMode
+    Catches a typo in param / marker / shards / workers / coverage
     at config-load time so a malformed row cannot silently survive into
     Jenkins or the pytest plugin. A missing or empty ``param`` is the
     sneakiest of these because the row would be skipped by every Groovy
@@ -269,16 +254,6 @@ def validate_stage_row(row):
     if "coverage" in row and not isinstance(row["coverage"], bool):
         raise ValueError(
             "STAGES row %r has invalid coverage=%r (must be bool)" % (stage, row["coverage"])
-        )
-    dist_mode = row.get("distMode")
-    if dist_mode not in VALID_DIST_MODES:
-        raise ValueError(
-            "STAGES row %r has invalid distMode=%r (allowed: %r)"
-            % (stage, dist_mode, list(VALID_DIST_MODES))
-        )
-    if shards > 1 and dist_mode != "loadgroup":
-        raise ValueError(
-            "STAGES row %r has shards=%r and must set distMode='loadgroup'" % (stage, shards)
         )
     zip_art = row.get("zipArtifacts")
     if zip_art is None:
@@ -416,7 +391,7 @@ def hw_test_type_labels(stages=None, labels=None):
 
 
 def stash_name(stage, shards, shard_id):
-    """Mirror ``shardStashName()`` in ``docker/jenkins/Jenkinsfile``."""
+    """Mirror ``shardStashName()`` in ``ci/Jenkinsfile``."""
     base = re.sub(r"^_|_$", "", re.sub(r"[^a-z0-9]+", "_", stage.lower()))
     return base if shards <= 1 else "%s_%d" % (base, shard_id + 1)
 
@@ -494,7 +469,6 @@ def _shard_entry(row):
             "stash": stash,
             "marker": row["marker"],
             "workers": int(row["workers"]),
-            "distMode": row.get("distMode"),
             "numShards": num_shards,
             "shardId": shard_id,
             "coverage": bool(row.get("coverage", False)),
@@ -654,8 +628,12 @@ def assign_groups_to_shards(group_keys, num_shards, weights=None, pins=None):
     has_signal = any(weights.get(k, 0.0) > 0.0 for k in unpinned)
 
     if not has_signal:
-        for idx, key in enumerate(unpinned):
-            shard = idx % num_shards
+        # No timing signal: balance by group count, but seed from any pinned
+        # load so pins are respected. Placing each group on the least-loaded
+        # shard (ties broken by index) stays deterministic and matches plain
+        # round-robin when there are no pins.
+        for key in unpinned:
+            shard = min(range(num_shards), key=lambda s: (shard_load[s], s))
             assignment[key] = shard
             source[key] = "round_robin"
             shard_load[shard] += 1.0
@@ -809,7 +787,7 @@ def summarize_timings(reports_dir):
     if slow_found:
         print(
             "ci_sharding summarize: one or more shards exceeded %.1fx family median. "
-            "A trusted full build may refresh the timing master if anomaly checks accept it"
+            "A trusted full build refreshes the timing master from these observations."
             % SLOW_FACTOR
         )
     return 0
@@ -963,9 +941,9 @@ def update_master(reports_dir, master_path, out_path, update_persistent=False, m
     return 0
 
 
-# Visible canary now that anomaly-protection is gone: groups whose latest
-# observation is >=2x their prior median are flagged so a real regression
-# does not hide behind the median-of-five window's smoothing.
+# Regression canary: flag groups whose latest observation is >= REGRESSION_FACTOR
+# times their prior median, so a real slowdown does not hide behind the
+# median-of-five window's smoothing.
 REGRESSION_FACTOR = 2.0
 
 
@@ -1042,11 +1020,13 @@ def _backup_if_corrupt(master_path):
 
 
 def locked_update(master_path, update_fn):
-    """Acquire an exclusive flock and apply ``update_fn`` to the master JSON.
+    """Apply ``update_fn`` to the master JSON under an NFS-safe directory lock.
 
-    The lock file (``.<basename>.lock``) lives next to the master and is
-    intentionally never deleted. The dot prefix keeps it out of ``ls``
-    listings since operators ``cat`` the master.
+    flock/fcntl advisory locks are local-only on NFS and give no cross-agent
+    exclusion, so the timing-master update serialises on the mkdir-based
+    nfs_dir_lock instead. The lock dir (``.<basename>.lock.d``) lives next to
+    the master; a crashed holder is reclaimed by the lock's stale TTL, so a
+    dead build never wedges the master.
     """
     if not master_path:
         return update_fn({})
@@ -1055,16 +1035,12 @@ def locked_update(master_path, update_fn):
     # cannot race on mkdir.
     os.makedirs(parent, exist_ok=True)
     base = os.path.basename(master_path)
-    lock_path = os.path.join(parent, "." + base + ".lock")
-    with open(lock_path, "a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            _backup_if_corrupt(master_path)
-            current = read_json(master_path, default={})
-            updated = update_fn(current)
-            write_json_atomic(master_path, updated)
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    lock_path = os.path.join(parent, "." + base + ".lock.d")
+    with nfs_dir_lock(lock_path):
+        _backup_if_corrupt(master_path)
+        current = read_json(master_path, default={})
+        updated = update_fn(current)
+        write_json_atomic(master_path, updated)
     return updated
 
 
@@ -1287,7 +1263,7 @@ def prune_snapshots(state_root, job_key, current_build, retain_n, max_age_days, 
 
 def prune_pip_cache(root, keep, max_age_days, dry_run=False):
     """Delete cache-key subdirs of ``root`` older than ``max_age_days``, keeping
-    ``keep``. Mirrors the local-setup stage's flock-guarded GC, but as tested
+    ``keep``. Mirrors the local-setup stage's pip-cache GC, but as tested
     Python instead of an inline find. The directory's own mtime is the age key
     (an actively reused cache dir is bumped on write, so it survives).
     """

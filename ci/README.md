@@ -10,7 +10,7 @@ You do not need Jenkins to run the same tests locally. The Jenkinsfile generates
 ./run-docker.sh python -m pytest -m sanity_bnn
 ```
 
-substituting any marker from the `STAGES` table in [`ci_sharding.py`](../../src/finn/util/ci_sharding.py). Leave `FINN_CI_NFS_ROOT` unset and the run picks up local-fallback mode automatically: per-agent Docker build, no build-to-HW handoff, no persistent timing master, deterministic round-robin sharding. The same per-shard JUnit XML and HTML reports are produced under the workspace.
+substituting any marker from the `STAGES` table in [`ci_sharding.py`](./ci_sharding.py). Leave `FINN_CI_NFS_ROOT` unset and the run picks up local-fallback mode automatically: per-agent Docker build, no build-to-HW handoff, no persistent timing master, deterministic round-robin sharding. The same per-shard JUnit XML and HTML reports are produced under the workspace.
 
 ## TL;DR for contributors
 
@@ -34,7 +34,7 @@ Optional operator overrides, all with sensible defaults so nothing else needs to
 | `FINN_CI_MIN_FREE_GB` | `120` | Minimum free space (GB) on the agent scratch volume below which a shard refuses to start. Lower on tighter disks, higher when bumping shard concurrency. |
 | `FINN_LSF_NFS_STAGING` | unset (no LSF tails, no LSF reaper) | When set, `archive_failure_logs.sh` tails LSF staging-dir logs into failure bundles, and the Jenkinsfile reaps orphaned bsub jobs tagged `finn_ci_<jobScope>_*` between builds. Sites that wrap their Vivado/Vitis through bsub set this to the LSF staging root. |
 
-Every parallel stage is defined by one row of `STAGES` in [`ci_sharding.py`](../../src/finn/util/ci_sharding.py). The [`Jenkinsfile`](./Jenkinsfile) loads the entire config bundle during Validate with a single `python3 src/finn/util/ci_sharding.py validate-config --choice <STAGES> --job-name <JOB_NAME>` call (which runs `validate_config()` first), and the pytest plugin in [`finn_ci_plugin.py`](../../src/finn/util/finn_ci_plugin.py) (registered via `pytest_plugins` in [`tests/conftest.py`](../../tests/conftest.py)) imports the same module for shard assignment and `--which-shard` lookup. Test selection is the standard `-m <marker>` expression, and shard splitting is the `--num-shards` / `--shard-id` plugin. Local pytest collection is unchanged unless the CI sharding options are used.
+Every parallel stage is defined by one row of `STAGES` in [`ci_sharding.py`](./ci_sharding.py). The [`Jenkinsfile`](./Jenkinsfile) loads the entire config bundle during Validate with a single `python3 ci/ci_sharding.py validate-config --choice <STAGES> --job-name <JOB_NAME>` call (which runs `validate_config()` first), and the pytest plugin in [`finn_ci_plugin.py`](./finn_ci_plugin.py) (registered via `pytest_plugins` in [`tests/conftest.py`](../tests/conftest.py)) imports the same module for shard assignment and `--which-shard` lookup. Test selection is the standard `-m <marker>` expression, and shard splitting is the `--num-shards` / `--shard-id` plugin. Local pytest collection is unchanged unless the CI sharding options are used.
 
 A `STAGES` row `marker` is restricted to the `a or b or c` disjunction form (enforced by `MARKER_SAFE_PATTERN` in `validate_config`): the marker is interpolated into a shell `-m` argument and the plugin's `marker_tokens` treats every whitespace-separated token as an `or` disjunct, so `and`/`not` are rejected. This only constrains `STAGES` rows; ad-hoc `pytest -m "fpgadataflow and not slow"` runs are unaffected (but such expressions are not reflected by `--which-shard`, which walks the `STAGES` rows).
 
@@ -44,7 +44,7 @@ The HW-tethered [`Jenkinsfile_HW`](./Jenkinsfile_HW) follows the same broad patt
 
 There is no checked-in seed file. Cold start (master absent) and snapshot-unreachable both fall through to deterministic round-robin shard assignment, so the pipeline keeps working without persistent timings. The persistent master is refreshed only by trusted full-matrix builds (`STAGES=full`, no `STAGE_FILTER`, successful build). Partial sanity/debug builds still write an archived `reports/ci_timings_master.json` preview, but do not touch the shared master.
 
-The master schema is `{"schema_version": 2, "groups": {<name>: {"samples": [last MAX_SAMPLES observations], count, last_seen_*}}}`. Each trusted full-matrix build appends one observation per observed group and trims the window to MAX_SAMPLES (five). Per-group weights consumed by the bin packer are the median of `samples`, so a single anomalous observation only moves one slot and the median is unaffected. `MAX_SAMPLES` lives at the top of [`ci_sharding.py`](../../src/finn/util/ci_sharding.py).
+The master schema is `{"schema_version": 2, "groups": {<name>: {"samples": [last MAX_SAMPLES observations], count, last_seen_*}}}`. Each trusted full-matrix build appends one observation per observed group and trims the window to MAX_SAMPLES (five). Per-group weights consumed by the bin packer are the median of `samples`, so a single anomalous observation only moves one slot and the median is unaffected. `MAX_SAMPLES` lives at the top of [`ci_sharding.py`](./ci_sharding.py).
 
 ## Build-to-HW zip handoff
 
@@ -101,7 +101,7 @@ When a shared Docker image directory is configured, non-build stages run `run-do
 
 Validate rotates the image, artifact, and timing-snapshot trees via the single `rotateBuildTrees()` helper in [`Jenkinsfile`](./Jenkinsfile). Each rotation keeps the newest N numeric entries and the current build, and deletes older entries whose mtime exceeds M days. All three subcommands skip silently when their parent directory does not exist, and the Python side tolerates concurrent prune races.
 
-`jobKey` is `JOB_NAME` sanitised by `ci_sharding.job_key()` to one path segment, leading and trailing dots stripped so `JOB_NAME=".."` cannot escape into the parent directory. The build pipeline reads the sanitised value out of the `validate-config` payload, and `Jenkinsfile_HW` shells out via the standalone `job-key` subcommand because it does not load the full bundle. Either way the sanitisation rule has one source of truth. Retention values live in the `RETENTION` dict at the top of [`ci_sharding.py`](../../src/finn/util/ci_sharding.py) and ride out via the same `validate-config` payload, so tuning is a one-file change.
+`jobKey` is `JOB_NAME` sanitised by `ci_sharding.job_key()` to one path segment, leading and trailing dots stripped so `JOB_NAME=".."` cannot escape into the parent directory. The build pipeline reads the sanitised value out of the `validate-config` payload, and `Jenkinsfile_HW` shells out via the standalone `job-key` subcommand because it does not load the full bundle. Either way the sanitisation rule has one source of truth. Retention values live in the `RETENTION` dict at the top of [`ci_sharding.py`](./ci_sharding.py) and ride out via the same `validate-config` payload, so tuning is a one-file change.
 
 Artifact-tree pruning is safe because HW resolves per board to the newest `.READY` zip remaining. Deleting an older build directory just makes HW fall through to the next-oldest READY on its next collect pass. Artifact retention is sized to outlast the longest realistic single-board failure streak.
 
@@ -144,20 +144,20 @@ Edit the `_BNN_WBITS`, `_BNN_ABITS`, and `_BNN_TOPOLOGY` constants in `tests/end
 
 ### Add a new HW test type?
 
-Adding a new `hwTestType` (today `bnn_build_sanity` or `bnn_build_full`) is a one-line change in [`ci_sharding.py`](../../src/finn/util/ci_sharding.py): add `STAGES` rows whose `zipArtifacts.hwTestType` is the new name and an entry in `HW_TEST_TYPE_LABELS` mapping that name to the human-readable label that should appear in the Jenkins UI (e.g. `"bnn_build_robust": "Robust"`). The `hw-config-json` subcommand picks the new entry up automatically in first-appearance order (so place smoke/sanity types before longer test types), and `validate_config()` rejects an `hwTestType` declared in `STAGES` without a matching label.
+Adding a new `hwTestType` (today `bnn_build_sanity` or `bnn_build_full`) is a one-line change in [`ci_sharding.py`](./ci_sharding.py): add `STAGES` rows whose `zipArtifacts.hwTestType` is the new name and an entry in `HW_TEST_TYPE_LABELS` mapping that name to the human-readable label that should appear in the Jenkins UI (e.g. `"bnn_build_robust": "Robust"`). The `hw-config-json` subcommand picks the new entry up automatically in first-appearance order (so place smoke/sanity types before longer test types), and `validate_config()` rejects an `hwTestType` declared in `STAGES` without a matching label.
 
 ### Add a new BNN board?
 
 1. Add the marker `bnn_<board>` to `setup.cfg` under `[tool:pytest]`.
-2. In [`ci_sharding.py`](../../src/finn/util/ci_sharding.py), add a `BOARDS` entry (in the desired test-parametrisation position, key order is load-bearing) with `agentLabel`, `credentialsId`, `restartPrep`, `setupScript`, `marker`, and a `STAGES` row that references the board in its `zipArtifacts.boards`. `TEST_BOARDS` is derived from `BOARDS` and is consumed by `tests/end2end/test_end2end_bnn_pynq.py` automatically.
-3. Add a `_BNN_MARKER_BY_BOARD` line in `tests/end2end/test_end2end_bnn_pynq.py`. `validate_config()` cross-checks the marker tables and sanity-checks each row's marker/shards/workers/distMode on every CLI invocation. `Jenkinsfile_HW` derives `HW_SHARDS`, the HW test types, and their labels from `BOARDS`/`STAGES` via the single `python3 src/finn/util/ci_sharding.py hw-config-json` call, so no separate edit is needed there.
+2. In [`ci_sharding.py`](./ci_sharding.py), add a `BOARDS` entry (in the desired test-parametrisation position, key order is load-bearing) with `agentLabel`, `credentialsId`, `restartPrep`, `setupScript`, `marker`, and `bnnMarker`, plus a `STAGES` row that references the board in its `zipArtifacts.boards`. `TEST_BOARDS` derives from `BOARDS`, and `tests/end2end/test_end2end_bnn_pynq.py` reads `BOARDS[board]["bnnMarker"]`, so the board's scenarios are parametrised automatically.
+3. Nothing else is needed. `validate_config()` sanity-checks each `STAGES`/`BOARDS` row on every CLI invocation, and `Jenkinsfile_HW` derives `HW_SHARDS`, the HW test types, and their labels from `BOARDS`/`STAGES` via the single `python3 ci/ci_sharding.py hw-config-json` call, so no separate edit is needed there.
 
 ### Add a new CI param?
 
 `ci_sharding.STAGES` rows carry a `param` field that maps onto the `STAGES` Jenkins choice. To add a new family (say `quantization`):
 
 1. Add `STAGES` rows with `"param": "quantization"`.
-2. Run `python3 src/finn/util/ci_sharding.py stage-choices-json` and mirror the generated list in [`Jenkinsfile`](./Jenkinsfile)'s declarative `choice` block. The `test_jenkinsfile_stage_choices_match_python_source` test catches drift.
+2. Run `python3 ci/ci_sharding.py stage-choices-json` and mirror the generated list in [`Jenkinsfile`](./Jenkinsfile)'s declarative `choice` block. The `test_jenkinsfile_stage_choices_match_python_source` test catches drift.
 3. Add a row to the `STAGES` table further down in this README. The `test_readme_stages_table_matches_python_source` test catches drift.
 
 `enabled_params_for_choice` is dynamic and picks up the new name automatically.
@@ -197,7 +197,7 @@ This prints `shard | items | groups | weight_s | sample_group` and exits. Set `F
 
 Open `reports/ci_timings_master.json` from any archived build. The `last_update` field shows how many groups this build observed and whether it was a persistent update. Manual updates are not supported. Run a successful `STAGES=full` build to refresh the shared master.
 
-`python3 src/finn/util/ci_sharding.py summarize path/to/reports/` prints per-shard wall-clock outliers from archived `<stash>.timings.json` files, useful when investigating one slow build.
+`python3 ci/ci_sharding.py summarize path/to/reports/` prints per-shard wall-clock outliers from archived `<stash>.timings.json` files, useful when investigating one slow build.
 
 ## Artefacts
 
@@ -222,7 +222,7 @@ Build resolution is automatic via `build_job_name` (default `finn`). See "Build-
 
 Board zips are retrieved by direct filesystem read from each board's resolved build directory on the `finn-build` aggregator agent, then `stash`/`unstash`'d to the board agents. Boards whose zip has no `.READY` sibling are skipped from the per-board stash and per-shard branch maps. If a whole HW stage has no READY zips, the stage marks the build unstable with a clear message instead of calling `parallel` with an empty branch map.
 
-Shared Groovy helpers live in [`common.groovy`](./common.groovy). Each Jenkinsfile loads it once via `load 'docker/jenkins/common.groovy'` and exposes thin top-level wrappers. `safeStash*` splits into build-pipeline and HW forms because the two pipelines genuinely disagree on what to include. HW takes an explicit `fileBase` (its reports use a different basename from its stash name) and uses sudo when board credentials are bound. The directory-clean helpers split three ways. `cleanPreviousBuildFiles` is the build-pipeline form (rms then mkdirs the buildDir as the unprivileged user so docker `-v` does not bind the mount as root). `cleanBoardWorkdirHw` rms a HW board's per-shard workdir together with the sibling `<board>.zip` so the next shard starts clean. `cleanReportsDirHw` rms the HW aggregator's `reports/` dir without any sibling-zip semantics. `aggregateReports` stays inline in each Jenkinsfile because the build-pipeline form does many more things than the HW form.
+Shared Groovy helpers live in [`common.groovy`](./common.groovy). Each Jenkinsfile loads it once via `load 'ci/common.groovy'` and exposes thin top-level wrappers. `safeStash*` splits into build-pipeline and HW forms because the two pipelines genuinely disagree on what to include. HW takes an explicit `fileBase` (its reports use a different basename from its stash name) and uses sudo when board credentials are bound. The directory-clean helpers split three ways. `cleanPreviousBuildFiles` is the build-pipeline form (rms then mkdirs the buildDir as the unprivileged user so docker `-v` does not bind the mount as root). `cleanBoardWorkdirHw` rms a HW board's per-shard workdir together with the sibling `<board>.zip` so the next shard starts clean. `cleanReportsDirHw` rms the HW aggregator's `reports/` dir without any sibling-zip semantics. `aggregateReports` stays inline in each Jenkinsfile because the build-pipeline form does many more things than the HW form.
 
 ## Tool dispatch hooks
 

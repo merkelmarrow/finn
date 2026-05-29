@@ -25,11 +25,10 @@ it via ``self``.
 """
 import pytest
 
+import ci_sharding
 import json
 import os
 import time
-
-from finn.util import ci_sharding
 
 SHARD_MARKER_NAME = "shard"
 

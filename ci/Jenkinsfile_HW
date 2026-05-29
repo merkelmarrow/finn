@@ -2,7 +2,7 @@
 //
 // HW_SHARDS is loaded from ci_sharding.py's BOARDS table so the build and HW
 // pipelines share one source of truth. Shared Groovy helpers live in
-// docker/jenkins/common.groovy.
+// ci/common.groovy.
 
 import groovy.transform.Field
 
@@ -15,7 +15,7 @@ import groovy.transform.Field
 def _common = null
 
 private def loadCommonOnce() {
-  if (_common == null) { _common = load 'docker/jenkins/common.groovy' }
+  if (_common == null) { _common = load 'ci/common.groovy' }
   return _common
 }
 
@@ -87,7 +87,7 @@ pipeline {
       // REBOOT_SLEEP minutes. Default 5; the job DSL may override.
       steps { sleep(time: (env.REBOOT_SLEEP ?: '5').toInteger(), unit: 'MINUTES') }
     }
-    // Default checkout is required so docker/jenkins/test_bnn_hw_pytest.py
+    // Default checkout is required so ci/test_bnn_hw_pytest.py
     // is in the workspace for the bnn_test_files stash.
     stage('Collect build information for HW testing') {
       agent { label "${FINN_BUILD_LABEL}" }
@@ -127,7 +127,7 @@ void loadHwShards() {
   // rejects an hwTestType without a matching label, so HW_TEST_TYPE_LABELS is
   // guaranteed to cover HW_TEST_TYPES by the time we get here.
   String raw = sh(returnStdout: true, script:
-    "python3 src/finn/util/ci_sharding.py hw-config-json"
+    "python3 ci/ci_sharding.py hw-config-json"
   ).trim()
   Map cfg = readJSON(text: raw) as Map
   HW_SHARDS = (cfg.shards as List).collect { it as Map }
@@ -203,7 +203,7 @@ void collectBuildArtifacts() {
   refreshNodeOnlineFlags()
   resolveBuildBoardZipPaths()
   archiveBuildInfo()
-  dir('docker/jenkins') {
+  dir('ci') {
     stash name: 'bnn_test_files', includes: 'test_bnn_hw_pytest.py'
   }
   HW_TEST_TYPES.each { testType -> stashBuildArtifacts(testType) }
@@ -215,7 +215,7 @@ void resolveBuildBoardZipPaths() {
   BUILD_BOARD_ZIP_PATHS = [:]
   String rawJob = paramString('build_job_name').trim() ?: 'finn'
   String jobKey = sh(returnStdout: true, script:
-    "python3 src/finn/util/ci_sharding.py job-key ${shellQuote(rawJob)}"
+    "python3 ci/ci_sharding.py job-key ${shellQuote(rawJob)}"
   ).trim()
   String override = paramString('build_dir').trim()
   String artifactDir = loadCommonOnce().finnArtifactsRoot()
@@ -227,7 +227,7 @@ void resolveBuildBoardZipPaths() {
   }
   String tests = HW_TEST_TYPES.join(',')
   String boards = HW_SHARDS.collect { it.board }.join(',')
-  String cmd = "python3 src/finn/util/ci_sharding.py resolve-build-zips " +
+  String cmd = "python3 ci/ci_sharding.py resolve-build-zips " +
                "--artifact-dir ${shellQuote(artifactDir)} --job-key ${shellQuote(jobKey)} " +
                "--tests ${shellQuote(tests)} --boards ${shellQuote(boards)} " +
                "--build-dir ${shellQuote(override)}"
@@ -521,7 +521,7 @@ void restartZynqPlatform() {
   }
 }
 
-// Thin wrappers over docker/jenkins/common.groovy. safeStashReport takes an
+// Thin wrappers over ci/common.groovy. safeStashReport takes an
 // explicit fileBase because HW reports use a different basename pattern
 // (testType_hw_board) from the stash name (testType_board).
 boolean paramBool(String name)                { return loadCommonOnce().paramBool(name) }
