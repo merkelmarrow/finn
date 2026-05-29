@@ -26,11 +26,14 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import errno
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from qonnx.core.modelwrapper import ModelWrapper
 from qonnx.custom_op.registry import getCustomOp
 from qonnx.util.basic import gen_finn_dt_tensor, roundup_to_integer_multiple
@@ -178,6 +181,29 @@ def make_build_dir(prefix=""):
     # or non-build UID can still read the FINN build tree on the host.
     os.chmod(new_dir, 0o755)
     return new_dir
+
+
+def robust_rmtree(path, retries=6, initial_delay=0.1, backoff=2.0):
+    """Remove a directory tree, retrying transient NFS ``ENOTEMPTY`` races.
+
+    Maximum total wait at the defaults is ~6.3s across retries before a
+    persistent ``ENOTEMPTY`` propagates. Other ``OSError`` subclasses
+    propagate immediately. A missing path is a no-op.
+    """
+    if not path or not os.path.exists(path):
+        return
+    delay = initial_delay
+    for attempt in range(retries):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if exc.errno != errno.ENOTEMPTY or attempt == retries - 1:
+                raise
+            time.sleep(delay)
+            delay *= backoff
 
 
 class CppBuilder:
