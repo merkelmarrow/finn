@@ -68,8 +68,13 @@ class CallHLS:
         self.code_gen_dir = code_gen_dir
         self.ipgen_script = str(self.code_gen_dir) + "/ipgen.sh"
         working_dir = os.environ["PWD"]
+        # per-codegen-dir TMPDIR so concurrent HLS runs don't race on /tmp,
+        # kept under code_gen_dir so it is cleaned up with the build dir
+        priv_tmp = os.path.join(code_gen_dir, ".vitis_tmp")
+        os.makedirs(priv_tmp, exist_ok=True)
         f = open(self.ipgen_script, "w")
         f.write("#!/bin/bash \n")
+        f.write('export TMPDIR="{}"\n'.format(priv_tmp))
         f.write("cd {}\n".format(code_gen_dir))
         f.write(vitis_cmd)
         f.write("cd {}\n".format(working_dir))
